@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-AssetTerminator.OnPremAgent-f49c9f46-de27-4742-95dc-d9897b9bfb2c</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AssetTerminator.Infrastructure\AssetTerminator.Infrastructure.csproj" />
+    <ProjectReference Include="..\AssetTerminator.Providers.ActiveDirectory\AssetTerminator.Providers.ActiveDirectory.csproj" />
+    <ProjectReference Include="..\AssetTerminator.Providers.ConfigMgr\AssetTerminator.Providers.ConfigMgr.csproj" />
+  </ItemGroup>
+</Project>

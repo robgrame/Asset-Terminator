@@ -1,0 +1,21 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AssetTerminator.Api/AssetTerminator.Api.csproj" />
+    <Project Path="src/AssetTerminator.Contracts/AssetTerminator.Contracts.csproj" />
+    <Project Path="src/AssetTerminator.Core/AssetTerminator.Core.csproj" />
+    <Project Path="src/AssetTerminator.Guardrails/AssetTerminator.Guardrails.csproj" />
+    <Project Path="src/AssetTerminator.Infrastructure/AssetTerminator.Infrastructure.csproj" />
+    <Project Path="src/AssetTerminator.OnPremAgent/AssetTerminator.OnPremAgent.csproj" />
+    <Project Path="src/AssetTerminator.Orchestrator/AssetTerminator.Orchestrator.csproj" />
+    <Project Path="src/AssetTerminator.Providers.ActiveDirectory/AssetTerminator.Providers.ActiveDirectory.csproj" />
+    <Project Path="src/AssetTerminator.Providers.ConfigMgr/AssetTerminator.Providers.ConfigMgr.csproj" />
+    <Project Path="src/AssetTerminator.Providers.EntraId/AssetTerminator.Providers.EntraId.csproj" />
+    <Project Path="src/AssetTerminator.Providers.Intune/AssetTerminator.Providers.Intune.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AssetTerminator.Api.Tests/AssetTerminator.Api.Tests.csproj" />
+    <Project Path="tests/AssetTerminator.Guardrails.Tests/AssetTerminator.Guardrails.Tests.csproj" />
+    <Project Path="tests/AssetTerminator.Orchestrator.Tests/AssetTerminator.Orchestrator.Tests.csproj" />
+    <Project Path="tests/AssetTerminator.Providers.Tests/AssetTerminator.Providers.Tests.csproj" />
+  </Folder>
+</Solution>

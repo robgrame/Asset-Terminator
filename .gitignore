@@ -1,0 +1,30 @@
+## .NET
+bin/
+obj/
+out/
+publish/
+publish-out/
+*.user
+*.suo
+.vs/
+artifacts/
+TestResults/
+
+## Azure Functions
+local.settings.json
+azure-functions-core-tools/
+bin
+obj
+
+## Rider/VS
+.idea/
+
+## macOS/Windows
+.DS_Store
+Thumbs.db
+
+## Secrets
+*.pfx
+*.publishsettings
+appsettings.*.local.json
+.env
