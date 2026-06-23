@@ -102,7 +102,7 @@ function Get-DecommissionHistory {
 
     $cfg = Get-StateConfig
     $pk = ConvertTo-EntityKey $RequestId
-    $filter = [Uri]::EscapeDataString("PartitionKey eq '$pk' and RowKey gt 'evt-'")
+    $filter = [Uri]::EscapeDataString("PartitionKey eq '$pk' and RowKey ge 'evt-' and RowKey lt 'evu'")
     $uri = "$($cfg.Endpoint)/$($cfg.Table)()?`$filter=$filter"
     try {
         $result = Invoke-RestMethod -Method Get -Uri $uri -Headers (Get-TableHeaders) -ErrorAction Stop

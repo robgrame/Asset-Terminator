@@ -45,41 +45,41 @@ function Update-State {
 Write-PocLog -Level 'Information' -Message 'Processing wipe request.' -Properties $logProps
 Update-State -Status 'InProgress' -Detail 'Resolving device and evaluating guardrails.'
 
-# --- 1. Resolve the device --------------------------------------------------
-# ServiceNow sends serialNumber + deviceName. When several stale objects match,
-# Get-IntuneManagedDevice selects the freshest (newest enrollment / check-in).
-$device = Get-IntuneManagedDevice -ManagedDeviceId $request.managedDeviceId `
-    -DeviceName $request.deviceName -SerialNumber $request.serialNumber -LogProperties $logProps
-if (-not $device) {
-    Write-PocLog -Level 'Error' -Message 'Device not found in Intune; nothing to wipe.' -Properties $logProps
-    Update-State -Status 'Failed' -Detail 'Device not found in Intune.'
-    return
-}
-
-$logProps.managedDeviceId = $device.id
-$logProps.resolvedSerial  = $device.serialNumber
-$logProps.enrolledDateTime = $device.enrolledDateTime
-$logProps.lastSyncDateTime = $device.lastSyncDateTime
-
-# --- 2. Evaluate guardrails -------------------------------------------------
-$decision = Invoke-Guardrails -Device $device -ConfigPath $guardrailConfigPath
-
-foreach ($r in $decision.Results) {
-    Write-PocLog -Level ($r.Passed ? 'Information' : 'Warning') `
-        -Message "Guardrail '$($r.Name)' [$($r.Mode)] -> $($r.Passed ? 'PASS' : 'FAIL'): $($r.Reason)" `
-        -Properties $logProps
-}
-
-if (-not $decision.Allowed) {
-    $reasons = $decision.BlockingReasons -join '; '
-    Write-PocLog -Level 'Warning' -Message "WIPE BLOCKED by guardrails: $reasons" -Properties $logProps
-    Update-State -Status 'Blocked' -Detail "Guardrails blocked the wipe: $reasons"
-    return
-}
-
-# --- 3. Execute (or simulate) the wipe --------------------------------------
-$dryRun = [bool]$request.dryRun
 try {
+    # --- 1. Resolve the device ----------------------------------------------
+    # ServiceNow sends serialNumber + deviceName. When several stale objects match,
+    # Get-IntuneManagedDevice selects the freshest (newest enrollment / check-in).
+    $device = Get-IntuneManagedDevice -ManagedDeviceId $request.managedDeviceId `
+        -DeviceName $request.deviceName -SerialNumber $request.serialNumber -LogProperties $logProps
+    if (-not $device) {
+        Write-PocLog -Level 'Error' -Message 'Device not found in Intune; nothing to wipe.' -Properties $logProps
+        Update-State -Status 'Failed' -Detail 'Device not found in Intune.'
+        return
+    }
+
+    $logProps.managedDeviceId = $device.id
+    $logProps.resolvedSerial  = $device.serialNumber
+    $logProps.enrolledDateTime = $device.enrolledDateTime
+    $logProps.lastSyncDateTime = $device.lastSyncDateTime
+
+    # --- 2. Evaluate guardrails ---------------------------------------------
+    $decision = Invoke-Guardrails -Device $device -ConfigPath $guardrailConfigPath
+
+    foreach ($r in $decision.Results) {
+        Write-PocLog -Level ($r.Passed ? 'Information' : 'Warning') `
+            -Message "Guardrail '$($r.Name)' [$($r.Mode)] -> $($r.Passed ? 'PASS' : 'FAIL'): $($r.Reason)" `
+            -Properties $logProps
+    }
+
+    if (-not $decision.Allowed) {
+        $reasons = $decision.BlockingReasons -join '; '
+        Write-PocLog -Level 'Warning' -Message "WIPE BLOCKED by guardrails: $reasons" -Properties $logProps
+        Update-State -Status 'Blocked' -Detail "Guardrails blocked the wipe: $reasons"
+        return
+    }
+
+    # --- 3. Execute (or simulate) the wipe ----------------------------------
+    $dryRun = [bool]$request.dryRun
     $result = Invoke-IntuneWipe -ManagedDeviceId $device.id -DryRun:$dryRun -LogProperties $logProps
     Write-PocLog -Level 'Information' -Message "Wipe outcome: $($result.Outcome)." -Properties ($logProps + @{ outcome = $result.Outcome })
 
@@ -88,7 +88,8 @@ try {
     Update-State -Status $status -Detail $detail
 }
 catch {
-    Write-PocLog -Level 'Error' -Message "Wipe failed: $($_.Exception.Message)" -Properties $logProps
-    Update-State -Status 'Failed' -Detail "Wipe call failed: $($_.Exception.Message)"
-    throw
+    Write-PocLog -Level 'Error' -Message "Processing failed: $($_.Exception.Message)" -Properties $logProps
+    Update-State -Status 'Failed' -Detail "Processing failed: $($_.Exception.Message)"
+    throw  # let Service Bus retry / dead-letter
 }
+
