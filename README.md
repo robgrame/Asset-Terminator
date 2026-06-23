@@ -29,6 +29,8 @@ flowchart LR
     AGENT --> LA
 ```
 
+For a detailed component breakdown, the rationale behind each design decision, and the full request-flow and state-machine diagrams, see [`docs\architecture.md`](docs/architecture.md).
+
 ## Solution layout
 
 ### Source projects
