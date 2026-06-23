@@ -1,0 +1,495 @@
+openapi: 3.0.3
+info:
+  title: Asset-Terminator REST API
+  version: 1.0.0
+  description: ServiceNow-facing API for asynchronous asset decommissioning orchestration.
+servers:
+  - url: https://asset-terminator.example.azurewebsites.net
+    description: Production
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: Decommission
+    description: Intake, status, history, and override operations.
+paths:
+  /api/v1/decommission:
+    post:
+      tags: [Decommission]
+      summary: Accept a decommission request
+      description: Accepts a ServiceNow request and starts asynchronous decommissioning. requestId is the idempotency key.
+      operationId: acceptDecommission
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecommissionRequest'
+            examples:
+              windowsVipFullDecommission:
+                summary: Windows VIP full decommission and wipe
+                value:
+                  requestId: "sn-task-8b1a7f68db6240109b3f001122334455"
+                  assetId: "AST-0007421"
+                  deviceName: "VIP-LAPTOP-042"
+                  serialNumber: "PF3ZX91K"
+                  primaryUserUpn: "alex.wilber@example.com"
+                  deviceType: "Windows"
+                  assetCategory: "Vip"
+                  requestedActions: ["Wipe", "Intune", "EntraId", "ConfigMgr", "ActiveDirectory"]
+                  requestor: "svc.servicenow.asset"
+                  ticketNumber: "CHG0042157"
+                  timestamp: "2026-06-23T09:00:00Z"
+                  dryRun: false
+              dryRun:
+                summary: Dry-run validation only
+                value:
+                  requestId: "sn-task-dryrun-1001"
+                  assetId: "AST-0008120"
+                  deviceName: "LAB-ANDROID-007"
+                  serialNumber: "R58T9001QPL"
+                  primaryUserUpn: "casey.jensen@example.com"
+                  deviceType: "Android"
+                  assetCategory: "Standard"
+                  requestedActions: ["Intune", "EntraId"]
+                  requestor: "svc.servicenow.asset"
+                  ticketNumber: "TASK0099012"
+                  timestamp: "2026-06-23T09:05:00Z"
+                  dryRun: true
+      responses:
+        "202":
+          description: Request accepted for asynchronous processing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecommissionAccepted'
+              examples:
+                accepted:
+                  value:
+                    requestId: "sn-task-8b1a7f68db6240109b3f001122334455"
+                    correlationId: "AT-20260623-000042"
+                    status: "Accepted"
+                    statusUrl: "/api/v1/decommission/sn-task-8b1a7f68db6240109b3f001122334455"
+        "400":
+          $ref: '#/components/responses/ValidationProblem'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "409":
+          description: Duplicate requestId; original request remains accepted and is not executed twice.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecommissionAccepted'
+              examples:
+                duplicateButAccepted:
+                  value:
+                    requestId: "sn-task-8b1a7f68db6240109b3f001122334455"
+                    correlationId: "AT-20260623-000042"
+                    status: "Accepted"
+                    statusUrl: "/api/v1/decommission/sn-task-8b1a7f68db6240109b3f001122334455"
+  /api/v1/decommission/{requestId}:
+    get:
+      tags: [Decommission]
+      summary: Get aggregate decommission status
+      operationId: getDecommissionStatus
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        "200":
+          description: Current aggregate request status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecommissionStatusResponse'
+              examples:
+                blockedByGuardrail:
+                  summary: Wipe blocked by mandatory guardrail
+                  value:
+                    requestId: "sn-task-8b1a7f68db6240109b3f001122334455"
+                    correlationId: "AT-20260623-000042"
+                    ticketNumber: "CHG0042157"
+                    overallStatus: "Blocked"
+                    slaState: "AtRisk"
+                    createdAt: "2026-06-23T09:00:12Z"
+                    lastUpdatedAt: "2026-06-23T09:04:30Z"
+                    dueAt: "2026-06-24T09:00:12Z"
+                    actions:
+                      - target: "Wipe"
+                        action: "IntuneWipe"
+                        status: "Blocked"
+                        lastChecked: "2026-06-23T09:04:30Z"
+                        retryCount: 0
+                        details: "EncryptionGuardrail failed: BitLocker recovery key escrow was not confirmed."
+                      - target: "Intune"
+                        action: "DeleteManagedDevice"
+                        status: "Pending"
+                        lastChecked: null
+                        retryCount: 0
+                        details: "Waiting for wipe completion."
+                      - target: "EntraId"
+                        action: "DeleteDevice"
+                        status: "Pending"
+                        lastChecked: null
+                        retryCount: 0
+                        details: null
+        "404":
+          $ref: '#/components/responses/NotFound'
+  /api/v1/decommission/{requestId}/history:
+    get:
+      tags: [Decommission]
+      summary: Get immutable decommission history
+      operationId: getDecommissionHistory
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        "200":
+          description: Chronological immutable audit events for the request.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DecommissionHistoryEvent'
+              examples:
+                history:
+                  value:
+                    - timestamp: "2026-06-23T09:00:12Z"
+                      eventType: "RequestAccepted"
+                      target: null
+                      outcome: "Accepted"
+                      actor: "svc.servicenow.asset"
+                      detail: "ServiceNow request CHG0042157 accepted."
+                    - timestamp: "2026-06-23T09:04:30Z"
+                      eventType: "GuardrailEvaluated"
+                      target: "Wipe"
+                      outcome: "Blocked"
+                      actor: "AssetTerminator.Guardrails"
+                      detail: "EncryptionGuardrail failed."
+        "404":
+          $ref: '#/components/responses/NotFound'
+  /api/v1/decommission/{requestId}/override:
+    post:
+      tags: [Decommission]
+      summary: Override failed guardrails
+      description: Requires the Approver role. The reason is mandatory and is written to immutable audit storage.
+      operationId: overrideGuardrails
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OverrideRequest'
+            examples:
+              overrideEncryption:
+                summary: Approver override for failed encryption escrow guardrail
+                value:
+                  reason: "Device is confirmed physically destroyed by depot intake; proceed with logical deletes."
+                  guardrailIds: ["EncryptionGuardrail"]
+      responses:
+        "202":
+          description: Override accepted and workflow resumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecommissionAccepted'
+              examples:
+                overrideAccepted:
+                  value:
+                    requestId: "sn-task-8b1a7f68db6240109b3f001122334455"
+                    correlationId: "AT-20260623-000042"
+                    status: "Accepted"
+                    statusUrl: "/api/v1/decommission/sn-task-8b1a7f68db6240109b3f001122334455"
+        "400":
+          description: Missing or invalid override reason.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+              example:
+                title: "Validation failed"
+                status: 400
+                detail: "reason is required."
+        "403":
+          $ref: '#/components/responses/Forbidden'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: API key stored in Azure Key Vault and validated with the ServiceNow IP allowlist.
+  parameters:
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: ServiceNow-supplied idempotency key.
+  responses:
+    ValidationProblem:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            title: "Validation failed"
+            status: 400
+            detail: "requestId, assetId, deviceType, assetCategory, and requestedActions are required."
+    Unauthorized:
+      description: Missing or invalid x-api-key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            title: "Unauthorized"
+            status: 401
+            detail: "Missing or invalid API key."
+    Forbidden:
+      description: Authenticated caller is not allowed by IP allowlist or lacks the required role.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            title: "Forbidden"
+            status: 403
+            detail: "Caller is not authorized for this operation."
+    NotFound:
+      description: requestId was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            title: "Not found"
+            status: 404
+            detail: "No decommission request exists for the supplied requestId."
+  schemas:
+    DecommissionRequest:
+      type: object
+      required:
+        - requestId
+        - assetId
+        - deviceType
+        - assetCategory
+        - requestedActions
+      properties:
+        requestId:
+          type: string
+          description: Idempotency key supplied by ServiceNow.
+        assetId:
+          type: string
+          description: CMDB asset identifier.
+        deviceName:
+          type: string
+          nullable: true
+        serialNumber:
+          type: string
+          nullable: true
+        primaryUserUpn:
+          type: string
+          nullable: true
+        deviceType:
+          $ref: '#/components/schemas/DeviceType'
+        assetCategory:
+          $ref: '#/components/schemas/AssetCategory'
+        requestedActions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecommissionTarget'
+        requestor:
+          type: string
+          nullable: true
+        ticketNumber:
+          type: string
+          nullable: true
+        timestamp:
+          type: string
+          format: date-time
+          nullable: true
+        dryRun:
+          type: boolean
+          default: false
+    DecommissionAccepted:
+      type: object
+      required:
+        - requestId
+        - correlationId
+        - status
+      properties:
+        requestId:
+          type: string
+        correlationId:
+          type: string
+        status:
+          type: string
+          example: "Accepted"
+        statusUrl:
+          type: string
+          nullable: true
+    DecommissionStatusResponse:
+      type: object
+      required:
+        - requestId
+        - correlationId
+        - overallStatus
+        - createdAt
+        - lastUpdatedAt
+        - actions
+      properties:
+        requestId:
+          type: string
+        correlationId:
+          type: string
+        ticketNumber:
+          type: string
+          nullable: true
+        overallStatus:
+          type: string
+          description: Completed, Failed, InProgress, TimedOut, Blocked, SlaBreached, or SlaAtRisk.
+        slaState:
+          type: string
+          nullable: true
+          description: OnTrack, AtRisk, Breached, or Exempt.
+        createdAt:
+          type: string
+          format: date-time
+        lastUpdatedAt:
+          type: string
+          format: date-time
+        dueAt:
+          type: string
+          format: date-time
+          nullable: true
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecommissionActionStatus'
+    DecommissionActionStatus:
+      type: object
+      required:
+        - target
+        - action
+        - status
+        - retryCount
+      properties:
+        target:
+          $ref: '#/components/schemas/DecommissionTarget'
+        action:
+          type: string
+        status:
+          type: string
+          description: Pending, InProgress, Completed, Failed, Blocked, TimedOut, or Skipped.
+        lastChecked:
+          type: string
+          format: date-time
+          nullable: true
+        retryCount:
+          type: integer
+          format: int32
+          minimum: 0
+        details:
+          type: string
+          nullable: true
+    DecommissionHistoryEvent:
+      type: object
+      required:
+        - timestamp
+        - eventType
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        eventType:
+          type: string
+        target:
+          type: string
+          nullable: true
+        outcome:
+          type: string
+          nullable: true
+        actor:
+          type: string
+          nullable: true
+        detail:
+          type: string
+          nullable: true
+    OverrideRequest:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+        guardrailIds:
+          type: array
+          items:
+            type: string
+    ServiceNowCallback:
+      type: object
+      required:
+        - eventId
+        - requestId
+        - correlationId
+        - overallStatus
+        - eventType
+        - timestamp
+        - details
+      properties:
+        eventId:
+          type: string
+          description: Unique callback event id for ServiceNow idempotency.
+        requestId:
+          type: string
+        correlationId:
+          type: string
+        ticketNumber:
+          type: string
+          nullable: true
+        overallStatus:
+          type: string
+        eventType:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        details:
+          type: object
+          additionalProperties: true
+    DecommissionTarget:
+      type: string
+      enum: [ActiveDirectory, ConfigMgr, Intune, EntraId, Wipe]
+    DeviceType:
+      type: string
+      enum: [Windows, MacOS, iOS, Android]
+    AssetCategory:
+      type: string
+      enum: [Standard, Vip, Critical]
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string

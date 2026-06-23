@@ -134,3 +134,20 @@ public sealed class MessagingOptions
     public string OnPremActionsQueue { get; set; } = "decommission-onprem";
     public string CallbackDeadLetterQueue { get; set; } = "callback-deadletter";
 }
+
+/// <summary>Guardrail override / approval policy.</summary>
+public sealed class OverrideOptions
+{
+    public const string Section = "AssetTerminator:Override";
+
+    /// <summary>Number of distinct Approver sign-offs required before an override takes effect, per category.</summary>
+    public Dictionary<AssetCategory, int> RequiredApprovals { get; set; } = new()
+    {
+        [AssetCategory.Standard] = 1,
+        [AssetCategory.Vip] = 2,
+        [AssetCategory.Critical] = 2
+    };
+
+    public int RequiredFor(AssetCategory category) =>
+        RequiredApprovals.TryGetValue(category, out var n) ? Math.Max(1, n) : 1;
+}

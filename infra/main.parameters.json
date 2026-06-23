@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "value": "astterm"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "env": {
+      "value": "dev"
+    },
+    "wormRetentionDays": {
+      "value": 2555
+    },
+    "sqlAdminGroupName": {
+      "value": "Asset-Terminator-SQL-Admins"
+    },
+    "sqlAdminGroupObjectId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "useLocalAuth": {
+      "value": false
+    }
+  }
+}

@@ -1,0 +1,76 @@
+// Asset-Terminator Log Analytics query library.
+// These queries target custom tables, which normally have a _CL suffix:
+// DecommissionRequests_CL, DecommissionActions_CL, GuardrailResults_CL, CallbackEvents_CL.
+// Assumed common columns:
+//   requestId_s, correlationId_s, assetId_s, ticketNumber_s
+//   overallStatus_s, status_s, action_s, target_s, system_s
+//   deviceType_s, assetCategory_s, slaState_s
+//   retryCount_d, createdAt_t, completedAt_t, dueAt_t, TimeGenerated
+
+// Requests by overall status (Completed/Failed/TimedOut/Blocked).
+DecommissionRequests_CL
+| where overallStatus_s in ("Completed", "Failed", "TimedOut", "Blocked")
+| summarize requestCount = dcount(requestId_s) by overallStatus_s
+| order by requestCount desc
+
+// Average completion time from request creation to completion.
+DecommissionRequests_CL
+| where isnotempty(createdAt_t) and isnotempty(completedAt_t)
+| where overallStatus_s == "Completed"
+| extend completionMinutes = datetime_diff("minute", completedAt_t, createdAt_t)
+| summarize avgCompletionMinutes = avg(completionMinutes), p50Minutes = percentile(completionMinutes, 50), p95Minutes = percentile(completionMinutes, 95)
+
+// Retries per action and target.
+DecommissionActions_CL
+| summarize totalRetries = sum(tolong(retryCount_d)), maxRetries = max(tolong(retryCount_d)), actions = count() by target_s, action_s
+| order by totalRetries desc
+
+// Failure rate per system (ActiveDirectory/ConfigMgr/Intune/EntraId).
+DecommissionActions_CL
+| where system_s in ("ActiveDirectory", "ConfigMgr", "Intune", "EntraId") or target_s in ("ActiveDirectory", "ConfigMgr", "Intune", "EntraId")
+| extend system = coalesce(system_s, target_s)
+| summarize totalActions = count(), failedActions = countif(status_s == "Failed") by system
+| extend failureRate = todouble(failedActions) / todouble(totalActions)
+| order by failureRate desc
+
+// Request distribution by deviceType.
+DecommissionRequests_CL
+| summarize requestCount = dcount(requestId_s) by deviceType_s
+| order by requestCount desc
+
+// SLA compliance rate by asset category.
+DecommissionRequests_CL
+| where overallStatus_s in ("Completed", "Failed", "TimedOut", "Blocked")
+| extend metSla = iff(isnotempty(dueAt_t) and isnotempty(completedAt_t), completedAt_t <= dueAt_t, slaState_s !in ("Breached", "SlaBreached"))
+| summarize totalRequests = dcount(requestId_s), compliantRequests = dcountif(requestId_s, metSla) by assetCategory_s
+| extend complianceRate = todouble(compliantRequests) / todouble(totalRequests)
+| order by complianceRate asc
+
+// Requests currently breaching or at risk of breaching SLA.
+DecommissionRequests_CL
+| where overallStatus_s !in ("Completed", "Failed", "TimedOut")
+| extend minutesUntilDue = datetime_diff("minute", dueAt_t, now())
+| where slaState_s in ("AtRisk", "Breached", "SlaAtRisk", "SlaBreached") or (isnotempty(dueAt_t) and dueAt_t <= now() + 4h)
+| project TimeGenerated, requestId_s, ticketNumber_s, assetId_s, assetCategory_s, overallStatus_s, slaState_s, dueAt_t, minutesUntilDue
+| order by dueAt_t asc
+
+// Requests pending beyond SLA.
+DecommissionRequests_CL
+| where overallStatus_s in ("Accepted", "InProgress", "Blocked")
+| where isnotempty(dueAt_t) and dueAt_t < now()
+| project requestId_s, ticketNumber_s, assetId_s, deviceType_s, assetCategory_s, overallStatus_s, slaState_s, createdAt_t, dueAt_t
+| order by dueAt_t asc
+
+// Guardrail outcomes by guardrail id.
+// Assumed GuardrailResults_CL columns: guardrailId_s, result_s, mandatory_b, overridable_b, requestId_s, target_s.
+GuardrailResults_CL
+| summarize evaluations = count(), failures = countif(result_s in ("Failed", "Blocked")) by guardrailId_s, mandatory_b, overridable_b
+| extend failureRate = todouble(failures) / todouble(evaluations)
+| order by failures desc
+
+// Callback delivery health.
+// Assumed CallbackEvents_CL columns: eventId_s, requestId_s, eventType_s, status_s, retryCount_d, deliveredAt_t, deadLettered_b.
+CallbackEvents_CL
+| summarize callbacks = count(), delivered = countif(status_s == "Delivered"), deadLettered = countif(deadLettered_b == true), retries = sum(tolong(retryCount_d)) by eventType_s
+| extend deliveryRate = todouble(delivered) / todouble(callbacks)
+| order by deadLettered desc, retries desc
