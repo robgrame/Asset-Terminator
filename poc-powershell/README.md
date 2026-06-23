@@ -167,6 +167,26 @@ Typical state flow: **Requested ➜ InProgress ➜ Completed** (dry-run) / **Blo
 **Application Insights** (`attpoc-appi-dev`): each step is logged as a structured
 entry with the same `correlationId`.
 
+### Simulate a ServiceNow request (helper script)
+
+`scripts/Invoke-ServiceNowWipe.ps1` reproduces the full ServiceNow flow: it builds the
+DTO, POSTs to the intake and polls the status endpoint until a terminal state.
+
+```powershell
+cd poc-powershell/scripts
+
+# Browse real Intune devices (interactive Graph sign-in, read-only scope)
+./Invoke-ServiceNowWipe.ps1 -ListDevices
+
+# Dry-run against a real device (resolves + guardrails, NO destructive wipe)
+./Invoke-ServiceNowWipe.ps1 -DeviceName 'LAPTOP-FIN-007' -SerialNumber '5CG1234XYZ'
+
+# REAL wipe (prompts for confirmation)
+./Invoke-ServiceNowWipe.ps1 -ManagedDeviceId '<guid>' -Execute
+```
+
+It is **dry-run by default**; `-Execute` is required (and confirmed) for a real wipe.
+
 ### State & idempotency (Table Storage)
 
 The dedicated state account persists one row per request (`PartitionKey=requestId`,
