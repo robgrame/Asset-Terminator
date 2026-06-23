@@ -32,6 +32,9 @@ public sealed class DecommissionRecord
     /// <summary>Raw inbound request JSON, for full fidelity replay.</summary>
     public string RequestJson { get; set; } = string.Empty;
 
+    /// <summary>Serialized enriched <see cref="DeviceContext"/> (resolved ids, encryption state, ...).</summary>
+    public string? DeviceContextJson { get; set; }
+
     public List<SubAction> Actions { get; set; } = new();
 }
 
