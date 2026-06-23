@@ -14,17 +14,20 @@ public sealed class CallbackPublisher
 {
     private readonly ICallbackSender _sender;
     private readonly IAuditWriter _audit;
+    private readonly IOperationalTelemetry _telemetry;
     private readonly ILogger<CallbackPublisher> _logger;
 
-    public CallbackPublisher(ICallbackSender sender, IAuditWriter audit, ILogger<CallbackPublisher> logger)
+    public CallbackPublisher(ICallbackSender sender, IAuditWriter audit, IOperationalTelemetry telemetry, ILogger<CallbackPublisher> logger)
     {
         _sender = sender;
         _audit = audit;
+        _telemetry = telemetry;
         _logger = logger;
     }
 
     public async Task PublishAsync(DecommissionRecord record, string eventType, CancellationToken ct)
     {
+        var eventId = Guid.NewGuid().ToString("N");
         var callback = new ServiceNowCallback
         {
             RequestId = record.RequestId,
@@ -34,6 +37,7 @@ public sealed class CallbackPublisher
             EventType = eventType,
             Details = new Dictionary<string, object?>
             {
+                ["eventId"] = eventId,
                 ["slaState"] = record.SlaState.ToString(),
                 ["dueAt"] = record.DueAtUtc,
                 ["actions"] = record.Actions.Select(a => new
@@ -59,7 +63,23 @@ public sealed class CallbackPublisher
             Reason = eventType
         }, ct);
 
-        await _sender.SendAsync(callback, ct);
+        await _telemetry.RequestSnapshotAsync(record, ct);
+
+        var success = true;
+        try
+        {
+            await _sender.SendAsync(callback, ct);
+        }
+        catch
+        {
+            success = false;
+            throw;
+        }
+        finally
+        {
+            await _telemetry.CallbackEventAsync(record, eventType, eventId, success, null, ct);
+        }
+
         _logger.LogInformation("Published callback {Event} for {RequestId} status={Status}",
             eventType, record.RequestId, record.State);
     }

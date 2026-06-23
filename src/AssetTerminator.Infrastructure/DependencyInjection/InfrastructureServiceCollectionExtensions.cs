@@ -1,5 +1,6 @@
 using Azure.Identity;
 using Azure.Messaging.ServiceBus;
+using Azure.Monitor.Ingestion;
 using Azure.Security.KeyVault.Secrets;
 using Azure.Storage.Blobs;
 using AssetTerminator.Core.Abstractions;
@@ -8,6 +9,7 @@ using AssetTerminator.Infrastructure.Audit;
 using AssetTerminator.Infrastructure.Callbacks;
 using AssetTerminator.Infrastructure.Data;
 using AssetTerminator.Infrastructure.Messaging;
+using AssetTerminator.Infrastructure.Observability;
 using AssetTerminator.Infrastructure.Secrets;
 using AssetTerminator.Infrastructure.Sla;
 using Microsoft.EntityFrameworkCore;
@@ -64,6 +66,18 @@ public static class InfrastructureServiceCollectionExtensions
         // --- SLA ---
         services.AddSingleton<ISlaCalculator, SlaCalculator>();
 
+        // --- Operational telemetry (Log Analytics custom tables via Logs Ingestion) ---
+        var observability = configuration.GetSection(ObservabilityOptions.Section).Get<ObservabilityOptions>() ?? new ObservabilityOptions();
+        if (!string.IsNullOrWhiteSpace(observability.DcrEndpoint) && !string.IsNullOrWhiteSpace(observability.DcrImmutableId))
+        {
+            services.AddSingleton(_ => new LogsIngestionClient(new Uri(observability.DcrEndpoint), credential));
+            services.AddSingleton<IOperationalTelemetry, LogsIngestionTelemetry>();
+        }
+        else
+        {
+            services.AddSingleton<IOperationalTelemetry>(NullOperationalTelemetry.Instance);
+        }
+
         // --- ServiceNow callbacks ---
         services.AddHttpClient<ICallbackSender, HttpServiceNowCallbackSender>();
 
@@ -79,5 +93,6 @@ public static class InfrastructureServiceCollectionExtensions
         services.Configure<AuditOptions>(configuration.GetSection(AuditOptions.Section));
         services.Configure<OrchestrationOptions>(configuration.GetSection(OrchestrationOptions.Section));
         services.Configure<MessagingOptions>(configuration.GetSection(MessagingOptions.Section));
+        services.Configure<ObservabilityOptions>(configuration.GetSection(ObservabilityOptions.Section));
     }
 }

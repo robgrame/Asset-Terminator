@@ -151,3 +151,25 @@ public sealed class OverrideOptions
     public int RequiredFor(AssetCategory category) =>
         RequiredApprovals.TryGetValue(category, out var n) ? Math.Max(1, n) : 1;
 }
+
+/// <summary>
+/// Operational telemetry to Log Analytics custom tables via the Logs Ingestion API.
+/// When <see cref="DcrEndpoint"/>/<see cref="DcrImmutableId"/> are not configured the
+/// emitter is a no-op (telemetry still flows to Application Insights via ILogger).
+/// </summary>
+public sealed class ObservabilityOptions
+{
+    public const string Section = "AssetTerminator:Observability";
+
+    /// <summary>Data Collection Endpoint logs-ingestion URI (https://...ingest.monitor.azure.com).</summary>
+    public string? DcrEndpoint { get; set; }
+
+    /// <summary>Data Collection Rule immutable id (dcr-...).</summary>
+    public string? DcrImmutableId { get; set; }
+
+    /// <summary>Stream name for request snapshots (e.g. Custom-DecommissionRequests_CL).</summary>
+    public string RequestsStream { get; set; } = "Custom-DecommissionRequests_CL";
+    public string ActionsStream { get; set; } = "Custom-DecommissionActions_CL";
+    public string GuardrailsStream { get; set; } = "Custom-GuardrailResults_CL";
+    public string CallbacksStream { get; set; } = "Custom-CallbackEvents_CL";
+}

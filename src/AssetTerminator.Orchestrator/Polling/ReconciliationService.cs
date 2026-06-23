@@ -26,6 +26,7 @@ public sealed class ReconciliationService
     private readonly IEnumerable<IDeviceCleanupProvider> _providers;
     private readonly ISlaCalculator _sla;
     private readonly CallbackPublisher _callbacks;
+    private readonly IOperationalTelemetry _telemetry;
     private readonly IOptionsMonitor<OrchestrationOptions> _orchestration;
     private readonly IOptionsMonitor<SlaOptions> _slaOptions;
     private readonly ILogger<ReconciliationService> _logger;
@@ -37,6 +38,7 @@ public sealed class ReconciliationService
         IEnumerable<IDeviceCleanupProvider> providers,
         ISlaCalculator sla,
         CallbackPublisher callbacks,
+        IOperationalTelemetry telemetry,
         IOptionsMonitor<OrchestrationOptions> orchestration,
         IOptionsMonitor<SlaOptions> slaOptions,
         ILogger<ReconciliationService> logger)
@@ -47,6 +49,7 @@ public sealed class ReconciliationService
         _providers = providers;
         _sla = sla;
         _callbacks = callbacks;
+        _telemetry = telemetry;
         _orchestration = orchestration;
         _slaOptions = slaOptions;
         _logger = logger;
@@ -85,6 +88,7 @@ public sealed class ReconciliationService
                 continue; // still backing off
 
             await ReconcileActionAsync(record, action, context, slaCfg, ct);
+            await _telemetry.ActionSnapshotAsync(record, action, ct);
         }
 
         var newState = DecommissionActivities.OverallState(record);

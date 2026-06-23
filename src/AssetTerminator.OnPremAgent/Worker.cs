@@ -109,6 +109,7 @@ public sealed class Worker : BackgroundService
         using var scope = _scopeFactory.CreateScope();
         var store = scope.ServiceProvider.GetRequiredService<IStateStore>();
         var audit = scope.ServiceProvider.GetRequiredService<IAuditWriter>();
+        var telemetry = scope.ServiceProvider.GetRequiredService<IOperationalTelemetry>();
         var providers = scope.ServiceProvider.GetServices<IDeviceCleanupProvider>();
 
         var record = await store.GetAsync(message.RequestId, ct);
@@ -141,6 +142,7 @@ public sealed class Worker : BackgroundService
         ApplyResult(action, result);
         await store.UpdateAsync(record, ct);
         await Audit(audit, record, "DeleteCompleted", message.Target, action.Status.ToString(), result.Detail, ct);
+        await telemetry.ActionSnapshotAsync(record, action, ct);
 
         _logger.LogInformation("On-prem {Target} for {RequestId} -> {Status}",
             message.Target, message.RequestId, action.Status);

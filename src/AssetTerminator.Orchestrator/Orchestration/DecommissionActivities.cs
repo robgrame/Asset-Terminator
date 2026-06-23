@@ -32,6 +32,7 @@ public sealed class DecommissionActivities
     private readonly IEnumerable<IDeviceCleanupProvider> _providers;
     private readonly IWipeProvider _wipe;
     private readonly CallbackPublisher _callbacks;
+    private readonly IOperationalTelemetry _telemetry;
     private readonly ILogger<DecommissionActivities> _logger;
 
     public DecommissionActivities(
@@ -43,6 +44,7 @@ public sealed class DecommissionActivities
         IEnumerable<IDeviceCleanupProvider> providers,
         IWipeProvider wipe,
         CallbackPublisher callbacks,
+        IOperationalTelemetry telemetry,
         ILogger<DecommissionActivities> logger)
     {
         _store = store;
@@ -53,6 +55,7 @@ public sealed class DecommissionActivities
         _providers = providers;
         _wipe = wipe;
         _callbacks = callbacks;
+        _telemetry = telemetry;
         _logger = logger;
     }
 
@@ -115,6 +118,8 @@ public sealed class DecommissionActivities
             GuardrailResults = evaluation.Results
         }, ct);
 
+        await _telemetry.GuardrailResultsAsync(record, evaluation.Results, ct);
+
         return new GuardrailOutcome(allowed, blocking.Select(b => $"{b.GuardrailId}: {b.Reason}").ToList());
     }
 
@@ -162,6 +167,7 @@ public sealed class DecommissionActivities
         ApplyResult(action, result);
         await _store.UpdateAsync(record, ct);
         await Audit(record, "DeleteCompleted", input.Target.ToString(), action.Status.ToString(), result.Detail, ct);
+        await _telemetry.ActionSnapshotAsync(record, action, ct);
     }
 
     [Function(nameof(IssueWipe))]
@@ -191,6 +197,7 @@ public sealed class DecommissionActivities
             action.FinalOutcome = "Failed";
         await _store.UpdateAsync(record, ct);
         await Audit(record, "WipeAccepted", "Wipe", action.Status.ToString(), result.Detail, ct);
+        await _telemetry.ActionSnapshotAsync(record, action, ct);
     }
 
     [Function(nameof(BlockWipe))]

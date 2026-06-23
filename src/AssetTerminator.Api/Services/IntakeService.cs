@@ -19,6 +19,7 @@ public sealed class IntakeService
     private readonly IAuditWriter _audit;
     private readonly IWorkflowStarter _workflow;
     private readonly ISlaCalculator _sla;
+    private readonly IOperationalTelemetry _telemetry;
     private readonly ILogger<IntakeService> _logger;
 
     public IntakeService(
@@ -26,12 +27,14 @@ public sealed class IntakeService
         IAuditWriter audit,
         IWorkflowStarter workflow,
         ISlaCalculator sla,
+        IOperationalTelemetry telemetry,
         ILogger<IntakeService> logger)
     {
         _store = store;
         _audit = audit;
         _workflow = workflow;
         _sla = sla;
+        _telemetry = telemetry;
         _logger = logger;
     }
 
@@ -95,6 +98,7 @@ public sealed class IntakeService
         }, ct);
 
         await _workflow.StartAsync(request.RequestId, correlationId, ct);
+        await _telemetry.RequestSnapshotAsync(persisted, ct);
 
         return new IntakeResult(true, true, correlationId, null);
     }
