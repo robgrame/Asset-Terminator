@@ -86,14 +86,6 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           value: appInsightsConnectionString
         }
         {
-          name: 'FUNCTIONS_EXTENSION_VERSION'
-          value: '~4'
-        }
-        {
-          name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: 'dotnet-isolated'
-        }
-        {
           name: 'AzureWebJobsStorage'
           value: 'DefaultEndpointsProtocol=https;AccountName=${deploymentStorage.name};AccountKey=${deploymentStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
