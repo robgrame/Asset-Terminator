@@ -1,0 +1,30 @@
+{
+  "guardrails": [
+    {
+      "name": "Encryption",
+      "enabled": true,
+      "mode": "Mandatory",
+      "settings": {}
+    },
+    {
+      "name": "Inactivity",
+      "enabled": true,
+      "mode": "Warning",
+      "settings": {
+        "minimumInactiveDays": 14
+      }
+    },
+    {
+      "name": "CriticalDevice",
+      "enabled": true,
+      "mode": "Mandatory",
+      "settings": {
+        "blockedCategories": [
+          "Executives",
+          "Servers",
+          "Kiosk-Critical"
+        ]
+      }
+    }
+  ]
+}

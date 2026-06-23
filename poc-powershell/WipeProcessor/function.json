@@ -1,0 +1,11 @@
+{
+  "bindings": [
+    {
+      "type": "serviceBusTrigger",
+      "direction": "in",
+      "name": "Message",
+      "queueName": "wipe-requests",
+      "connection": "ServiceBusConnection"
+    }
+  ]
+}

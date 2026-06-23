@@ -1,0 +1,26 @@
+{
+  "bindings": [
+    {
+      "authLevel": "function",
+      "type": "httpTrigger",
+      "direction": "in",
+      "name": "Request",
+      "methods": [
+        "post"
+      ],
+      "route": "v1/wipe"
+    },
+    {
+      "type": "http",
+      "direction": "out",
+      "name": "Response"
+    },
+    {
+      "type": "serviceBus",
+      "direction": "out",
+      "name": "OutMessage",
+      "queueName": "wipe-requests",
+      "connection": "ServiceBusConnection"
+    }
+  ]
+}
