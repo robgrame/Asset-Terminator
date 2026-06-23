@@ -56,10 +56,23 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   kind: 'StorageV2'
   properties: {
     allowBlobPublicAccess: false
-    // Consumption plan content share relies on shared key access.
+    // Flex Consumption deployment container uses connection-string auth.
     allowSharedKeyAccess: true
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
+  }
+}
+
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: storage
+  name: 'default'
+}
+
+resource deploymentContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: 'app-package'
+  properties: {
+    publicAccess: 'None'
   }
 }
 
@@ -91,47 +104,69 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   location: location
   tags: tags
   sku: {
-    name: 'Y1'
-    tier: 'Dynamic'
+    name: 'FC1'
+    tier: 'FlexConsumption'
   }
-  properties: {}
+  kind: 'functionapp'
+  properties: {
+    reserved: true
+  }
 }
+
+var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
 
 resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   name: funcName
   location: location
   tags: tags
-  kind: 'functionapp'
+  kind: 'functionapp,linux'
   identity: {
     type: 'SystemAssigned'
   }
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
+    functionAppConfig: {
+      deployment: {
+        storage: {
+          type: 'blobContainer'
+          value: '${storage.properties.primaryEndpoints.blob}app-package'
+          authentication: {
+            type: 'StorageAccountConnectionString'
+            storageAccountConnectionStringName: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
+          }
+        }
+      }
+      runtime: {
+        name: 'powershell'
+        version: '7.4'
+      }
+      scaleAndConcurrency: {
+        instanceMemoryMB: 2048
+        maximumInstanceCount: 40
+        alwaysReady: [
+          {
+            name: 'http'
+            instanceCount: 1
+          }
+          {
+            name: 'function:WipeProcessor'
+            instanceCount: 1
+          }
+        ]
+      }
+    }
     siteConfig: {
-      powerShellVersion: '7.4'
       ftpsState: 'Disabled'
       minTlsVersion: '1.2'
       appSettings: [
         {
           name: 'AzureWebJobsStorage'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+          value: storageConnectionString
         }
         {
-          name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
-        }
-        {
-          name: 'WEBSITE_CONTENTSHARE'
-          value: toLower(funcName)
-        }
-        {
-          name: 'FUNCTIONS_EXTENSION_VERSION'
-          value: '~4'
-        }
-        {
-          name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: 'powershell'
+          name: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
+          value: storageConnectionString
         }
         {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
