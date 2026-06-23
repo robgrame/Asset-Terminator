@@ -30,8 +30,8 @@ if (-not $payload) {
     return
 }
 
-if (-not $payload.managedDeviceId -and -not $payload.deviceName) {
-    Write-Problem -StatusCode 400 -Message 'Either managedDeviceId or deviceName is required.'
+if (-not $payload.managedDeviceId -and -not $payload.deviceName -and -not $payload.serialNumber) {
+    Write-Problem -StatusCode 400 -Message 'At least one of managedDeviceId, deviceName or serialNumber is required.'
     return
 }
 
@@ -47,6 +47,7 @@ $message = [ordered]@{
     correlationId   = $correlationId
     managedDeviceId = $payload.managedDeviceId
     deviceName      = $payload.deviceName
+    serialNumber    = $payload.serialNumber
     ticketNumber    = $payload.ticketNumber
     requestor       = $payload.requestor
     dryRun          = $dryRun
@@ -61,6 +62,7 @@ Write-PocLog -Level 'Information' -Message 'Wipe request accepted and enqueued.'
     requestId       = $requestId
     managedDeviceId = $payload.managedDeviceId
     deviceName      = $payload.deviceName
+    serialNumber    = $payload.serialNumber
     dryRun          = $dryRun
 }
 

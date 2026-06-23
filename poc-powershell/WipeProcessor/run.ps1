@@ -20,19 +20,26 @@ $logProps = @{
     requestId       = $request.requestId
     managedDeviceId = $request.managedDeviceId
     deviceName      = $request.deviceName
+    serialNumber    = $request.serialNumber
     dryRun          = $request.dryRun
 }
 
 Write-PocLog -Level 'Information' -Message 'Processing wipe request.' -Properties $logProps
 
 # --- 1. Resolve the device --------------------------------------------------
-$device = Get-IntuneManagedDevice -ManagedDeviceId $request.managedDeviceId -DeviceName $request.deviceName
+# ServiceNow sends serialNumber + deviceName. When several stale objects match,
+# Get-IntuneManagedDevice selects the freshest (newest enrollment / check-in).
+$device = Get-IntuneManagedDevice -ManagedDeviceId $request.managedDeviceId `
+    -DeviceName $request.deviceName -SerialNumber $request.serialNumber -LogProperties $logProps
 if (-not $device) {
     Write-PocLog -Level 'Error' -Message 'Device not found in Intune; nothing to wipe.' -Properties $logProps
     return
 }
 
 $logProps.managedDeviceId = $device.id
+$logProps.resolvedSerial  = $device.serialNumber
+$logProps.enrolledDateTime = $device.enrolledDateTime
+$logProps.lastSyncDateTime = $device.lastSyncDateTime
 
 # --- 2. Evaluate guardrails -------------------------------------------------
 $decision = Invoke-Guardrails -Device $device -ConfigPath $guardrailConfigPath

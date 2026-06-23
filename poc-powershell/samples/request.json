@@ -1,7 +1,7 @@
 {
   "requestId": "SNOW-INC0012345",
-  "managedDeviceId": "00000000-0000-0000-0000-000000000000",
   "deviceName": "LAPTOP-CONTOSO-01",
+  "serialNumber": "5CG1234XYZ",
   "ticketNumber": "INC0012345",
   "requestor": "service-desk@contoso.com",
   "dryRun": true

@@ -141,6 +141,32 @@ Follow execution in **Application Insights** (`attpoc-appi-dev`): each step
 (accepted ➜ guardrail PASS/FAIL ➜ BLOCKED or wipe outcome) is logged as a structured
 entry with the same `correlationId`.
 
+### Device resolution (serial + name, freshest wins)
+
+ServiceNow sends the **serialNumber together with the deviceName**. The request body
+accepts `managedDeviceId`, `deviceName` and/or `serialNumber` (at least one required):
+
+```jsonc
+{
+  "requestId": "SNOW-INC0012345",
+  "deviceName": "LAPTOP-CONTOSO-01",
+  "serialNumber": "5CG1234XYZ",
+  "dryRun": true
+}
+```
+
+`Get-IntuneManagedDevice` builds a combined Graph `$filter`
+(`deviceName eq '…' and serialNumber eq '…'`) and narrows the results client-side.
+Because re-enrollment / re-imaging can leave **several stale objects** with the same
+name and serial, when more than one device matches we never pick an arbitrary one —
+`Select-FreshestManagedDevice` selects the **freshest**:
+
+1. most recent `enrolledDateTime`, then
+2. most recent `lastSyncDateTime` (check-in) as tie-breaker.
+
+Missing/null dates sort as the oldest, and the selection is logged (count of matches +
+the resolved `serialNumber`, `enrolledDateTime`, `lastSyncDateTime`) for audit.
+
 ---
 
 ## 🔁 How it maps to the full solution
