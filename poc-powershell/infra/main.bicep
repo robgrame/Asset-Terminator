@@ -15,6 +15,7 @@ var storageName = take(toLower('${namePrefix}st${env}${suffix}'), 24)
 var sbNamespaceName = '${namePrefix}-sb-${env}'
 var planName = '${namePrefix}-plan-${env}'
 var funcName = '${namePrefix}-func-${env}'
+var uamiName = '${namePrefix}-func-uami-${env}'
 var lawName = '${namePrefix}-law-${env}'
 var aiName = '${namePrefix}-appi-${env}'
 
@@ -26,6 +27,15 @@ var tags = {
 // Built-in role definition IDs.
 var serviceBusDataSenderRoleId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
 var serviceBusDataReceiverRoleId = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
+var storageBlobDataOwnerRoleId = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+var storageQueueDataContributorRoleId = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+var storageTableDataContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+
+resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: uamiName
+  location: location
+  tags: tags
+}
 
 resource law 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: lawName
@@ -56,8 +66,9 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   kind: 'StorageV2'
   properties: {
     allowBlobPublicAccess: false
-    // Flex Consumption deployment container uses connection-string auth.
-    allowSharedKeyAccess: true
+    // Identity-based (passwordless) access only; the external hardening job keeps
+    // allowSharedKeyAccess disabled, so both deployment and runtime use the MI.
+    allowSharedKeyAccess: false
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
   }
@@ -113,7 +124,7 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   }
 }
 
-var storageConnectionString = 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+var storageBlobEndpoint = storage.properties.primaryEndpoints.blob
 
 resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   name: funcName
@@ -121,7 +132,10 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   tags: tags
   kind: 'functionapp,linux'
   identity: {
-    type: 'SystemAssigned'
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${uami.id}': {}
+    }
   }
   properties: {
     serverFarmId: plan.id
@@ -130,10 +144,10 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
       deployment: {
         storage: {
           type: 'blobContainer'
-          value: '${storage.properties.primaryEndpoints.blob}app-package'
+          value: '${storageBlobEndpoint}app-package'
           authentication: {
-            type: 'StorageAccountConnectionString'
-            storageAccountConnectionStringName: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
+            type: 'UserAssignedIdentity'
+            userAssignedIdentityResourceId: uami.id
           }
         }
       }
@@ -161,21 +175,47 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
       minTlsVersion: '1.2'
       appSettings: [
         {
-          name: 'AzureWebJobsStorage'
-          value: storageConnectionString
+          // Identity-based host storage (no shared key).
+          name: 'AzureWebJobsStorage__accountName'
+          value: storage.name
         }
         {
-          name: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
-          value: storageConnectionString
+          name: 'AzureWebJobsStorage__blobServiceUri'
+          value: storageBlobEndpoint
+        }
+        {
+          name: 'AzureWebJobsStorage__queueServiceUri'
+          value: storage.properties.primaryEndpoints.queue
+        }
+        {
+          name: 'AzureWebJobsStorage__tableServiceUri'
+          value: storage.properties.primaryEndpoints.table
+        }
+        {
+          // Tell the host which UAMI to use for the storage connection.
+          name: 'AzureWebJobsStorage__credential'
+          value: 'managedidentity'
+        }
+        {
+          name: 'AzureWebJobsStorage__clientId'
+          value: uami.properties.clientId
         }
         {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
           value: appInsights.properties.ConnectionString
         }
         {
-          // Passwordless Service Bus access via Managed Identity.
+          // Passwordless Service Bus access via the User-Assigned Managed Identity.
           name: 'ServiceBusConnection__fullyQualifiedNamespace'
           value: '${sbNamespaceName}.servicebus.windows.net'
+        }
+        {
+          name: 'ServiceBusConnection__credential'
+          value: 'managedidentity'
+        }
+        {
+          name: 'ServiceBusConnection__clientId'
+          value: uami.properties.clientId
         }
       ]
     }
@@ -184,26 +224,62 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
 
 // Grant the Function App identity send + receive on the Service Bus namespace.
 resource sbSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBus.id, functionApp.id, serviceBusDataSenderRoleId)
+  name: guid(serviceBus.id, uami.id, serviceBusDataSenderRoleId)
   scope: serviceBus
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataSenderRoleId)
-    principalId: functionApp.identity.principalId
+    principalId: uami.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
 resource sbReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBus.id, functionApp.id, serviceBusDataReceiverRoleId)
+  name: guid(serviceBus.id, uami.id, serviceBusDataReceiverRoleId)
   scope: serviceBus
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataReceiverRoleId)
-    principalId: functionApp.identity.principalId
+    principalId: uami.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Grant the Function App identity data access on the storage account so that
+// both the deployment container and the runtime host storage work without keys.
+resource blobOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, uami.id, storageBlobDataOwnerRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataOwnerRoleId)
+    principalId: uami.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource queueContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, uami.id, storageQueueDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageQueueDataContributorRoleId)
+    principalId: uami.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource tableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, uami.id, storageTableDataContributorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageTableDataContributorRoleId)
+    principalId: uami.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
 output functionAppName string = functionApp.name
-output functionPrincipalId string = functionApp.identity.principalId
+output functionPrincipalId string = uami.properties.principalId
+output functionClientId string = uami.properties.clientId
+output functionIdentityName string = uami.name
 output serviceBusNamespace string = serviceBus.name
 output queueName string = queueName
+
+
