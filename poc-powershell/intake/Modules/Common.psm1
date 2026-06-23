@@ -41,24 +41,27 @@ function New-CorrelationId {
     return [guid]::NewGuid().ToString()
 }
 
-function Get-GraphToken {
+function Get-IdentityToken {
     <#
         .SYNOPSIS
-            Returns a Microsoft Graph access token.
+            Returns an Entra access token for the given resource/audience.
         .DESCRIPTION
-            In Azure it uses the App Service / Functions Managed Identity endpoint
-            (IDENTITY_ENDPOINT + IDENTITY_HEADER). Set GRAPH_CLIENT_ID to target a
-            specific user-assigned identity; omit it for the system-assigned one.
+            In Azure it uses the Functions Managed Identity endpoint
+            (IDENTITY_ENDPOINT + IDENTITY_HEADER). Set UAMI_CLIENT_ID to target a
+            specific user-assigned identity (required when several are assigned).
             Locally it falls back to the Azure CLI (az account get-access-token).
+        .PARAMETER Resource
+            The audience, e.g. https://graph.microsoft.com or https://storage.azure.com.
     #>
     [CmdletBinding()]
     param(
-        [string] $Resource = 'https://graph.microsoft.com'
+        [Parameter(Mandatory)][string] $Resource,
+        [string] $ClientId = $env:UAMI_CLIENT_ID
     )
 
     if ($env:IDENTITY_ENDPOINT -and $env:IDENTITY_HEADER) {
         $uri = "$($env:IDENTITY_ENDPOINT)?resource=$Resource&api-version=2019-08-01"
-        if ($env:GRAPH_CLIENT_ID) { $uri += "&client_id=$($env:GRAPH_CLIENT_ID)" }
+        if ($ClientId) { $uri += "&client_id=$ClientId" }
         $response = Invoke-RestMethod -Method Get -Uri $uri -Headers @{ 'X-IDENTITY-HEADER' = $env:IDENTITY_HEADER }
         return $response.access_token
     }
@@ -66,9 +69,21 @@ function Get-GraphToken {
     # Local development fallback.
     $token = az account get-access-token --resource $Resource --query accessToken -o tsv 2>$null
     if (-not $token) {
-        throw 'Unable to acquire a Graph token: no Managed Identity endpoint and Azure CLI fallback failed.'
+        throw "Unable to acquire a token for '$Resource': no Managed Identity endpoint and Azure CLI fallback failed."
     }
     return $token
+}
+
+function Get-GraphToken {
+    <#
+        .SYNOPSIS
+            Returns a Microsoft Graph access token (delegates to Get-IdentityToken).
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $Resource = 'https://graph.microsoft.com'
+    )
+    return Get-IdentityToken -Resource $Resource
 }
 
 function Invoke-GraphRequest {
@@ -114,4 +129,4 @@ function Invoke-GraphRequest {
     }
 }
 
-Export-ModuleMember -Function Write-PocLog, New-CorrelationId, Get-GraphToken, Invoke-GraphRequest
+Export-ModuleMember -Function Write-PocLog, New-CorrelationId, Get-IdentityToken, Get-GraphToken, Invoke-GraphRequest
