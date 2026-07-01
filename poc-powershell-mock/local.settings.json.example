@@ -9,6 +9,13 @@
     "GRAPH_CLIENT_ID": "<app-registration-application-client-id>",
     "GRAPH_CLIENT_SECRET": "<app-registration-client-secret>",
 
-    "DEFAULT_DRY_RUN": "false"
+    "GRAPH_BASE_URI": "https://graph.microsoft.com/beta",
+    "GRAPH_AUTHORITY_HOST": "https://login.microsoftonline.com",
+    "GRAPH_SCOPE": "https://graph.microsoft.com/.default",
+    "GRAPH_MAX_RETRIES": "4",
+
+    "DEFAULT_DRY_RUN": "false",
+    "WIPE_KEEP_ENROLLMENT_DATA": "false",
+    "WIPE_KEEP_USER_DATA": "false"
   }
 }

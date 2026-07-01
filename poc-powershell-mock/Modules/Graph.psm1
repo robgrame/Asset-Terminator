@@ -5,9 +5,51 @@
 # secret (GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET). No managed
 # identity and no certificate are used. The token is cached in-process until a
 # minute before it expires.
+#
+# ALL configuration comes from the Function App Application Settings (environment
+# variables). Every knob has a safe default so the mock runs with only the three
+# GRAPH_* credential settings populated. Configurable settings:
+#   GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET   (credentials, required)
+#   GRAPH_BASE_URI            (default https://graph.microsoft.com/beta)
+#   GRAPH_AUTHORITY_HOST      (default https://login.microsoftonline.com)
+#   GRAPH_SCOPE              (default https://graph.microsoft.com/.default)
+#   GRAPH_MAX_RETRIES         (default 4)
+#   WIPE_KEEP_ENROLLMENT_DATA (default false)
+#   WIPE_KEEP_USER_DATA       (default false)
 
-$script:GraphBaseUri = 'https://graph.microsoft.com/beta'
-$script:TokenCache   = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
+$script:TokenCache = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
+
+function Get-AppSetting {
+    <#
+        .SYNOPSIS
+            Reads a Function Application Setting (environment variable), returning
+            $Default when it is unset or empty.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [string] $Default
+    )
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
+    return $value
+}
+
+function Get-AppSettingBool {
+    <#
+        .SYNOPSIS
+            Reads a boolean Function Application Setting, returning $Default when
+            unset or not parseable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Name,
+        [bool] $Default = $false
+    )
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
+    try { return [System.Convert]::ToBoolean($value) } catch { return $Default }
+}
 
 function Write-MockLog {
     <#
@@ -83,12 +125,13 @@ function Get-GraphToken {
     $body = @{
         client_id     = $clientId
         client_secret = $clientSecret
-        scope         = 'https://graph.microsoft.com/.default'
+        scope         = (Get-AppSetting -Name 'GRAPH_SCOPE' -Default 'https://graph.microsoft.com/.default')
         grant_type    = 'client_credentials'
     }
 
+    $authorityHost = (Get-AppSetting -Name 'GRAPH_AUTHORITY_HOST' -Default 'https://login.microsoftonline.com').TrimEnd('/')
     $response = Invoke-RestMethod -Method POST `
-        -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" `
+        -Uri "$authorityHost/$tenantId/oauth2/v2.0/token" `
         -ContentType 'application/x-www-form-urlencoded' `
         -Body $body
 
@@ -109,10 +152,12 @@ function Invoke-GraphRequest {
         [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PATCH', 'DELETE')][string] $Method,
         [Parameter(Mandatory)][string] $Path,
         [object] $Body,
-        [int] $MaxRetries = 4
+        [int] $MaxRetries = -1
     )
 
-    $uri = if ($Path -match '^https?://') { $Path } else { "$script:GraphBaseUri/$($Path.TrimStart('/'))" }
+    if ($MaxRetries -lt 0) { $MaxRetries = [int](Get-AppSetting -Name 'GRAPH_MAX_RETRIES' -Default '4') }
+    $baseUri = (Get-AppSetting -Name 'GRAPH_BASE_URI' -Default 'https://graph.microsoft.com/beta').TrimEnd('/')
+    $uri = if ($Path -match '^https?://') { $Path } else { "$baseUri/$($Path.TrimStart('/'))" }
 
     $attempt = 0
     while ($true) {
@@ -271,21 +316,24 @@ function Invoke-IntuneWipe {
     param(
         [Parameter(Mandatory)][string] $ManagedDeviceId,
         [switch] $DryRun,
-        [bool] $KeepEnrollmentData = $false,
-        [bool] $KeepUserData = $false,
+        [Nullable[bool]] $KeepEnrollmentData,
+        [Nullable[bool]] $KeepUserData,
         [hashtable] $LogProperties = @{}
     )
+
+    if ($null -eq $KeepEnrollmentData) { $KeepEnrollmentData = Get-AppSettingBool -Name 'WIPE_KEEP_ENROLLMENT_DATA' -Default $false }
+    if ($null -eq $KeepUserData)       { $KeepUserData       = Get-AppSettingBool -Name 'WIPE_KEEP_USER_DATA' -Default $false }
 
     if ($DryRun) {
         Write-MockLog -Level 'Information' -Message "DRY-RUN: wipe skipped for managedDevice $ManagedDeviceId." -Properties $LogProperties
         return [pscustomobject]@{ Action = 'Wipe'; Outcome = 'DryRun'; ManagedDeviceId = $ManagedDeviceId; ExecutedAt = (Get-Date).ToUniversalTime().ToString('o') }
     }
 
-    $body = @{ keepEnrollmentData = $KeepEnrollmentData; keepUserData = $KeepUserData }
+    $body = @{ keepEnrollmentData = [bool]$KeepEnrollmentData; keepUserData = [bool]$KeepUserData }
     Invoke-GraphRequest -Method POST -Path "deviceManagement/managedDevices/$ManagedDeviceId/wipe" -Body $body | Out-Null
     Write-MockLog -Level 'Information' -Message "Wipe command issued for managedDevice $ManagedDeviceId." -Properties $LogProperties
     return [pscustomobject]@{ Action = 'Wipe'; Outcome = 'Issued'; ManagedDeviceId = $ManagedDeviceId; ExecutedAt = (Get-Date).ToUniversalTime().ToString('o') }
 }
 
 Export-ModuleMember -Function Write-MockLog, ConvertTo-DeviceOs, Get-GraphToken, Invoke-GraphRequest, `
-    Get-IntuneManagedDevice, Remove-AutopilotDevice, Invoke-IntuneWipe
+    Get-IntuneManagedDevice, Remove-AutopilotDevice, Invoke-IntuneWipe, Get-AppSetting, Get-AppSettingBool

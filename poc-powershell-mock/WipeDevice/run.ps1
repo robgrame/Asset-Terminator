@@ -56,8 +56,7 @@ $correlationId = [guid]::NewGuid().ToString()
 $requestId = if ($payload.requestId) { [string]$payload.requestId } else { $correlationId }
 
 # DryRun: default from DEFAULT_DRY_RUN app setting (default false = execute for real).
-$dryRun = $false
-if ($env:DEFAULT_DRY_RUN) { try { $dryRun = [System.Convert]::ToBoolean($env:DEFAULT_DRY_RUN) } catch { } }
+$dryRun = Get-AppSettingBool -Name 'DEFAULT_DRY_RUN' -Default $false
 if ($null -ne $payload.dryRun) { $dryRun = [System.Convert]::ToBoolean($payload.dryRun) }
 
 $logProps = @{

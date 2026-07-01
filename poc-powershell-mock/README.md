@@ -25,17 +25,27 @@ function, with no queue, no database and no Durable Functions.
 
 `dryRun: true` evaluates everything and calls nothing destructive.
 
-## Graph authentication — app registration + secret
+## Configuration — everything via Application Settings
 
-Graph is called with the **client credentials** grant (app registration + client
-secret). **No managed identity, no certificate.** Configure:
+**All** configuration is read from the Function App **Application Settings**
+(environment variables). Only the three `GRAPH_*` credential settings are
+required; every other setting has a safe default.
 
-| App setting | Description |
-|---|---|
-| `GRAPH_TENANT_ID` | Entra tenant (directory) ID |
-| `GRAPH_CLIENT_ID` | App registration application (client) ID |
-| `GRAPH_CLIENT_SECRET` | App registration client secret |
-| `DEFAULT_DRY_RUN` | `true`/`false` default when the request omits `dryRun` (default `false`) |
+| App setting | Required | Default | Description |
+|---|---|---|---|
+| `GRAPH_TENANT_ID` | ✅ | — | Entra tenant (directory) ID |
+| `GRAPH_CLIENT_ID` | ✅ | — | App registration application (client) ID |
+| `GRAPH_CLIENT_SECRET` | ✅ | — | App registration client secret |
+| `GRAPH_BASE_URI` | | `https://graph.microsoft.com/beta` | Graph endpoint (`beta` or `v1.0`) |
+| `GRAPH_AUTHORITY_HOST` | | `https://login.microsoftonline.com` | Entra authority host (change for sovereign clouds) |
+| `GRAPH_SCOPE` | | `https://graph.microsoft.com/.default` | OAuth2 scope for the client-credentials token |
+| `GRAPH_MAX_RETRIES` | | `4` | Retries on transient Graph errors (429/5xx) |
+| `DEFAULT_DRY_RUN` | | `false` | Default when the request omits `dryRun` |
+| `WIPE_KEEP_ENROLLMENT_DATA` | | `false` | `keepEnrollmentData` on the Intune wipe |
+| `WIPE_KEEP_USER_DATA` | | `false` | `keepUserData` on the Intune wipe |
+
+> Store `GRAPH_CLIENT_SECRET` in Key Vault and reference it from the app setting
+> for anything beyond a throwaway mock.
 
 ### Required Graph application permissions (admin-consented)
 
@@ -44,9 +54,6 @@ secret). **No managed identity, no certificate.** Configure:
 | `DeviceManagementManagedDevices.Read.All` | resolve the managed device |
 | `DeviceManagementManagedDevices.PrivilegedOperations.All` | issue the wipe |
 | `DeviceManagementServiceConfig.ReadWrite.All` | delete from Windows Autopilot |
-
-> Store `GRAPH_CLIENT_SECRET` in Key Vault and reference it from the app setting
-> for anything beyond a throwaway mock.
 
 ## Request body
 
