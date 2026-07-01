@@ -28,3 +28,5 @@ Thumbs.db
 *.publishsettings
 appsettings.*.local.json
 .env
+
+infra/main.json
