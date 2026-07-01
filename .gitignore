@@ -30,3 +30,6 @@ appsettings.*.local.json
 .env
 
 infra/main.json
+
+# Compiled bicep
+poc-powershell-mock/infra/main.json

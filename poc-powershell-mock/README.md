@@ -113,6 +113,34 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:7071/api/v1/wipe' `
 
 ## Deploy to Azure
 
+### Infrastructure (Bicep)
+
+`infra/main.bicep` provisions a **B1 Linux App Service Plan** (Always On), a
+**PowerShell 7.4 Function App**, a storage account (identity-based, shared key
+disabled) and **Application Insights** (workspace-based). No Key Vault, no App
+Configuration. The user-assigned identity is used only to authenticate the
+Functions host to storage — Graph auth uses the app registration + secret.
+
+All application configuration is set as **Application Settings** by the template.
+
+```powershell
+cd infra
+./deploy.ps1 -ResourceGroup ASSET-TERMINATOR-RG -Location northeurope `
+    -GraphTenantId  <tenant-id> `
+    -GraphClientId  <app-id> `
+    -GraphClientSecret <secret>
+```
+
+`deploy.ps1` deploys the infra, publishes the code, and prints the invoke URL +
+function key. Use `-SkipPublish` to deploy infra only.
+
+Grant the Graph app registration these **application** permissions (admin
+consent required): `DeviceManagementManagedDevices.Read.All`,
+`DeviceManagementManagedDevices.PrivilegedOperations.All`,
+`DeviceManagementServiceConfig.ReadWrite.All`.
+
+### Manual publish
+
 ```powershell
 func azure functionapp publish <function-app-name>
 
