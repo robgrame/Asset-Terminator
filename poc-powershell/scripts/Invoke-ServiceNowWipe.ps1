@@ -43,6 +43,11 @@
 .PARAMETER Execute
     Request a REAL wipe (dryRun = false). Without this switch the call is a dry-run.
 
+.PARAMETER Disposition
+    Decommission disposition: 'Terminate' (default, destructive wipe flow with
+    Autopilot delete + pre-wipe preventive actions) or 'Retire' (re-purpose:
+    Intune retire, no wipe/Autopilot/preventive actions).
+
 .PARAMETER ListDevices
     List managed devices from Intune (Graph) and exit. Optionally filter with
     -DeviceName / -SerialNumber (client-side contains match).
@@ -61,6 +66,9 @@
 
 .EXAMPLE
     ./Invoke-ServiceNowWipe.ps1 -ManagedDeviceId '00000000-0000-0000-0000-000000000000' -Execute
+
+.EXAMPLE
+    ./Invoke-ServiceNowWipe.ps1 -DeviceName 'POOL-LAPTOP-018' -SerialNumber '5CG9876ABC' -Disposition Retire
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
@@ -71,6 +79,8 @@ param(
     [string] $ManagedDeviceId,
     [string] $TicketNumber,
     [string] $Requestor = 'service-desk@contoso.com',
+    [ValidateSet('Terminate', 'Retire')]
+    [string] $Disposition = 'Terminate',
     [switch] $Execute,
     [switch] $ListDevices,
     [int]    $PollTimeoutSeconds = 180,
@@ -134,7 +144,8 @@ if (-not $DeviceName -and -not $SerialNumber -and -not $ManagedDeviceId) {
 $dryRun = -not $Execute
 if ($Execute) {
     $target = @($DeviceName, $SerialNumber, $ManagedDeviceId | Where-Object { $_ }) -join ' / '
-    if (-not $PSCmdlet.ShouldProcess($target, "REAL Intune WIPE (irreversible)")) {
+    $actionLabel = if ($Disposition -eq 'Retire') { "REAL Intune RETIRE (re-purpose)" } else { "REAL Intune WIPE (irreversible)" }
+    if (-not $PSCmdlet.ShouldProcess($target, $actionLabel)) {
         Write-Warn "Aborted by user. No request submitted."
         return
     }
@@ -144,12 +155,14 @@ if (-not $TicketNumber) { $TicketNumber = "INC{0:D7}" -f (Get-Random -Minimum 1 
 $requestId = "SNOW-$TicketNumber-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmss'))"
 
 # --- Build the ServiceNow-style payload ------------------------------------
+$requestedActions = if ($Disposition -eq 'Retire') { @('delete-Intune', 'retire') } else { @('delete-Intune', 'wipe') }
 $payload = [ordered]@{
     requestId        = $requestId
     ticketNumber     = $TicketNumber
     requestor        = $Requestor
     timestamp        = [DateTime]::UtcNow.ToString('o')
-    requestedActions = @('delete-Intune', 'wipe')
+    dispositionType  = $Disposition
+    requestedActions = $requestedActions
     dryRun           = $dryRun
 }
 if ($DeviceName)      { $payload.deviceName      = $DeviceName }
@@ -208,8 +221,8 @@ while ((Get-Date) -lt $deadline) {
     if ($state.overallStatus -in $terminal) {
         Write-Host ""
         switch ($state.overallStatus) {
-            'Completed' { Write-Ok   "WIPE COMPLETED ($(if ($state.dryRun) { 'dry-run / simulated' } else { 'REAL' }))." }
-            'Blocked'   { Write-Warn "BLOCKED by guardrails - no wipe performed." }
+            'Completed' { Write-Ok   "$($Disposition.ToUpper()) COMPLETED ($(if ($state.dryRun) { 'dry-run / simulated' } else { 'REAL' }))." }
+            'Blocked'   { Write-Warn "BLOCKED by guardrails / pre-wipe actions - no wipe performed." }
             'Failed'    { Write-Warn "FAILED - $($state.detail)" }
         }
         Write-Step "Final state + history:"

@@ -41,6 +41,14 @@ if (-not $payload.managedDeviceId -and -not $payload.deviceName -and -not $paylo
     return
 }
 
+# Disposition: Terminate (default, destructive wipe flow) or Retire (re-purpose, no wipe).
+$disposition = 'Terminate'
+if ($payload.dispositionType) { $disposition = [string]$payload.dispositionType }
+if ($disposition -notin @('Terminate', 'Retire')) {
+    Write-Json -StatusCode 400 -Object @{ error = "dispositionType must be 'Terminate' or 'Retire'." }
+    return
+}
+
 $correlationId = New-CorrelationId
 $requestId = if ($payload.requestId) { [string]$payload.requestId } else { $correlationId }
 
@@ -54,6 +62,7 @@ $logProps = @{
     managedDeviceId = $payload.managedDeviceId
     deviceName      = $payload.deviceName
     serialNumber    = $payload.serialNumber
+    dispositionType = $disposition
     dryRun          = $dryRun
 }
 
@@ -68,6 +77,7 @@ try {
         SerialNumber    = [string]$payload.serialNumber
         TicketNumber    = [string]$payload.ticketNumber
         Requestor       = [string]$payload.requestor
+        DispositionType = $disposition
         DryRun          = $dryRun
     }
 
@@ -102,6 +112,7 @@ $message = [ordered]@{
     serialNumber    = $payload.serialNumber
     ticketNumber    = $payload.ticketNumber
     requestor       = $payload.requestor
+    dispositionType = $disposition
     dryRun          = $dryRun
     enqueuedAt      = (Get-Date).ToUniversalTime().ToString('o')
 }
@@ -111,8 +122,9 @@ Push-OutputBinding -Name OutMessage -Value ($message | ConvertTo-Json -Depth 6)
 Write-PocLog -Level 'Information' -Message 'Wipe request accepted and enqueued.' -Properties $logProps
 
 Write-Json -StatusCode ([int][HttpStatusCode]::Accepted) -Object @{
-    status        = 'Accepted'
-    requestId     = $requestId
-    correlationId = $correlationId
-    dryRun        = $dryRun
+    status          = 'Accepted'
+    requestId       = $requestId
+    correlationId   = $correlationId
+    dispositionType = $disposition
+    dryRun          = $dryRun
 }

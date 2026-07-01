@@ -42,17 +42,18 @@ try {
     })
 
     Write-Json -StatusCode 200 -Object @{
-        requestId     = $state.RequestId
-        correlationId = $state.CorrelationId
-        overallStatus = $state.OverallStatus
-        deviceName    = $state.DeviceName
-        serialNumber  = $state.SerialNumber
-        ticketNumber  = $state.TicketNumber
-        dryRun        = $state.DryRun
-        createdAt     = $state.CreatedAt
-        lastUpdatedAt = $state.LastUpdatedAt
-        detail        = $state.Detail
-        history       = $history
+        requestId       = $state.RequestId
+        correlationId   = $state.CorrelationId
+        overallStatus   = $state.OverallStatus
+        deviceName      = $state.DeviceName
+        serialNumber    = $state.SerialNumber
+        ticketNumber    = $state.TicketNumber
+        dispositionType = $state.DispositionType
+        dryRun          = $state.DryRun
+        createdAt       = $state.CreatedAt
+        lastUpdatedAt   = $state.LastUpdatedAt
+        detail          = $state.Detail
+        history         = $history
     }
 }
 catch {

@@ -1,0 +1,20 @@
+{
+  "deleteFromAutopilot": true,
+  "requireCompletionBeforeWipe": true,
+  "actions": [
+    {
+      "name": "LicenseRemoval",
+      "enabled": true,
+      "required": true,
+      "settings": {
+        "targetEdition": "Windows Pro"
+      }
+    },
+    {
+      "name": "BiosPasswordRemoval",
+      "enabled": true,
+      "required": true,
+      "settings": {}
+    }
+  ]
+}

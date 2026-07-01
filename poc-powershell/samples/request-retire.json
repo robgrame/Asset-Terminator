@@ -1,0 +1,9 @@
+{
+  "requestId": "SNOW-INC0012399",
+  "deviceName": "POOL-LAPTOP-018",
+  "serialNumber": "5CG9876ABC",
+  "ticketNumber": "INC0012399",
+  "requestor": "service-desk@contoso.com",
+  "dispositionType": "Retire",
+  "dryRun": true
+}

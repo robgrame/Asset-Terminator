@@ -47,7 +47,7 @@ function Get-IntuneManagedDevice {
         [hashtable] $LogProperties = @{}
     )
 
-    $select = 'id,deviceName,managedDeviceOwnerType,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,deviceCategoryDisplayName'
+    $select = 'id,deviceName,managedDeviceOwnerType,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,manufacturer,deviceCategoryDisplayName'
 
     if ($ManagedDeviceId) {
         try {

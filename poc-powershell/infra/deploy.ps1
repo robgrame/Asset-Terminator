@@ -51,7 +51,8 @@ if (-not $SkipGraphConsent) {
 
     $roleNames = @(
         'DeviceManagementManagedDevices.Read.All',                 # read managed device (guardrail signals)
-        'DeviceManagementManagedDevices.PrivilegedOperations.All'  # wipe / retire
+        'DeviceManagementManagedDevices.PrivilegedOperations.All', # wipe / retire
+        'DeviceManagementServiceConfig.ReadWrite.All'              # delete from Windows Autopilot (pre-wipe)
     )
 
     foreach ($roleName in $roleNames) {
@@ -72,7 +73,7 @@ if (-not $SkipGraphConsent) {
     }
 }
 else {
-    Write-Warning 'Skipping Graph consent. Assign DeviceManagementManagedDevices.Read.All and .PrivilegedOperations.All to the PROCESSOR identity manually.'
+    Write-Warning 'Skipping Graph consent. Assign DeviceManagementManagedDevices.Read.All, .PrivilegedOperations.All and DeviceManagementServiceConfig.ReadWrite.All to the PROCESSOR identity manually.'
 }
 
 # ---------------------------------------------------------------------------
