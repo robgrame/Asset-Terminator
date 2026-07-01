@@ -335,5 +335,100 @@ function Invoke-IntuneWipe {
     return [pscustomobject]@{ Action = 'Wipe'; Outcome = 'Issued'; ManagedDeviceId = $ManagedDeviceId; ExecutedAt = (Get-Date).ToUniversalTime().ToString('o') }
 }
 
+function Get-DeviceWipeStatus {
+    <#
+        .SYNOPSIS
+            Reads the LIVE state of a previously issued Intune wipe for a managed
+            device, straight from Microsoft Graph (no local persistence).
+        .DESCRIPTION
+            GET /deviceManagement/managedDevices/{id} selecting managementState and
+            deviceActionResults, then extracts the 'wipe' entry. Intune wipes are
+            asynchronous: the command is only carried out when the device next checks
+            in, so this reports the real progress after the wipe was issued.
+
+            actionState values (Graph): none | pending | canceled | active | done |
+            failed | notSupported | retryPending. 'active' is surfaced as 'inProgress'.
+            Requires DeviceManagementManagedDevices.Read.All.
+        .OUTPUTS
+            PSCustomObject: Found (bool), plus device fields and the wipe action
+            result (WipeState, WipeStartDateTime, WipeLastUpdatedDateTime), or
+            Found=$false when the managed device no longer exists (already wiped /
+            retired objects are removed from Intune).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ManagedDeviceId,
+        [hashtable] $LogProperties = @{}
+    )
+
+    $select = 'id,deviceName,serialNumber,operatingSystem,managementState,lastSyncDateTime'
+    $device = $null
+    try {
+        $device = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices/$ManagedDeviceId`?`$select=$select,deviceActionResults"
+    }
+    catch {
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($status -eq 404) {
+            Write-MockLog -Level 'Information' -Message "Managed device $ManagedDeviceId not found (likely already wiped/removed)." -Properties $LogProperties
+            return [pscustomobject]@{ Found = $false; ManagedDeviceId = $ManagedDeviceId }
+        }
+        throw
+    }
+
+    $wipe = @($device.deviceActionResults) | Where-Object { $_.actionName -eq 'wipe' } | Select-Object -First 1
+
+    $wipeState = if ($wipe) {
+        switch ($wipe.actionState) {
+            'active' { 'inProgress' }
+            default  { [string]$wipe.actionState }
+        }
+    }
+    else { 'notIssued' }
+
+    return [pscustomobject]@{
+        Found                   = $true
+        ManagedDeviceId         = $device.id
+        DeviceName              = $device.deviceName
+        SerialNumber            = $device.serialNumber
+        OperatingSystem         = $device.operatingSystem
+        ManagementState         = $device.managementState
+        LastSyncDateTime        = $device.lastSyncDateTime
+        WipeState               = $wipeState
+        WipeStartDateTime       = if ($wipe) { $wipe.startDateTime } else { $null }
+        WipeLastUpdatedDateTime = if ($wipe) { $wipe.lastUpdatedDateTime } else { $null }
+    }
+}
+
+function Get-AutopilotDeviceStatus {
+    <#
+        .SYNOPSIS
+            Reports whether a Windows Autopilot identity still exists for a serial
+            number (used to confirm the Autopilot deletion took effect).
+        .OUTPUTS
+            PSCustomObject: Present (bool), AutopilotDeviceId, SerialNumber.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $SerialNumber,
+        [hashtable] $LogProperties = @{}
+    )
+
+    if (-not $SerialNumber) {
+        return [pscustomobject]@{ Present = $null; AutopilotDeviceId = $null; SerialNumber = $SerialNumber; Detail = 'No serialNumber to check.' }
+    }
+
+    $escaped = $SerialNumber.Replace("'", "''")
+    $filter  = [Uri]::EscapeDataString("contains(serialNumber,'$escaped')")
+    $result  = Invoke-GraphRequest -Method GET -Path "deviceManagement/windowsAutopilotDeviceIdentities?`$filter=$filter"
+    $identity = @($result.value) | Where-Object { $_.serialNumber -eq $SerialNumber } | Select-Object -First 1
+
+    if ($identity) {
+        return [pscustomobject]@{ Present = $true; AutopilotDeviceId = $identity.id; SerialNumber = $SerialNumber }
+    }
+    return [pscustomobject]@{ Present = $false; AutopilotDeviceId = $null; SerialNumber = $SerialNumber }
+}
+
 Export-ModuleMember -Function Write-MockLog, ConvertTo-DeviceOs, Get-GraphToken, Invoke-GraphRequest, `
-    Get-IntuneManagedDevice, Remove-AutopilotDevice, Invoke-IntuneWipe, Get-AppSetting, Get-AppSettingBool
+    Get-IntuneManagedDevice, Remove-AutopilotDevice, Invoke-IntuneWipe, Get-DeviceWipeStatus, `
+    Get-AutopilotDeviceStatus, Get-AppSetting, Get-AppSettingBool

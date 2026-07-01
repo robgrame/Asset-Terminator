@@ -1,9 +1,10 @@
 # Asset-Terminator — PowerShell single-function mock
 
-A deliberately minimal **mockup** of the decommission flow: **one** Azure Function
-(PowerShell) that combines *intake* and *processing* in a single synchronous call.
-It deletes the device from **Windows Autopilot** (Windows only) and issues the
-**Intune wipe**.
+A deliberately minimal **mockup** of the decommission flow: an Azure Function app
+(PowerShell) whose main endpoint combines *intake* and *processing* in a single
+synchronous call. It deletes the device from **Windows Autopilot** (Windows only)
+and issues the **Intune wipe**. A second read-only endpoint reports the live
+request status straight from Microsoft Graph.
 
 This is intentionally simpler than the production-shaped `poc-powershell/`
 (two apps + Service Bus + state store): here everything happens inline in one
@@ -96,6 +97,61 @@ Sample payloads are in [`samples/`](./samples).
 ```
 
 `overallStatus`: `Completed` (real run), `DryRun`, or `Failed` (wipe error → HTTP 502).
+
+> ⚠️ **`Completed` means the wipe command was *accepted* by Intune, not that the
+> device is already wiped.** Intune wipes are asynchronous: the device performs
+> the wipe at its next MDM check-in. Use the status endpoint below to see the
+> real progress.
+
+## Checking the request status
+
+`GET /api/v1/wipe/status`
+
+Because the mock keeps **no local state**, status is derived **live** from
+Microsoft Graph on every call:
+
+- **Wipe progress** — from `managedDevices/{id}.deviceActionResults` (the `wipe`
+  action): `pending` → `inProgress` → `done` / `failed`. A device that has
+  disappeared from Intune is reported as `notFoundInIntune` (the wipe most likely
+  completed and the object was removed).
+- **Autopilot removal** (Windows only) — presence of a
+  `windowsAutopilotDeviceIdentities` object for the serial number.
+
+Caller auth is the same **Function API Key**. Provide at least one identifier as a
+query-string parameter; add `operatingSystem` to enable the Autopilot check.
+
+| Query parameter | Description |
+|---|---|
+| `managedDeviceId` | Intune managed device id (most precise) |
+| `deviceName` | Device name |
+| `serialNumber` | Serial number (also used for the Autopilot check) |
+| `operatingSystem` | `Windows` \| `Mac` \| `Mobile` (Autopilot check runs for Windows) |
+
+```powershell
+Invoke-RestMethod -Method Get `
+  -Uri 'http://localhost:7071/api/v1/wipe/status?serialNumber=PF3ABCDE&operatingSystem=Windows'
+```
+
+```json
+{
+  "correlationId": "…",
+  "operatingSystem": "Windows",
+  "overallStatus": "WipeInProgress",
+  "wipe": {
+    "found": true,
+    "managedDeviceId": "…",
+    "managementState": "wipe",
+    "state": "inProgress",
+    "startDateTime": "…",
+    "lastUpdatedDateTime": "…"
+  },
+  "autopilot": { "serialNumber": "PF3ABCDE", "present": false, "removed": true, "autopilotDeviceId": null },
+  "checkedAt": "…"
+}
+```
+
+`overallStatus`: `NoWipeIssued` · `WipePending` · `WipeInProgress` ·
+`WipeRetryPending` · `WipeCompleted` · `WipeCompletedOrRemoved` · `WipeFailed`.
 
 ## Run locally
 
