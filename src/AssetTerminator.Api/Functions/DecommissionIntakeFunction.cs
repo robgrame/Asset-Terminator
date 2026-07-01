@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using AssetTerminator.Api.Services;
 using AssetTerminator.Contracts;
 using Microsoft.AspNetCore.Http;
@@ -14,7 +15,10 @@ namespace AssetTerminator.Api.Functions;
 /// </summary>
 public sealed class DecommissionIntakeFunction
 {
-    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() }
+    };
 
     private readonly IntakeService _intake;
     private readonly ILogger<DecommissionIntakeFunction> _logger;
