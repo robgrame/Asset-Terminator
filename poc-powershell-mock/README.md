@@ -187,6 +187,23 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:7071/api/v1/wipe' `
 Use `-SkipStatus` to send only the wipe. `-DryRun`/`-Execute` override the sample's
 `dryRun` flag.
 
+### Query status only
+
+`test/Get-WipeStatus.ps1` calls only `GET /api/v1/wipe/status` (no wipe is issued),
+and can poll until the wipe reaches a terminal state.
+
+```powershell
+# One-shot status
+./test/Get-WipeStatus.ps1 -SerialNumber PF3ABCDE -OperatingSystem Windows
+
+# Poll a deployed app until the wipe finishes
+./test/Get-WipeStatus.ps1 -BaseUrl https://attmock-func-dev.azurewebsites.net `
+  -FunctionKey <key> -ManagedDeviceId <id> -Watch
+```
+
+`-Watch` polls every `-IntervalSeconds` (default 30) up to `-MaxPolls` (default 20)
+until `WipeCompleted` / `WipeCompletedOrRemoved` / `WipeFailed`.
+
 ## Deploy to Azure
 
 ### Infrastructure (Bicep)
