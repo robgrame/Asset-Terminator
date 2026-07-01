@@ -167,6 +167,26 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:7071/api/v1/wipe' `
   -ContentType 'application/json' -Body $body
 ```
 
+### Test script
+
+`test/Invoke-MockTest.ps1` runs the full flow — POST the wipe, then GET the status
+— against a local host or a deployed app.
+
+```powershell
+# Local host, safe dry-run against the Windows sample
+./test/Invoke-MockTest.ps1 -DryRun
+
+# Different sample / real execution
+./test/Invoke-MockTest.ps1 -SamplePath .\samples\request-mac.json -DryRun
+
+# Deployed app (key sent as x-functions-key), real execution
+./test/Invoke-MockTest.ps1 -BaseUrl https://attmock-func-dev.azurewebsites.net `
+  -FunctionKey <key> -Execute
+```
+
+Use `-SkipStatus` to send only the wipe. `-DryRun`/`-Execute` override the sample's
+`dryRun` flag.
+
 ## Deploy to Azure
 
 ### Infrastructure (Bicep)
