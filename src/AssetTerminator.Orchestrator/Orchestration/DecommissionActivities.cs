@@ -3,17 +3,27 @@ using AssetTerminator.Contracts;
 using AssetTerminator.Core.Abstractions;
 using AssetTerminator.Core.Domain;
 using AssetTerminator.Core.Guardrails;
+using AssetTerminator.Core.Options;
 using AssetTerminator.Orchestrator.Services;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace AssetTerminator.Orchestrator.Orchestration;
 
 /// <summary>Serializable metadata returned by the validate/enrich activity.</summary>
-public sealed record RequestMeta(bool DryRun, bool WipeRequested, List<DecommissionTarget> Targets);
+public sealed record RequestMeta(
+    bool DryRun,
+    DispositionType Disposition,
+    List<DecommissionTarget> Targets,
+    TimeSpan PreWipePollInterval,
+    bool RequirePreWipeCompletion);
 
 /// <summary>Serializable guardrail outcome passed back to the orchestrator.</summary>
 public sealed record GuardrailOutcome(bool Allowed, List<string> BlockingReasons);
+
+/// <summary>Completion state of the on-device pre-wipe preventive actions.</summary>
+public sealed record PreWipeStatus(bool AllTerminal, bool AllSucceeded, bool DeadlinePassed, List<string> FailedReasons);
 
 /// <summary>
 /// Durable activity functions. Each activity loads the current state from the store by
@@ -31,8 +41,11 @@ public sealed class DecommissionActivities
     private readonly IActionDispatcher _dispatcher;
     private readonly IEnumerable<IDeviceCleanupProvider> _providers;
     private readonly IWipeProvider _wipe;
+    private readonly IRetireProvider _retire;
     private readonly CallbackPublisher _callbacks;
     private readonly IOperationalTelemetry _telemetry;
+    private readonly OrchestrationOptions _orchestration;
+    private readonly PreWipeOptions _preWipe;
     private readonly ILogger<DecommissionActivities> _logger;
 
     public DecommissionActivities(
@@ -43,8 +56,11 @@ public sealed class DecommissionActivities
         IActionDispatcher dispatcher,
         IEnumerable<IDeviceCleanupProvider> providers,
         IWipeProvider wipe,
+        IRetireProvider retire,
         CallbackPublisher callbacks,
         IOperationalTelemetry telemetry,
+        IOptions<OrchestrationOptions> orchestration,
+        IOptions<PreWipeOptions> preWipe,
         ILogger<DecommissionActivities> logger)
     {
         _store = store;
@@ -54,8 +70,11 @@ public sealed class DecommissionActivities
         _dispatcher = dispatcher;
         _providers = providers;
         _wipe = wipe;
+        _retire = retire;
         _callbacks = callbacks;
         _telemetry = telemetry;
+        _orchestration = orchestration.Value;
+        _preWipe = preWipe.Value;
         _logger = logger;
     }
 
@@ -71,10 +90,15 @@ public sealed class DecommissionActivities
         await _store.UpdateAsync(record, ct);
 
         await Audit(record, "Validated", null, "Validated",
-            $"intuneId={context.IntuneManagedDeviceId}; entraId={context.EntraDeviceId}; encrypted={context.IsEncrypted}", ct);
+            $"disposition={record.DispositionType}; intuneId={context.IntuneManagedDeviceId}; entraId={context.EntraDeviceId}; encrypted={context.IsEncrypted}", ct);
 
         var targets = record.Actions.Select(a => a.Target).ToList();
-        return new RequestMeta(record.DryRun, targets.Contains(DecommissionTarget.Wipe), targets);
+        return new RequestMeta(
+            record.DryRun,
+            record.DispositionType,
+            targets,
+            _orchestration.PreWipePollInterval,
+            _preWipe.RequireCompletionBeforeWipe);
     }
 
     [Function(nameof(EvaluateGuardrails))]
@@ -200,6 +224,58 @@ public sealed class DecommissionActivities
         await _telemetry.ActionSnapshotAsync(record, action, ct);
     }
 
+    [Function(nameof(ExecuteRetire))]
+    public async Task ExecuteRetire([ActivityTrigger] string requestId, CancellationToken ct)
+    {
+        var record = await Load(requestId, ct);
+        var context = LoadContext(record);
+        var action = record.Actions.First(a => a.Target == DecommissionTarget.Retire);
+        action.LastCheckedUtc = DateTimeOffset.UtcNow;
+
+        if (record.DryRun)
+        {
+            action.Status = ActionStatus.Skipped;
+            action.Details = "[DRY-RUN] retire simulated";
+            action.FinalOutcome = "Skipped";
+            await _store.UpdateAsync(record, ct);
+            await Audit(record, "RetireSimulated", "Retire", "Skipped", "[DRY-RUN]", ct);
+            return;
+        }
+
+        await Audit(record, "RetireIssued", "Retire", "InProgress", null, ct); // write-before-action
+        var result = await _retire.RetireAsync(context, ct);
+        // The retire is asynchronous; success here only means the command was accepted.
+        action.Status = result.Status == ActionStatus.Failed ? ActionStatus.Failed
+            : result.Status == ActionStatus.Skipped ? ActionStatus.Skipped
+            : ActionStatus.InProgress;
+        action.Details = result.Detail ?? "retire command issued; awaiting completion";
+        if (result.Status == ActionStatus.Skipped)
+            action.FinalOutcome = "Skipped";
+        else if (result.Status == ActionStatus.Failed && !result.Transient)
+            action.FinalOutcome = "Failed";
+        await _store.UpdateAsync(record, ct);
+        await Audit(record, "RetireAccepted", "Retire", action.Status.ToString(), result.Detail, ct);
+        await _telemetry.ActionSnapshotAsync(record, action, ct);
+    }
+
+    [Function(nameof(CheckPreWipeActions))]
+    public async Task<PreWipeStatus> CheckPreWipeActions([ActivityTrigger] CheckPreWipeInput input, CancellationToken ct)
+    {
+        var record = await Load(input.RequestId, ct);
+        var targets = input.Targets.ToHashSet();
+        var actions = record.Actions.Where(a => targets.Contains(a.Target)).ToList();
+
+        var allTerminal = actions.All(a => IsTerminal(a.Status));
+        var allSucceeded = actions.All(a => a.Status is ActionStatus.Success or ActionStatus.Skipped);
+        var deadlinePassed = DateTimeOffset.UtcNow >= record.DueAtUtc;
+        var failed = actions
+            .Where(a => a.Status is not (ActionStatus.Success or ActionStatus.Skipped))
+            .Select(a => $"{a.Target}: {a.Details ?? a.Status.ToString()}")
+            .ToList();
+
+        return new PreWipeStatus(allTerminal, allSucceeded, deadlinePassed, failed);
+    }
+
     [Function(nameof(BlockWipe))]
     public async Task BlockWipe([ActivityTrigger] BlockInput input, CancellationToken ct)
     {
@@ -214,7 +290,7 @@ public sealed class DecommissionActivities
         record.State = RequestState.GuardrailsFailed;
         await _store.UpdateAsync(record, ct);
         await Audit(record, "WipeBlocked", "Wipe", "Blocked", string.Join("; ", input.Reasons), ct);
-        await _callbacks.PublishAsync(record, "GuardrailsBlocked", ct);
+        await _callbacks.PublishAsync(record, input.CallbackEvent ?? "GuardrailsBlocked", ct);
     }
 
     [Function(nameof(Finalize))]
@@ -258,7 +334,14 @@ public sealed class DecommissionActivities
     }
 
     private static bool IsOnPrem(DecommissionTarget t) =>
-        t is DecommissionTarget.ActiveDirectory or DecommissionTarget.ConfigMgr;
+        t is DecommissionTarget.ActiveDirectory
+            or DecommissionTarget.ConfigMgr
+            or DecommissionTarget.LicenseRemoval
+            or DecommissionTarget.BiosPasswordRemoval;
+
+    private static bool IsTerminal(ActionStatus status) =>
+        status is ActionStatus.Success or ActionStatus.Skipped or ActionStatus.Failed
+            or ActionStatus.Blocked or ActionStatus.TimedOut;
 
     private async Task<DecommissionRecord> Load(string requestId, CancellationToken ct) =>
         await _store.GetAsync(requestId, ct)
@@ -287,5 +370,8 @@ public sealed class DecommissionActivities
 /// <summary>Activity input for a delete sub-action.</summary>
 public sealed record DeleteInput(string RequestId, DecommissionTarget Target);
 
-/// <summary>Activity input for blocking the wipe.</summary>
-public sealed record BlockInput(string RequestId, List<string> Reasons);
+/// <summary>Activity input for blocking the wipe. <paramref name="CallbackEvent"/> defaults to "GuardrailsBlocked".</summary>
+public sealed record BlockInput(string RequestId, List<string> Reasons, string? CallbackEvent = null);
+
+/// <summary>Activity input for checking completion of the pre-wipe preventive actions.</summary>
+public sealed record CheckPreWipeInput(string RequestId, List<DecommissionTarget> Targets);

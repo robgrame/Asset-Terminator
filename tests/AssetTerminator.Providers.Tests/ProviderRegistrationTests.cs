@@ -2,6 +2,7 @@ using AssetTerminator.Contracts;
 using AssetTerminator.Core.Abstractions;
 using AssetTerminator.Providers.ActiveDirectory;
 using AssetTerminator.Providers.ConfigMgr;
+using AssetTerminator.Providers.DeviceActions;
 using AssetTerminator.Providers.EntraId;
 using AssetTerminator.Providers.Intune;
 using Microsoft.Extensions.Configuration;
@@ -28,6 +29,27 @@ public sealed class ProviderRegistrationTests
 
         Assert.True(Registers<IDeviceCleanupProvider, IntuneDeleteProvider>(services));
         Assert.True(Registers<IWipeProvider, IntuneWipeProvider>(services));
+    }
+
+    [Fact]
+    public void AddIntuneProviders_RegistersAutopilotAndRetire()
+    {
+        var services = new ServiceCollection();
+        services.AddIntuneProviders();
+
+        Assert.True(Registers<IDeviceCleanupProvider, AutopilotDeleteProvider>(services));
+        Assert.True(Registers<IRetireProvider, IntuneRetireProvider>(services));
+    }
+
+    [Fact]
+    public void AddDeviceActionsProviders_RegistersLicenseAndBios()
+    {
+        var services = new ServiceCollection();
+        services.AddDeviceActionsProviders(EmptyConfig());
+
+        Assert.True(Registers<IDeviceCleanupProvider, LicenseRemovalProvider>(services));
+        Assert.True(Registers<IDeviceCleanupProvider, BiosPasswordRemovalProvider>(services));
+        Assert.True(Registers<ILocalCommandRunner, ProcessCommandRunner>(services));
     }
 
     [Fact]

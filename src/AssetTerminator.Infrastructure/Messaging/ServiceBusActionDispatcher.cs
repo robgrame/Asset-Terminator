@@ -60,5 +60,8 @@ public sealed class ServiceBusActionDispatcher : IActionDispatcher
     }
 
     private static bool IsOnPrem(DecommissionTarget target) =>
-        target is DecommissionTarget.ActiveDirectory or DecommissionTarget.ConfigMgr;
+        target is DecommissionTarget.ActiveDirectory
+            or DecommissionTarget.ConfigMgr
+            or DecommissionTarget.LicenseRemoval
+            or DecommissionTarget.BiosPasswordRemoval;
 }

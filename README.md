@@ -137,7 +137,8 @@ flowchart LR
 | `src/AssetTerminator.Providers.ActiveDirectory` | AD computer-object delete provider. |
 | `src/AssetTerminator.Providers.ConfigMgr` | SCCM / ConfigMgr AdminService provider. |
 | `src/AssetTerminator.Providers.EntraId` | Microsoft Graph Entra ID device lookup & delete. |
-| `src/AssetTerminator.Providers.Intune` | Microsoft Graph Intune wipe / retire / read / delete. |
+| `src/AssetTerminator.Providers.Intune` | Microsoft Graph Intune wipe / retire / read / delete, plus Windows Autopilot device delete. |
+| `src/AssetTerminator.Providers.DeviceActions` | On-device pre-wipe preventive actions (Enterprise→Pro license step-down, OEM BIOS password removal) executed by the on-prem agent. |
 
 </details>
 
@@ -216,15 +217,29 @@ The contract is documented in **[`docs/openapi.yaml`](docs/openapi.yaml)**. Serv
 
 ## 🔁 End-to-end flow
 
-1. ServiceNow submits a `DecommissionRequest` with identifiers, `deviceType`, `assetCategory`, `requestedActions` and optional `dryRun`.
-2. The API validates API key, IP allowlist, required fields, enum values and idempotency.
+1. ServiceNow submits a `DecommissionRequest` with identifiers, `deviceType`, `assetCategory`, `dispositionType`, `requestedActions` and optional `dryRun`.
+2. The API validates API key, IP allowlist, required fields, enum values, disposition rules and idempotency.
 3. Current state is written to Azure SQL and an immutable audit event to WORM Blob Storage.
-4. Durable Functions sequences the requested actions and dispatches cloud or on-prem work.
-5. Mandatory guardrails gate the wipe — `EncryptionGuardrail` must pass; Inactivity / CriticalGroup are configurable.
-6. Intune & Entra actions call Microsoft Graph with least-privilege UAMIs; AD & SCCM work is queued to Service Bus for the on-prem worker.
-7. The async tracking engine polls long-running status with retry/backoff and a configurable give-up timeout (default 7 days).
-8. Callback events are pushed to ServiceNow with retry, dead-letter and idempotent `eventId`.
-9. Telemetry flows to Log Analytics for workbook reporting and KQL analysis.
+4. Durable Functions sequences the requested actions per disposition and dispatches cloud or on-prem work.
+5. **Terminate** deletes the device object (AD/SCCM/Intune/Entra) and removes it from **Windows Autopilot**, then runs config-gated **pre-wipe preventive actions** (Enterprise→Pro license step-down, OEM BIOS password removal) on the device via the on-prem agent, and only wipes once they complete.
+6. **Retire** (re-purpose) deletes the device object and issues the Intune *retire* action — **no wipe, no Autopilot deletion, no preventive actions**.
+7. Mandatory guardrails gate the wipe — `EncryptionGuardrail` must pass; Inactivity / CriticalGroup are configurable; incomplete required pre-wipe actions block the wipe.
+8. Intune & Entra actions call Microsoft Graph with least-privilege UAMIs; AD, SCCM, license and BIOS work is queued to Service Bus for the on-prem worker.
+9. The async tracking engine polls long-running status with retry/backoff and a configurable give-up timeout (default 7 days).
+10. Callback events are pushed to ServiceNow with retry, dead-letter and idempotent `eventId`.
+11. Telemetry flows to Log Analytics for workbook reporting and KQL analysis.
+
+### Disposition types
+
+| Disposition | Deletes (AD/SCCM/Intune/Entra) | Autopilot delete | Pre-wipe preventive actions | Intune action |
+|---|---|---|---|---|
+| **Terminate** (default) | ✅ | ✅ (Windows, if `serialNumber`) | ✅ license + BIOS (config-gated) | **Wipe** |
+| **Retire** (re-purpose) | ✅ | ❌ | ❌ | **Retire** |
+
+Pre-wipe preventive actions are auto-injected at intake for a Windows Terminate+Wipe and gated by
+`AssetTerminator:PreWipe` options (`DeleteFromAutopilot`, `RemoveEnterpriseLicense`, `RemoveBiosPassword`,
+`RequireCompletionBeforeWipe`). License step-down and BIOS password removal run on the device through the
+on-prem agent (`AssetTerminator.Providers.DeviceActions`).
 
 ---
 

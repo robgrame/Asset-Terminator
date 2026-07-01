@@ -75,6 +75,85 @@ public sealed class GraphIntuneService
     }
 
     /// <summary>
+    /// Issues an Intune retire: removes company data and management state while keeping the
+    /// device usable (re-purpose). Asynchronous; success here only means the command was accepted.
+    /// </summary>
+    public async Task RetireAsync(string id, CancellationToken ct)
+    {
+        try
+        {
+            await _graph.DeviceManagement.ManagedDevices[id]
+                .Retire
+                .PostAsync(cancellationToken: ct)
+                .ConfigureAwait(false);
+        }
+        catch (ODataError ex)
+        {
+            throw GraphIntuneServiceException.From(ex);
+        }
+        catch (Exception ex) when (IsTransientTransport(ex))
+        {
+            throw GraphIntuneServiceException.TransientFailure(ex);
+        }
+    }
+
+    /// <summary>
+    /// Resolves the Windows Autopilot device identity id for the device, matched by serial number.
+    /// </summary>
+    public async Task<string?> ResolveAutopilotIdentityIdAsync(DeviceContext context, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(context.SerialNumber))
+        {
+            return null;
+        }
+
+        try
+        {
+            var response = await _graph.DeviceManagement.WindowsAutopilotDeviceIdentities
+                .GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.QueryParameters.Filter =
+                        $"contains(serialNumber,'{EscapeODataString(context.SerialNumber)}')";
+                    requestConfiguration.QueryParameters.Top = 1;
+                }, ct)
+                .ConfigureAwait(false);
+
+            return response?.Value?.FirstOrDefault()?.Id;
+        }
+        catch (ODataError ex) when (IsNotFound(ex))
+        {
+            return null;
+        }
+        catch (ODataError ex)
+        {
+            throw GraphIntuneServiceException.From(ex);
+        }
+        catch (Exception ex) when (IsTransientTransport(ex))
+        {
+            throw GraphIntuneServiceException.TransientFailure(ex);
+        }
+    }
+
+    /// <summary>Deletes the Windows Autopilot device identity registration.</summary>
+    public async Task DeleteAutopilotIdentityAsync(string id, CancellationToken ct)
+    {
+        try
+        {
+            await _graph.DeviceManagement.WindowsAutopilotDeviceIdentities[id]
+                .DeleteAsync(cancellationToken: ct)
+                .ConfigureAwait(false);
+        }
+        catch (ODataError ex)
+        {
+            throw GraphIntuneServiceException.From(ex);
+        }
+        catch (Exception ex) when (IsTransientTransport(ex))
+        {
+            throw GraphIntuneServiceException.TransientFailure(ex);
+        }
+    }
+
+    /// <summary>
     /// TODO: Confirm tenant-specific Intune wipe flags with the customer before production use.
     /// </summary>
     public async Task WipeAsync(string id, DeviceType deviceType, CancellationToken ct)

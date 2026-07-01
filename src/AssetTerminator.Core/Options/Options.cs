@@ -122,6 +122,36 @@ public sealed class OrchestrationOptions
 
     /// <summary>Cap for exponential backoff.</summary>
     public TimeSpan RetryMaxDelay { get; set; } = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// How often the orchestrator re-checks pre-wipe preventive actions (Autopilot/license/BIOS)
+    /// while waiting for them to complete before issuing the wipe.
+    /// </summary>
+    public TimeSpan PreWipePollInterval { get; set; } = TimeSpan.FromMinutes(5);
+}
+
+/// <summary>
+/// Pre-wipe preventive actions automatically injected for a Windows <c>Terminate</c> request.
+/// These run (and, for the on-device ones, must complete) before the Intune wipe is issued.
+/// </summary>
+public sealed class PreWipeOptions
+{
+    public const string Section = "AssetTerminator:PreWipe";
+
+    /// <summary>Delete the device's Windows Autopilot registration before the wipe.</summary>
+    public bool DeleteFromAutopilot { get; set; } = true;
+
+    /// <summary>Remove the Enterprise license (step down to Windows Pro) before the wipe.</summary>
+    public bool RemoveEnterpriseLicense { get; set; } = true;
+
+    /// <summary>Clear the BIOS/UEFI supervisor password via the OEM tool before the wipe.</summary>
+    public bool RemoveBiosPassword { get; set; } = true;
+
+    /// <summary>
+    /// When true, a failed/incomplete on-device preventive action (license/BIOS) blocks the wipe.
+    /// When false, the wipe proceeds even if a preventive action did not succeed.
+    /// </summary>
+    public bool RequireCompletionBeforeWipe { get; set; } = true;
 }
 
 /// <summary>Service Bus queue names.</summary>

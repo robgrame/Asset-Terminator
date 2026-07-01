@@ -92,6 +92,7 @@ public static class InfrastructureServiceCollectionExtensions
         services.Configure<CallbackOptions>(configuration.GetSection(CallbackOptions.Section));
         services.Configure<AuditOptions>(configuration.GetSection(AuditOptions.Section));
         services.Configure<OrchestrationOptions>(configuration.GetSection(OrchestrationOptions.Section));
+        services.Configure<PreWipeOptions>(configuration.GetSection(PreWipeOptions.Section));
         services.Configure<MessagingOptions>(configuration.GetSection(MessagingOptions.Section));
         services.Configure<ObservabilityOptions>(configuration.GetSection(ObservabilityOptions.Section));
     }

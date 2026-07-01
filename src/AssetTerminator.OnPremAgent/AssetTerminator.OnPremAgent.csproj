@@ -15,5 +15,6 @@
     <ProjectReference Include="..\AssetTerminator.Infrastructure\AssetTerminator.Infrastructure.csproj" />
     <ProjectReference Include="..\AssetTerminator.Providers.ActiveDirectory\AssetTerminator.Providers.ActiveDirectory.csproj" />
     <ProjectReference Include="..\AssetTerminator.Providers.ConfigMgr\AssetTerminator.Providers.ConfigMgr.csproj" />
+    <ProjectReference Include="..\AssetTerminator.Providers.DeviceActions\AssetTerminator.Providers.DeviceActions.csproj" />
   </ItemGroup>
 </Project>

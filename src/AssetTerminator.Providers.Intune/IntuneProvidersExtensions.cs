@@ -9,7 +9,9 @@ public static class IntuneProvidersExtensions
     {
         services.AddTransient<GraphIntuneService>();
         services.AddTransient<IDeviceCleanupProvider, IntuneDeleteProvider>();
+        services.AddTransient<IDeviceCleanupProvider, AutopilotDeleteProvider>();
         services.AddTransient<IWipeProvider, IntuneWipeProvider>();
+        services.AddTransient<IRetireProvider, IntuneRetireProvider>();
 
         return services;
     }

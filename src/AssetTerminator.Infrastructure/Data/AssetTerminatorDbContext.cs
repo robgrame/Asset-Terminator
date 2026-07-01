@@ -45,6 +45,7 @@ public sealed class AssetTerminatorDbContext : DbContext
             e.Property(x => x.SlaState).HasConversion<string>().HasMaxLength(32);
             e.Property(x => x.DeviceType).HasConversion<string>().HasMaxLength(32);
             e.Property(x => x.AssetCategory).HasConversion<string>().HasMaxLength(32);
+            e.Property(x => x.DispositionType).HasConversion<string>().HasMaxLength(32);
             e.Property(x => x.RequestJson);
             e.HasIndex(x => x.State);
             e.HasMany(x => x.Actions)

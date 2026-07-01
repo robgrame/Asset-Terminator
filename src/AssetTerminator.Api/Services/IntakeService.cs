@@ -3,6 +3,7 @@ using AssetTerminator.Core.Abstractions;
 using AssetTerminator.Core.Domain;
 using AssetTerminator.Core.Options;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace AssetTerminator.Api.Services;
 
@@ -20,6 +21,7 @@ public sealed class IntakeService
     private readonly IWorkflowStarter _workflow;
     private readonly ISlaCalculator _sla;
     private readonly IOperationalTelemetry _telemetry;
+    private readonly PreWipeOptions _preWipe;
     private readonly ILogger<IntakeService> _logger;
 
     public IntakeService(
@@ -28,6 +30,7 @@ public sealed class IntakeService
         IWorkflowStarter workflow,
         ISlaCalculator sla,
         IOperationalTelemetry telemetry,
+        IOptions<PreWipeOptions> preWipe,
         ILogger<IntakeService> logger)
     {
         _store = store;
@@ -35,6 +38,7 @@ public sealed class IntakeService
         _workflow = workflow;
         _sla = sla;
         _telemetry = telemetry;
+        _preWipe = preWipe.Value;
         _logger = logger;
     }
 
@@ -56,6 +60,7 @@ public sealed class IntakeService
             PrimaryUserUpn = request.PrimaryUserUpn,
             DeviceType = request.DeviceType,
             AssetCategory = request.AssetCategory,
+            DispositionType = request.DispositionType,
             TicketNumber = request.TicketNumber,
             Requestor = request.Requestor,
             DryRun = request.DryRun,
@@ -64,13 +69,12 @@ public sealed class IntakeService
             LastUpdatedAtUtc = now,
             DueAtUtc = _sla.ComputeDueAt(request.AssetCategory, now),
             RequestJson = rawJson,
-            Actions = request.RequestedActions
-                .Distinct()
+            Actions = ResolveTargets(request)
                 .Select(t => new SubAction
                 {
                     RequestId = request.RequestId,
                     Target = t,
-                    Action = t == DecommissionTarget.Wipe ? "Wipe" : "Delete",
+                    Action = ActionLabel(t),
                     Status = ActionStatus.Pending
                 })
                 .ToList()
@@ -115,6 +119,72 @@ public sealed class IntakeService
             return "deviceName or serialNumber is required to locate the device.";
         if (!Enum.IsDefined(r.DeviceType))
             return "deviceType is invalid.";
+        if (!Enum.IsDefined(r.DispositionType))
+            return "dispositionType is invalid.";
+
+        var actions = r.RequestedActions.ToHashSet();
+        if (r.DispositionType == DispositionType.Retire)
+        {
+            var forbidden = actions.Intersect(TerminateOnlyTargets).ToList();
+            if (forbidden.Count > 0)
+                return $"dispositionType Retire cannot include {string.Join(", ", forbidden)}.";
+        }
+        else if (actions.Contains(DecommissionTarget.Retire))
+        {
+            return "dispositionType Terminate cannot include the Retire action.";
+        }
+
+        if (actions.Contains(DecommissionTarget.Autopilot) && string.IsNullOrWhiteSpace(r.SerialNumber))
+            return "serialNumber is required to remove the device from Autopilot.";
+
         return null;
     }
+
+    /// <summary>
+    /// Resolves the effective set of sub-action targets from the request, applying disposition rules:
+    /// a Retire disposition always includes the Intune retire action; a Windows Terminate with a wipe
+    /// automatically injects the configured pre-wipe preventive actions (Autopilot, license, BIOS).
+    /// </summary>
+    private IEnumerable<DecommissionTarget> ResolveTargets(DecommissionRequest request)
+    {
+        var targets = request.RequestedActions.ToHashSet();
+
+        if (request.DispositionType == DispositionType.Retire)
+        {
+            targets.Add(DecommissionTarget.Retire);
+            targets.Remove(DecommissionTarget.Wipe);
+            return targets;
+        }
+
+        // Terminate: auto-inject pre-wipe preventive actions for a Windows wipe.
+        if (targets.Contains(DecommissionTarget.Wipe) && request.DeviceType == DeviceType.Windows)
+        {
+            if (_preWipe.DeleteFromAutopilot && !string.IsNullOrWhiteSpace(request.SerialNumber))
+                targets.Add(DecommissionTarget.Autopilot);
+            if (_preWipe.RemoveEnterpriseLicense)
+                targets.Add(DecommissionTarget.LicenseRemoval);
+            if (_preWipe.RemoveBiosPassword)
+                targets.Add(DecommissionTarget.BiosPasswordRemoval);
+        }
+
+        return targets;
+    }
+
+    private static readonly DecommissionTarget[] TerminateOnlyTargets =
+    [
+        DecommissionTarget.Wipe,
+        DecommissionTarget.Autopilot,
+        DecommissionTarget.LicenseRemoval,
+        DecommissionTarget.BiosPasswordRemoval
+    ];
+
+    private static string ActionLabel(DecommissionTarget target) => target switch
+    {
+        DecommissionTarget.Wipe => "Wipe",
+        DecommissionTarget.Retire => "Retire",
+        DecommissionTarget.Autopilot => "DeleteAutopilot",
+        DecommissionTarget.LicenseRemoval => "RemoveLicense",
+        DecommissionTarget.BiosPasswordRemoval => "RemoveBiosPassword",
+        _ => "Delete"
+    };
 }

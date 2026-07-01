@@ -23,6 +23,7 @@ public sealed class ReconciliationService
     private readonly IStateStore _store;
     private readonly IAuditWriter _audit;
     private readonly IWipeProvider _wipe;
+    private readonly IRetireProvider _retire;
     private readonly IEnumerable<IDeviceCleanupProvider> _providers;
     private readonly ISlaCalculator _sla;
     private readonly CallbackPublisher _callbacks;
@@ -35,6 +36,7 @@ public sealed class ReconciliationService
         IStateStore store,
         IAuditWriter audit,
         IWipeProvider wipe,
+        IRetireProvider retire,
         IEnumerable<IDeviceCleanupProvider> providers,
         ISlaCalculator sla,
         CallbackPublisher callbacks,
@@ -46,6 +48,7 @@ public sealed class ReconciliationService
         _store = store;
         _audit = audit;
         _wipe = wipe;
+        _retire = retire;
         _providers = providers;
         _sla = sla;
         _callbacks = callbacks;
@@ -118,6 +121,10 @@ public sealed class ReconciliationService
         if (action.Target == DecommissionTarget.Wipe)
         {
             result = await _wipe.GetWipeStatusAsync(context, ct);
+        }
+        else if (action.Target == DecommissionTarget.Retire)
+        {
+            result = await _retire.GetRetireStatusAsync(context, ct);
         }
         else
         {

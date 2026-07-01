@@ -25,6 +25,7 @@
     <ProjectReference Include="..\..\src\AssetTerminator.Providers.EntraId\AssetTerminator.Providers.EntraId.csproj" />
     <ProjectReference Include="..\..\src\AssetTerminator.Providers.ActiveDirectory\AssetTerminator.Providers.ActiveDirectory.csproj" />
     <ProjectReference Include="..\..\src\AssetTerminator.Providers.ConfigMgr\AssetTerminator.Providers.ConfigMgr.csproj" />
+    <ProjectReference Include="..\..\src\AssetTerminator.Providers.DeviceActions\AssetTerminator.Providers.DeviceActions.csproj" />
   </ItemGroup>
 
 </Project>

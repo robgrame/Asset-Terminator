@@ -16,6 +16,7 @@ public sealed class DecommissionRecord
     public string? PrimaryUserUpn { get; set; }
     public DeviceType DeviceType { get; set; }
     public AssetCategory AssetCategory { get; set; }
+    public DispositionType DispositionType { get; set; } = DispositionType.Terminate;
     public string? TicketNumber { get; set; }
     public string? Requestor { get; set; }
     public bool DryRun { get; set; }

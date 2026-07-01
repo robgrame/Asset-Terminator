@@ -58,10 +58,11 @@ Principi guida:
 | --- | --- | --- |
 | **AssetTerminator.Infrastructure** | Implementazioni concrete delle astrazioni: state store SQL, audit WORM hash-chained, dispatch Service Bus, Key Vault, Graph client factory, callback resilienti, calcolo SLA, telemetria Log Analytics. | EF Core, Azure.Storage.Blobs, Azure.Messaging.ServiceBus, Azure.Security.KeyVault, Polly, Azure.Monitor.Ingestion. |
 | **AssetTerminator.Guardrails** | Motore guardrail estensibile + guardrail predefiniti: `EncryptionGuardrail` (BitLocker/FileVault), `InactivityGuardrail`, `CriticalGroupGuardrail`. | Plug-in via DI; ogni guardrail config-driven (enabled / threshold / mandatory|warning / overridable). |
-| **AssetTerminator.Providers.Intune** | Delete del managed device + **wipe** + verifica stato wipe via Microsoft Graph. | Microsoft.Graph; UAMI dedicata. |
+| **AssetTerminator.Providers.Intune** | Delete del managed device + **wipe** + **retire** + delete da **Windows Autopilot** + verifica stato via Microsoft Graph. | Microsoft.Graph; UAMI dedicata. |
 | **AssetTerminator.Providers.EntraId** | Delete dell'oggetto device + probe di esistenza via Microsoft Graph. | Microsoft.Graph; UAMI dedicata. |
 | **AssetTerminator.Providers.ActiveDirectory** | Delete del computer object via LDAP/LDAPS (on-prem). | System.DirectoryServices.Protocols. |
 | **AssetTerminator.Providers.ConfigMgr** | Delete del device via SCCM AdminService REST (on-prem). | HttpClient verso AdminService. |
+| **AssetTerminator.Providers.DeviceActions** | Azioni preventive **on-device** eseguite dall'agente on-prem prima del wipe: step-down licenza Enterprise→Windows Pro e rimozione password BIOS via tool OEM (Dell/HP/Lenovo). | Process runner locale; comandi config-driven con placeholder `{serialNumber}`/`{deviceName}`/`{primaryUserUpn}`. |
 
 ### 2.3 Progetti — host eseguibili
 
@@ -155,6 +156,25 @@ sotto-azioni indipendenti che procedono comunque (continue-on-error).
 **Razionale.** Bloccare la rimozione degli oggetti directory perché manca, ad esempio, la
 cifratura sarebbe controproducente; il rischio reale (perdita dati) è legato al **wipe**, che
 è l'unica azione realmente gated.
+
+### 3.8bis Disposition (Terminate/Retire) e azioni preventive pre-wipe
+**Scelta.** La richiesta porta un `dispositionType`:
+- **Terminate** (default, flusso distruttivo): delete (AD/SCCM/Intune/Entra) **+ delete da Windows
+  Autopilot** in parallelo, poi le **azioni preventive on-device** (step-down licenza Enterprise→Pro,
+  rimozione password BIOS via tool OEM) eseguite dall'agente on-prem, e **solo al loro completamento**
+  viene emesso il **wipe** (gated dai guardrail).
+- **Retire** (re-purpose): delete (AD/SCCM/Intune/Entra) **+ azione Intune retire**; **nessun wipe,
+  nessuna delete da Autopilot, nessuna azione preventiva**.
+
+**Ordinamento pre-wipe.** La delete da Autopilot è cloud (`IDeviceCleanupProvider` inline) e completa
+prima del wipe grazie all'await delle delete. Licenza e BIOS sono on-prem (dispatchate all'agente): l'orchestratore
+**attende** (loop con durable timer + activity `CheckPreWipeActions`) che raggiungano uno stato terminale
+prima di procedere. Con `RequireCompletionBeforeWipe=true` un fallimento delle azioni preventive **blocca il wipe**.
+Auto-injection all'intake (Windows Terminate+Wipe) e gating via `AssetTerminator:PreWipe`
+(`DeleteFromAutopilot`, `RemoveEnterpriseLicense`, `RemoveBiosPassword`, `RequireCompletionBeforeWipe`).
+**Razionale.** Il cliente prevede due modalità di dismissione e richiede che il device sia rimosso da
+Autopilot e ripulito (licenza/BIOS) **prima** del wipe, così da consentire re-enrollment/re-purpose puliti.
+
 
 ### 3.9 Completamento asincrono: polling/reconciliation engine separato
 **Scelta.** L'orchestrazione Durable **emette i comandi** e termina lasciando lo stato
@@ -396,7 +416,7 @@ stateDiagram-v2
   TimedOut --> [*]
 ```
 
-Ogni **sotto-azione** (AD, SCCM, Intune-delete, EntraId, Wipe) ha stato indipendente
+Ogni **sotto-azione** (AD, SCCM, Intune-delete, EntraId, Autopilot, LicenseRemoval, BiosPasswordRemoval, Wipe, Retire) ha stato indipendente
 `Pending → InProgress → Success | Skipped | Failed | Blocked | TimedOut`, con
 `lastCheckedTimestamp`, `retryCount`, `finalOutcome`. Lo stato globale è derivato
 dall'aggregazione delle sotto-azioni (`DecommissionActivities.OverallState`).

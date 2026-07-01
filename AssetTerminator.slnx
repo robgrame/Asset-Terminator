@@ -9,6 +9,7 @@
     <Project Path="src/AssetTerminator.Orchestrator/AssetTerminator.Orchestrator.csproj" />
     <Project Path="src/AssetTerminator.Providers.ActiveDirectory/AssetTerminator.Providers.ActiveDirectory.csproj" />
     <Project Path="src/AssetTerminator.Providers.ConfigMgr/AssetTerminator.Providers.ConfigMgr.csproj" />
+    <Project Path="src/AssetTerminator.Providers.DeviceActions/AssetTerminator.Providers.DeviceActions.csproj" />
     <Project Path="src/AssetTerminator.Providers.EntraId/AssetTerminator.Providers.EntraId.csproj" />
     <Project Path="src/AssetTerminator.Providers.Intune/AssetTerminator.Providers.Intune.csproj" />
   </Folder>

@@ -42,6 +42,22 @@ paths:
                   ticketNumber: "CHG0042157"
                   timestamp: "2026-06-23T09:00:00Z"
                   dryRun: false
+              windowsRetireRepurpose:
+                summary: Windows retire for re-purpose (no wipe)
+                value:
+                  requestId: "sn-task-retire-2002"
+                  assetId: "AST-0007422"
+                  deviceName: "POOL-LAPTOP-018"
+                  serialNumber: "PF3ZX91L"
+                  primaryUserUpn: "jordan.reed@example.com"
+                  deviceType: "Windows"
+                  assetCategory: "Standard"
+                  dispositionType: "Retire"
+                  requestedActions: ["Intune", "EntraId", "ConfigMgr", "ActiveDirectory"]
+                  requestor: "svc.servicenow.asset"
+                  ticketNumber: "CHG0042158"
+                  timestamp: "2026-06-23T09:02:00Z"
+                  dryRun: false
               dryRun:
                 summary: Dry-run validation only
                 value:
@@ -307,6 +323,8 @@ components:
           $ref: '#/components/schemas/DeviceType'
         assetCategory:
           $ref: '#/components/schemas/AssetCategory'
+        dispositionType:
+          $ref: '#/components/schemas/DispositionType'
         requestedActions:
           type: array
           items:
@@ -473,7 +491,20 @@ components:
           additionalProperties: true
     DecommissionTarget:
       type: string
-      enum: [ActiveDirectory, ConfigMgr, Intune, EntraId, Wipe]
+      description: >-
+        Capability to execute. Autopilot, LicenseRemoval and BiosPasswordRemoval are
+        pre-wipe preventive actions auto-injected for a Windows Terminate+Wipe (config-gated);
+        Retire is auto-injected for the Retire disposition. Terminate-only targets
+        (Wipe, Autopilot, LicenseRemoval, BiosPasswordRemoval) are rejected for Retire.
+      enum: [ActiveDirectory, ConfigMgr, Intune, EntraId, Wipe, Autopilot, LicenseRemoval, BiosPasswordRemoval, Retire]
+    DispositionType:
+      type: string
+      default: Terminate
+      description: >-
+        Terminate performs the full destructive flow (deletes + pre-wipe preventive
+        actions + Intune wipe). Retire re-purposes the device (deletes + Intune retire),
+        with no wipe, no Autopilot deletion and no preventive actions.
+      enum: [Terminate, Retire]
     DeviceType:
       type: string
       enum: [Windows, MacOS, iOS, Android]

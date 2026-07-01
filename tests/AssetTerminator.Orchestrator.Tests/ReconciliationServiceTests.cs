@@ -26,6 +26,7 @@ public sealed class ReconciliationServiceTests
     private readonly Mock<IStateStore> _store = new();
     private readonly Mock<IAuditWriter> _audit = new();
     private readonly Mock<IWipeProvider> _wipe = new();
+    private readonly Mock<IRetireProvider> _retire = new();
     private readonly Mock<ISlaCalculator> _sla = new();
     private readonly Mock<IOperationalTelemetry> _telemetry = new();
     private readonly Mock<ICallbackSender> _callbackSender = new();
@@ -41,6 +42,7 @@ public sealed class ReconciliationServiceTests
             _store.Object,
             _audit.Object,
             _wipe.Object,
+            _retire.Object,
             providers,
             _sla.Object,
             publisher,
@@ -130,6 +132,21 @@ public sealed class ReconciliationServiceTests
 
         Assert.Equal(ActionStatus.Failed, action.Status);
         Assert.Equal("Failed", action.FinalOutcome);
+    }
+
+    [Fact]
+    public async Task RetireCompleted_MarksActionSuccess()
+    {
+        var action = new SubAction { RequestId = "r1", Target = DecommissionTarget.Retire, Status = ActionStatus.InProgress };
+        var record = Record(action, DateTimeOffset.UtcNow.AddDays(1));
+        record.DispositionType = DispositionType.Retire;
+        _retire.Setup(r => r.GetRetireStatusAsync(It.IsAny<DeviceContext>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ProviderResult.Success("retired"));
+
+        await CreateService([]).ReconcileAsync(record, CancellationToken.None);
+
+        Assert.Equal(ActionStatus.Success, action.Status);
+        Assert.Equal("Success", action.FinalOutcome);
     }
 
     private static IDeviceCleanupProvider ProviderFor(DecommissionTarget target, ProviderResult status)

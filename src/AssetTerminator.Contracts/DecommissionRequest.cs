@@ -39,6 +39,14 @@ public sealed class DecommissionRequest
     [JsonPropertyName("assetCategory")]
     public AssetCategory AssetCategory { get; set; } = AssetCategory.Standard;
 
+    /// <summary>
+    /// Asset disposition. <see cref="DispositionType.Terminate"/> performs the guarded wipe
+    /// (with pre-wipe Autopilot removal and preventive actions); <see cref="DispositionType.Retire"/>
+    /// issues an Intune retire for re-purpose without wiping or removing the Autopilot registration.
+    /// </summary>
+    [JsonPropertyName("dispositionType")]
+    public DispositionType DispositionType { get; set; } = DispositionType.Terminate;
+
     /// <summary>Requested actions, executed in a controlled order by the orchestrator.</summary>
     [JsonPropertyName("requestedActions")]
     public List<DecommissionTarget> RequestedActions { get; set; } = new();

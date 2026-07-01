@@ -59,3 +59,19 @@ public interface IWipeProvider
     /// </summary>
     Task<ProviderResult> GetWipeStatusAsync(DeviceContext context, CancellationToken ct);
 }
+
+/// <summary>
+/// Specialised provider that issues the Intune retire (remove company data / management while
+/// keeping the device usable) for a re-purpose disposition, and verifies its completion over time.
+/// </summary>
+public interface IRetireProvider
+{
+    /// <summary>Issue the retire command for the device.</summary>
+    Task<ProviderResult> RetireAsync(DeviceContext context, CancellationToken ct);
+
+    /// <summary>
+    /// Verify retire completion: success when Graph reports the retire done or the device is
+    /// no longer managed; otherwise still pending. Used by the polling engine.
+    /// </summary>
+    Task<ProviderResult> GetRetireStatusAsync(DeviceContext context, CancellationToken ct);
+}
