@@ -130,6 +130,16 @@ module rbac './modules/rbac.bicep' = {
       identity.outputs.orchestratorPrincipalId
       identity.outputs.onpremPrincipalId
     ]
+    hostStorageAssignments: [
+      {
+        storageName: storage.outputs.apiDeploymentStorageName
+        principalId: identity.outputs.apiPrincipalId
+      }
+      {
+        storageName: storage.outputs.orchestratorDeploymentStorageName
+        principalId: identity.outputs.orchestratorPrincipalId
+      }
+    ]
   }
 }
 
@@ -145,6 +155,7 @@ module apiFunction './modules/functionapp.bicep' = {
     managedIdentityResourceId: identity.outputs.apiResourceId
     appInsightsConnectionString: monitoring.outputs.appInsightsConnectionString
     sqlServerFqdn: sql.outputs.serverFqdn
+    sqlDatabaseName: sqlDatabaseName
     auditBlobServiceUri: storage.outputs.auditBlobServiceUri
     serviceBusFqdn: serviceBus.outputs.namespaceFqdn
     keyVaultUri: keyVault.outputs.keyVaultUri
@@ -163,6 +174,7 @@ module orchestratorFunction './modules/functionapp.bicep' = {
     managedIdentityResourceId: identity.outputs.orchestratorResourceId
     appInsightsConnectionString: monitoring.outputs.appInsightsConnectionString
     sqlServerFqdn: sql.outputs.serverFqdn
+    sqlDatabaseName: sqlDatabaseName
     auditBlobServiceUri: storage.outputs.auditBlobServiceUri
     serviceBusFqdn: serviceBus.outputs.namespaceFqdn
     keyVaultUri: keyVault.outputs.keyVaultUri

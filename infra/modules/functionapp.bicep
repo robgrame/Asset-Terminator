@@ -7,6 +7,7 @@ param managedIdentityClientId string
 param managedIdentityResourceId string
 param appInsightsConnectionString string
 param sqlServerFqdn string
+param sqlDatabaseName string
 param auditBlobServiceUri string
 param serviceBusFqdn string
 param keyVaultUri string
@@ -65,8 +66,8 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           type: 'blobContainer'
           value: '${deploymentStorage.properties.primaryEndpoints.blob}${deploymentContainerName}'
           authentication: {
-            type: 'StorageAccountConnectionString'
-            storageAccountConnectionStringName: 'AzureWebJobsStorage'
+            type: 'UserAssignedIdentity'
+            userAssignedIdentityResourceId: managedIdentityResourceId
           }
         }
       }
@@ -85,29 +86,66 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
           value: appInsightsConnectionString
         }
+        // Host storage (AzureWebJobsStorage) via managed identity — the flex storage
+        // accounts have shared-key access disabled by policy, so key-based auth is not possible.
         {
-          name: 'AzureWebJobsStorage'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${deploymentStorage.name};AccountKey=${deploymentStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+          name: 'AzureWebJobsStorage__accountName'
+          value: deploymentStorage.name
+        }
+        {
+          name: 'AzureWebJobsStorage__credential'
+          value: 'managedidentity'
+        }
+        {
+          name: 'AzureWebJobsStorage__clientId'
+          value: managedIdentityClientId
         }
         {
           name: 'AZURE_CLIENT_ID'
           value: managedIdentityClientId
         }
+        // Service Bus trigger connection ("ServiceBus") used by the orchestrator's
+        // serviceBusTrigger; identity-based, harmless on the API app.
         {
-          name: 'SQL_SERVER_FQDN'
-          value: sqlServerFqdn
-        }
-        {
-          name: 'AUDIT_BLOB_SERVICE_URI'
-          value: auditBlobServiceUri
-        }
-        {
-          name: 'SERVICEBUS_FQDN'
+          name: 'ServiceBus__fullyQualifiedNamespace'
           value: serviceBusFqdn
         }
         {
-          name: 'KEYVAULT_URI'
+          name: 'ServiceBus__credential'
+          value: 'managedidentity'
+        }
+        {
+          name: 'ServiceBus__clientId'
+          value: managedIdentityClientId
+        }
+        // Application configuration (hierarchical keys bound by the .NET code).
+        {
+          name: 'AssetTerminator__Audit__BlobServiceUri'
+          value: auditBlobServiceUri
+        }
+        {
+          name: 'AssetTerminator__Messaging__FullyQualifiedNamespace'
+          value: serviceBusFqdn
+        }
+        {
+          name: 'AssetTerminator__Messaging__OrchestrationQueue'
+          value: 'decommission-orchestration'
+        }
+        {
+          name: 'AssetTerminator__Messaging__CloudActionsQueue'
+          value: 'decommission-cloud'
+        }
+        {
+          name: 'AssetTerminator__Messaging__OnPremActionsQueue'
+          value: 'decommission-onprem'
+        }
+        {
+          name: 'AssetTerminator__KeyVaultUri'
           value: keyVaultUri
+        }
+        {
+          name: 'AssetTerminator__StateStore__ConnectionString'
+          value: 'Server=tcp:${sqlServerFqdn},1433;Database=${sqlDatabaseName};Encrypt=True;TrustServerCertificate=False;Authentication=Active Directory Managed Identity;User Id=${managedIdentityClientId};'
         }
       ]
       ftpsState: 'Disabled'

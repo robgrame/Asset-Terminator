@@ -67,6 +67,7 @@ Example permissions include:
 - DeviceManagementManagedDevices.PrivilegedOperations.All
 - DeviceManagementManagedDevices.ReadWrite.All
 - Device.ReadWrite.All
+- DeviceManagementServiceConfig.ReadWrite.All  (required to delete the device from Windows Autopilot)
 
 $outputs = $outputsJson | ConvertFrom-Json
 $orchestratorPrincipalId = $outputs.orchestratorUamiPrincipalId.value
@@ -75,7 +76,8 @@ $graphSpId = az ad sp list --filter "appId eq '$graphAppId'" --query "[0].id" -o
 $roleNames = @(
     'DeviceManagementManagedDevices.PrivilegedOperations.All',
     'DeviceManagementManagedDevices.ReadWrite.All',
-    'Device.ReadWrite.All'
+    'Device.ReadWrite.All',
+    'DeviceManagementServiceConfig.ReadWrite.All'
 )
 foreach ($roleName in $roleNames) {
     $roleId = az ad sp show --id $graphSpId --query "appRoles[?value=='$roleName' && allowedMemberTypes[?@=='Application']].id | [0]" -o tsv
@@ -96,4 +98,10 @@ ALTER ROLE db_datareader ADD MEMBER [<uami-orchestrator-name>];
 ALTER ROLE db_datawriter ADD MEMBER [<uami-orchestrator-name>];
 GRANT EXECUTE TO [<uami-api-name>];
 GRANT EXECUTE TO [<uami-orchestrator-name>];
+
+The application has no EF migration/EnsureCreated step, so the database schema must be
+created once after the SQL server + database are provisioned. Generate the script from the
+DbContext (ctx.Database.GenerateCreateScript()) and apply it against the database with an
+Entra token, or run the equivalent DDL. Tables: DecommissionRequests (with DispositionType
+nvarchar(32)), DecommissionActions, GuardrailOverrides.
 #>
