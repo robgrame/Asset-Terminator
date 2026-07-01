@@ -1,0 +1,9 @@
+{
+  "requestId": "CHG0012347",
+  "operatingSystem": "Mobile",
+  "deviceName": "iPhone-Sales-12",
+  "serialNumber": "DNPXY1234567",
+  "ticketNumber": "CHG0012347",
+  "requestor": "servicenow@contoso.com",
+  "dryRun": true
+}

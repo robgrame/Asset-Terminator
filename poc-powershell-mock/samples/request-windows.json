@@ -1,0 +1,9 @@
+{
+  "requestId": "CHG0012345",
+  "operatingSystem": "Windows",
+  "deviceName": "FC1WRK001",
+  "serialNumber": "PF3ABCDE",
+  "ticketNumber": "CHG0012345",
+  "requestor": "servicenow@contoso.com",
+  "dryRun": true
+}

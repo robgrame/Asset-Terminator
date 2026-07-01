@@ -1,0 +1,9 @@
+{
+  "requestId": "CHG0012346",
+  "operatingSystem": "Mac",
+  "deviceName": "MB-DESIGN-07",
+  "serialNumber": "C02XY1234567",
+  "ticketNumber": "CHG0012346",
+  "requestor": "servicenow@contoso.com",
+  "dryRun": true
+}
