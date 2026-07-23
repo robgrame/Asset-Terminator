@@ -1,4 +1,5 @@
 using Azure.Identity;
+using Azure.Messaging.EventGrid;
 using Azure.Messaging.ServiceBus;
 using Azure.Monitor.Ingestion;
 using Azure.Security.KeyVault.Secrets;
@@ -10,11 +11,13 @@ using AssetTerminator.Infrastructure.Callbacks;
 using AssetTerminator.Infrastructure.Data;
 using AssetTerminator.Infrastructure.Messaging;
 using AssetTerminator.Infrastructure.Observability;
+using AssetTerminator.Infrastructure.Realtime;
 using AssetTerminator.Infrastructure.Secrets;
 using AssetTerminator.Infrastructure.Sla;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace AssetTerminator.Infrastructure.DependencyInjection;
 
@@ -66,16 +69,37 @@ public static class InfrastructureServiceCollectionExtensions
         // --- SLA ---
         services.AddSingleton<ISlaCalculator, SlaCalculator>();
 
+        // --- Realtime fan-out (Event Grid custom topic -> SignalR live board) ---
+        var realtime = configuration.GetSection(RealtimeOptions.Section).Get<RealtimeOptions>() ?? new RealtimeOptions();
+        if (!string.IsNullOrWhiteSpace(realtime.TopicEndpoint))
+        {
+            services.AddSingleton(_ => new EventGridPublisherClient(new Uri(realtime.TopicEndpoint), credential));
+            services.AddSingleton<IRealtimeEventPublisher>(sp => new EventGridRealtimeEventPublisher(
+                sp.GetRequiredService<EventGridPublisherClient>(),
+                realtime.EventType,
+                sp.GetRequiredService<ILogger<EventGridRealtimeEventPublisher>>()));
+        }
+        else
+        {
+            services.AddSingleton<IRealtimeEventPublisher>(NullRealtimeEventPublisher.Instance);
+        }
+
         // --- Operational telemetry (Log Analytics custom tables via Logs Ingestion) ---
+        // Wrapped by RealtimeBroadcastTelemetry so every request state change also fans out live.
         var observability = configuration.GetSection(ObservabilityOptions.Section).Get<ObservabilityOptions>() ?? new ObservabilityOptions();
         if (!string.IsNullOrWhiteSpace(observability.DcrEndpoint) && !string.IsNullOrWhiteSpace(observability.DcrImmutableId))
         {
             services.AddSingleton(_ => new LogsIngestionClient(new Uri(observability.DcrEndpoint), credential));
-            services.AddSingleton<IOperationalTelemetry, LogsIngestionTelemetry>();
+            services.AddSingleton<LogsIngestionTelemetry>();
+            services.AddSingleton<IOperationalTelemetry>(sp => new RealtimeBroadcastTelemetry(
+                sp.GetRequiredService<LogsIngestionTelemetry>(),
+                sp.GetRequiredService<IRealtimeEventPublisher>()));
         }
         else
         {
-            services.AddSingleton<IOperationalTelemetry>(NullOperationalTelemetry.Instance);
+            services.AddSingleton<IOperationalTelemetry>(sp => new RealtimeBroadcastTelemetry(
+                NullOperationalTelemetry.Instance,
+                sp.GetRequiredService<IRealtimeEventPublisher>()));
         }
 
         // --- ServiceNow callbacks ---
@@ -95,5 +119,6 @@ public static class InfrastructureServiceCollectionExtensions
         services.Configure<PreWipeOptions>(configuration.GetSection(PreWipeOptions.Section));
         services.Configure<MessagingOptions>(configuration.GetSection(MessagingOptions.Section));
         services.Configure<ObservabilityOptions>(configuration.GetSection(ObservabilityOptions.Section));
+        services.Configure<RealtimeOptions>(configuration.GetSection(RealtimeOptions.Section));
     }
 }

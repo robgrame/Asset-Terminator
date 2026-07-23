@@ -203,3 +203,18 @@ public sealed class ObservabilityOptions
     public string GuardrailsStream { get; set; } = "Custom-GuardrailResults_CL";
     public string CallbacksStream { get; set; } = "Custom-CallbackEvents_CL";
 }
+
+/// <summary>
+/// Realtime fan-out configuration. When <see cref="TopicEndpoint"/> is not configured the
+/// realtime publisher is a no-op (the operations board simply receives no live events).
+/// </summary>
+public sealed class RealtimeOptions
+{
+    public const string Section = "AssetTerminator:Realtime";
+
+    /// <summary>Azure Event Grid custom topic endpoint (https://&lt;topic&gt;.&lt;region&gt;-1.eventgrid.azure.net/api/events).</summary>
+    public string? TopicEndpoint { get; set; }
+
+    /// <summary>Event type stamped on published events; the SignalR bridge filters on this.</summary>
+    public string EventType { get; set; } = "AssetTerminator.DecommissionStateChanged";
+}

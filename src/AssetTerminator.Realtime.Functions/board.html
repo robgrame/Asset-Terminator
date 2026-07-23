@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Asset-Terminator — Live Operations Board</title>
+    <style>
+        :root { color-scheme: dark; }
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: 'Segoe UI', system-ui, sans-serif; background: #0b0e14; color: #e6e6e6; }
+        header { display: flex; align-items: center; gap: 12px; padding: 16px 24px; background: #11151f; border-bottom: 1px solid #222b3a; }
+        header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+        .status { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: #6b7280; }
+        .dot.on { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+        .dot.off { background: #ef4444; }
+        main { padding: 16px 24px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #1c2432; }
+        th { color: #93a1b5; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+        tr.flash { animation: flash 1.2s ease-out; }
+        @keyframes flash { from { background: #1d3a2e; } to { background: transparent; } }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+        .s-completed { background: #14351f; color: #4ade80; }
+        .s-failed, .s-timedout, .s-guardrailsfailed { background: #3a1717; color: #f87171; }
+        .s-running, .s-inprogress { background: #1e2a45; color: #60a5fa; }
+        .s-pending, .s-queued { background: #35301a; color: #fbbf24; }
+        .s-default { background: #26303f; color: #cbd5e1; }
+        .sla-breached { color: #f87171; font-weight: 600; }
+        .sla-atrisk { color: #fbbf24; font-weight: 600; }
+        .muted { color: #6b7280; }
+        .empty { padding: 40px; text-align: center; color: #6b7280; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🛰️ Asset-Terminator — Live Operations Board</h1>
+        <div class="status">
+            <span id="dot" class="dot"></span>
+            <span id="statusText">Connecting…</span>
+        </div>
+    </header>
+    <main>
+        <table>
+            <thead>
+                <tr>
+                    <th>Ticket</th>
+                    <th>Device</th>
+                    <th>Type</th>
+                    <th>Disposition</th>
+                    <th>State</th>
+                    <th>SLA</th>
+                    <th>Updated (UTC)</th>
+                </tr>
+            </thead>
+            <tbody id="rows">
+                <tr id="emptyRow"><td colspan="7" class="empty">Waiting for state changes…</td></tr>
+            </tbody>
+        </table>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.7/signalr.min.js"></script>
+    <script>
+        const dot = document.getElementById('dot');
+        const statusText = document.getElementById('statusText');
+        const rows = document.getElementById('rows');
+
+        function setStatus(state) {
+            dot.className = 'dot ' + (state === 'on' ? 'on' : state === 'off' ? 'off' : '');
+            statusText.textContent = state === 'on' ? 'Live' : state === 'off' ? 'Disconnected' : 'Connecting…';
+        }
+        function slaClass(s) {
+            s = (s || '').toLowerCase();
+            if (s.includes('breach')) return 'sla-breached';
+            if (s.includes('risk')) return 'sla-atrisk';
+            return 'muted';
+        }
+        function stateClass(s) {
+            const key = (s || '').toLowerCase().replace(/[^a-z]/g, '');
+            const known = ['completed','failed','timedout','guardrailsfailed','running','inprogress','pending','queued'];
+            return known.includes(key) ? 's-' + key : 's-default';
+        }
+        function upsert(d) {
+            if (!d) return;
+            const id = d.requestId || d.RequestId || d.assetId || d.AssetId;
+            if (!id) return;
+            const empty = document.getElementById('emptyRow');
+            if (empty) empty.remove();
+            const state = d.state || d.State || '';
+            const sla = d.slaState || d.SlaState || '';
+            const rowId = 'r-' + String(id).replace(/[^a-zA-Z0-9]/g, '');
+            let tr = document.getElementById(rowId);
+            if (!tr) { tr = document.createElement('tr'); tr.id = rowId; rows.prepend(tr); }
+            tr.innerHTML = `
+                <td>${d.ticketNumber || d.TicketNumber || '—'}</td>
+                <td>${d.deviceName || d.DeviceName || '—'}</td>
+                <td>${d.deviceType || d.DeviceType || '—'}</td>
+                <td>${d.dispositionType || d.DispositionType || '—'}</td>
+                <td><span class="badge ${stateClass(state)}">${state || '—'}</span></td>
+                <td class="${slaClass(sla)}">${sla || '—'}</td>
+                <td class="muted">${(d.lastUpdatedAtUtc || d.LastUpdatedAtUtc || '').replace('T', ' ').replace('Z', '')}</td>`;
+            tr.classList.remove('flash');
+            void tr.offsetWidth;
+            tr.classList.add('flash');
+        }
+        async function start() {
+            const conn = new signalR.HubConnectionBuilder()
+                .withUrl(window.location.origin)
+                .withAutomaticReconnect()
+                .build();
+            conn.on('stateChanged', upsert);
+            conn.onreconnecting(() => setStatus('off'));
+            conn.onreconnected(() => setStatus('on'));
+            conn.onclose(() => { setStatus('off'); setTimeout(start, 5000); });
+            try { await conn.start(); setStatus('on'); }
+            catch (e) { setStatus('off'); setTimeout(start, 5000); }
+        }
+        setStatus('connecting');
+        start();
+    </script>
+</body>
+</html>

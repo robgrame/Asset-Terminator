@@ -1,0 +1,9 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "AzureSignalRConnectionString": "Endpoint=https://<your-signalr>.service.signalr.net;AuthType=azure.msi;Version=1.0;",
+    "SignalRHubName": "decommissions"
+  }
+}

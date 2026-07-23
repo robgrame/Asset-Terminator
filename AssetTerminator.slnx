@@ -12,6 +12,8 @@
     <Project Path="src/AssetTerminator.Providers.DeviceActions/AssetTerminator.Providers.DeviceActions.csproj" />
     <Project Path="src/AssetTerminator.Providers.EntraId/AssetTerminator.Providers.EntraId.csproj" />
     <Project Path="src/AssetTerminator.Providers.Intune/AssetTerminator.Providers.Intune.csproj" />
+    <Project Path="src/AssetTerminator.Realtime.Functions/AssetTerminator.Realtime.Functions.csproj" />
+    <Project Path="src/AssetTerminator.Realtime.Web/AssetTerminator.Realtime.Web.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AssetTerminator.Api.Tests/AssetTerminator.Api.Tests.csproj" />
