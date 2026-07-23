@@ -1,0 +1,16 @@
+{
+  "bindings": [
+    {
+      "name": "Message",
+      "type": "serviceBusTrigger",
+      "direction": "in",
+      "queueName": "%AssetTerminator__Messaging__OrchestrationQueue%",
+      "connection": "ServiceBus"
+    },
+    {
+      "name": "Starter",
+      "type": "durableClient",
+      "direction": "in"
+    }
+  ]
+}

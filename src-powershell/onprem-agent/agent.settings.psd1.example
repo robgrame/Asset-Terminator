@@ -1,0 +1,59 @@
+@{
+    # Asset-Terminator on-prem agent settings (copy to agent.settings.psd1 and fill in).
+    # This file configures the SYSTEM scheduled-task agent that drains the on-prem
+    # Service Bus queue and runs AD / ConfigMgr / DeviceActions.
+
+    # Master safety switch: when $true no destructive action is performed (simulate only).
+    DryRun = $true
+
+    ServiceBus = @{
+        Namespace   = 'yourns.servicebus.windows.net'
+        OnPremQueue = 'decommission-onprem'
+        # Optional pre-acquired SAS token ('SharedAccessSignature sr=...'). When empty the
+        # agent uses an Entra token (Managed Identity / Azure Arc / az CLI) for passwordless auth.
+        SasToken    = ''
+    }
+
+    ActiveDirectory = @{
+        # Optional LDAP search root, e.g. 'OU=Computers,DC=contoso,DC=com'. Empty = default naming context.
+        SearchRoot = ''
+    }
+
+    ConfigMgr = @{
+        # ConfigMgr AdminService base URL, e.g. 'https://sccm.contoso.com/AdminService/'
+        AdminServiceBaseUrl = ''
+        # Optional path to a DPAPI-protected credential file for the AdminService. Leave empty
+        # to use the task's Windows-integrated identity. Create it (as the SYSTEM/task account) with:
+        #   Get-Credential | Export-Clixml 'C:\ProgramData\AssetTerminator\sccm.cred.xml'
+        CredentialXmlPath   = ''
+    }
+
+    DeviceActions = @{
+        DryRun                = $true
+        CommandTimeoutSeconds = 300
+        DefaultManufacturer   = ''   # assumed OEM when the device context has no 'Manufacturer' signal
+        LicenseRemoval        = @{
+            FileName       = ''       # e.g. 'C:\Program Files\...\changepk.exe'
+            Arguments      = ''       # supports {serialNumber} {deviceName} {primaryUserUpn}
+            WorkingDirectory = ''
+            IgnoreExitCode = $false
+        }
+        # BIOS/UEFI supervisor password removal keyed by OEM manufacturer.
+        BiosPasswordRemoval   = @{
+            Dell   = @{ FileName = ''; Arguments = ''; WorkingDirectory = ''; IgnoreExitCode = $false }
+            HP     = @{ FileName = ''; Arguments = ''; WorkingDirectory = ''; IgnoreExitCode = $false }
+            Lenovo = @{ FileName = ''; Arguments = ''; WorkingDirectory = ''; IgnoreExitCode = $false }
+        }
+    }
+
+    # Environment variables consumed by AT.Infrastructure (SQL state store, Service Bus, WORM audit).
+    Environment = @{
+        SQL_SERVER            = 'yourserver.database.windows.net'
+        SQL_DATABASE          = 'assetterminator'
+        SB_NAMESPACE          = 'yourns.servicebus.windows.net'
+        SB_ONPREM_QUEUE       = 'decommission-onprem'
+        AUDIT_BLOB_ACCOUNT    = 'youraudit'
+        AUDIT_CONTAINER       = 'audit'
+        # UAMI_CLIENT_ID      = ''   # set when several user-assigned identities are available
+    }
+}

@@ -1,0 +1,30 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "powershell",
+    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.4",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "SQL_SERVER": "myserver.database.windows.net",
+    "SQL_DATABASE": "assetterminator",
+
+    "AUDIT_BLOB_ACCOUNT": "myauditstorage",
+    "AUDIT_CONTAINER": "audit",
+
+    "AssetTerminator__Messaging__FullyQualifiedNamespace": "mybus.servicebus.windows.net",
+    "AssetTerminator__Messaging__OrchestrationQueue": "decommission-orchestration",
+
+    "AssetTerminator__Ingestion__ApiKeyHeader": "x-api-key",
+    "AssetTerminator__Ingestion__ApiKeys__0": "replace-with-key-from-key-vault",
+    "AssetTerminator__Ingestion__IpAllowlist__0": "203.0.113.0/24",
+
+    "AssetTerminator__PreWipe__DeleteFromAutopilot": "true",
+    "AssetTerminator__PreWipe__RemoveEnterpriseLicense": "true",
+    "AssetTerminator__PreWipe__RemoveBiosPassword": "true",
+
+    "AssetTerminator__Override__RequiredApprovals__Vip": "2",
+    "AssetTerminator__Override__RequiredApprovals__Critical": "2",
+
+    "UAMI_CLIENT_ID": ""
+  }
+}
