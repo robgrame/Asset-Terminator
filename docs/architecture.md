@@ -76,7 +76,7 @@ Principi guida:
 
 | Risorsa | Contenuto |
 | --- | --- |
-| **infra/** | Bicep modulare: `sql`, `storage` (Blob WORM), `keyvault`, `servicebus`, `functionapp`, `identity` (UAMI), `rbac` (role assignment), `monitoring` (App Insights/LAW + Workbook) + `deploy.ps1`. |
+| **infra/** | Bicep modulare: `sql`, `storage` (Blob WORM), `keyvault`, `servicebus`, `functionapp`, `identity` (UAMI), `rbac` (role assignment), `monitoring` (App Insights/LAW + Workbook + Managed Grafana opzionale) + `deploy.ps1`. |
 | **docs/** | `openapi.yaml` (contratto REST + esempi ServiceNow), `permissions.md` (matrice permessi least-privilege per azione), `kql/queries.kql` (libreria query), questo `architecture.md`. |
 | **tests/** | xUnit + Moq: Guardrail engine, Orchestrator (state machine + reconciliation), API (validazione/idempotenza), Provider (registration). |
 
@@ -432,7 +432,7 @@ dall'aggregazione delle sotto-azioni (`DecommissionActivities.OverallState`).
 | **Timeout / give-up** | `DueAt` per richiesta calcolato da SLA categoria; superato → `TimedOut`, nessun ulteriore retry, audit + callback. |
 | **SLA** | `ISlaCalculator` valuta `WithinSla / AtRisk / Breached` per categoria (`Standard / Vip / Critical`); soglie, frequenza polling e aggressività retry configurabili; callback su breach/at-risk. |
 | **RBAC** | Ruoli Entra `Operator / Auditor / Admin / Approver`; override richiede ruolo `Approver` e motivazione; multi-approval per VIP/Critical. |
-| **Osservabilità** | `correlationId` end-to-end; tabelle custom Log Analytics; libreria KQL; Workbook con KPI, SLA compliance, drill-down per `requestId`. |
+| **Osservabilità** | `correlationId` end-to-end; tabelle custom Log Analytics; libreria KQL; Workbook con KPI, SLA compliance, drill-down per `requestId`; dashboard Azure Managed Grafana opzionale. |
 | **Configurabilità** | tutto via `appsettings` / Key Vault / config store: guardrail, SLA, callback, timeout, code, retention. |
 | **Testabilità** | interfacce mockabili; suite xUnit + Moq per guardrail engine, orchestratore/reconciliation, API, registrazione provider. |
 

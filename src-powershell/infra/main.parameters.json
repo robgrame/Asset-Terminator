@@ -22,6 +22,18 @@
     },
     "useLocalAuth": {
       "value": false
+    },
+    "deployWorkbook": {
+      "value": true
+    },
+    "deployGrafana": {
+      "value": false
+    },
+    "grafanaName": {
+      "value": ""
+    },
+    "grafanaAdminObjectIds": {
+      "value": []
     }
   }
 }

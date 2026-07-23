@@ -17,7 +17,15 @@ param(
 
     [int] $WormRetentionDays = 2555,
 
-    [bool] $UseLocalAuth = $false
+    [bool] $UseLocalAuth = $false,
+
+    [bool] $DeployWorkbook = $true,
+
+    [bool] $DeployGrafana = $false,
+
+    [string] $GrafanaName = '',
+
+    [string[]] $GrafanaAdminObjectIds = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +47,10 @@ $parameters = @(
     "sqlAdminGroupName=$SqlAdminGroupName"
     "sqlAdminGroupObjectId=$SqlAdminGroupObjectId"
     "useLocalAuth=$($UseLocalAuth.ToString().ToLowerInvariant())"
+    "deployWorkbook=$($DeployWorkbook.ToString().ToLowerInvariant())"
+    "deployGrafana=$($DeployGrafana.ToString().ToLowerInvariant())"
+    "grafanaName=$GrafanaName"
+    "grafanaAdminObjectIds=$('[' + (($GrafanaAdminObjectIds | ForEach-Object { '"' + $_ + '"' }) -join ',') + ']')"
 )
 
 Write-Host 'Running deployment what-if...'

@@ -21,6 +21,14 @@ param(
 
     [string] $PollingCron = '0 */5 * * * *',
 
+    [bool] $DeployWorkbook = $true,
+
+    [bool] $DeployGrafana = $false,
+
+    [string] $GrafanaName = '',
+
+    [string[]] $GrafanaAdminObjectIds = @(),
+
     # Skip the `func azure functionapp publish` step (infra-only run).
     [switch] $SkipPublish
 )
@@ -55,6 +63,10 @@ $parameters = @(
     "sqlAdminGroupObjectId=$SqlAdminGroupObjectId"
     "useLocalAuth=$($UseLocalAuth.ToString().ToLowerInvariant())"
     "pollingCron=$PollingCron"
+    "deployWorkbook=$($DeployWorkbook.ToString().ToLowerInvariant())"
+    "deployGrafana=$($DeployGrafana.ToString().ToLowerInvariant())"
+    "grafanaName=$GrafanaName"
+    "grafanaAdminObjectIds=$('[' + (($GrafanaAdminObjectIds | ForEach-Object { '"' + $_ + '"' }) -join ',') + ']')"
 )
 
 Write-Host 'Running deployment what-if...'

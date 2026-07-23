@@ -69,7 +69,7 @@ Decommissioning a corporate device is rarely a single click. The object lives in
 | 🎚️ | **SLA tiers** | `Standard` / `Vip` / `Critical` categories drive deadlines, prioritisation and escalation. |
 | 👮 | **RBAC & override** | Entra-backed roles (Operator / Auditor / Admin / Approver) with an audited guardrail-override workflow. |
 | 🧪 | **Dry-run mode** | Simulate the whole flow — validation, guardrails, planning — with **no** destructive action. |
-| 📈 | **Built-in observability** | Structured telemetry to Log Analytics custom tables, ready-made KQL queries and a workbook. |
+| 📈 | **Built-in observability** | Structured telemetry to Log Analytics custom tables, ready-made KQL queries, an Azure Monitor Workbook and an optional Azure Managed Grafana dashboard. |
 
 ---
 
@@ -114,7 +114,7 @@ flowchart LR
 | **Messaging** | Azure Service Bus (orchestration / cloud / on-prem / dead-letter queues) |
 | **Identity & access** | Microsoft Graph SDK · per-capability User-Assigned Managed Identities · Entra ID RBAC |
 | **Secrets** | Azure Key Vault (no secrets in code) |
-| **Observability** | Log Analytics custom tables · KQL · Azure Monitor Workbook |
+| **Observability** | Log Analytics custom tables · KQL · Azure Monitor Workbook · Azure Managed Grafana (optional) |
 | **IaC** | Bicep + PowerShell deployment script |
 | **Testing** | xUnit + Moq |
 

@@ -1,0 +1,188 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# 🛡️ Asset-Terminator — Operations\nKPI, SLA compliance e drill-down per `requestId`. Sorgente: tabelle custom Log Analytics (`DecommissionRequests_CL`, `DecommissionActions_CL`, `GuardrailResults_CL`, `CallbackEvents_CL`)."
+      },
+      "name": "title"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 📊 Volumi & esito"
+      },
+      "name": "h-overview"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionRequests_CL | where overallStatus_s in (\"Completed\",\"Failed\",\"TimedOut\",\"Blocked\") | summarize requestCount = dcount(requestId_s) by overallStatus_s | order by requestCount desc",
+        "size": 1,
+        "title": "Richieste per stato",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "piechart"
+      },
+      "name": "query-richieste-per-stato"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionRequests_CL | summarize requestCount = dcount(requestId_s) by deviceType_s | order by requestCount desc",
+        "size": 1,
+        "title": "Distribuzione per tipo dispositivo",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "query-distribuzione-per-tipo-dispositivo"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionRequests_CL | where isnotempty(createdAt_t) and isnotempty(completedAt_t) | where overallStatus_s == \"Completed\" | extend completionMinutes = datetime_diff(\"minute\", completedAt_t, createdAt_t) | summarize avgCompletionMinutes = avg(completionMinutes), p50Minutes = percentile(completionMinutes,50), p95Minutes = percentile(completionMinutes,95)",
+        "size": 1,
+        "title": "Tempo di completamento (min)",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "query-tempo-di-completamento-(min)"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 🎯 Affidabilita per sistema"
+      },
+      "name": "h-reliability"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionActions_CL | where system_s in (\"ActiveDirectory\",\"ConfigMgr\",\"Intune\",\"EntraId\") or target_s in (\"ActiveDirectory\",\"ConfigMgr\",\"Intune\",\"EntraId\") | extend system = coalesce(system_s, target_s) | summarize totalActions = count(), failedActions = countif(status_s == \"Failed\") by system | extend failureRate = todouble(failedActions)/todouble(totalActions) | order by failureRate desc",
+        "size": 1,
+        "title": "Failure rate per sistema",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "barchart"
+      },
+      "name": "query-failure-rate-per-sistema"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionActions_CL | summarize totalRetries = sum(tolong(retryCount_d)), maxRetries = max(tolong(retryCount_d)), actions = count() by target_s, action_s | order by totalRetries desc",
+        "size": 1,
+        "title": "Retry per azione e target",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "query-retry-per-azione-e-target"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## ⏱️ SLA"
+      },
+      "name": "h-sla"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionRequests_CL | where overallStatus_s in (\"Completed\",\"Failed\",\"TimedOut\",\"Blocked\") | extend metSla = iff(isnotempty(dueAt_t) and isnotempty(completedAt_t), completedAt_t <= dueAt_t, slaState_s !in (\"Breached\",\"SlaBreached\")) | summarize totalRequests = dcount(requestId_s), compliantRequests = dcountif(requestId_s, metSla) by assetCategory_s | extend complianceRate = todouble(compliantRequests)/todouble(totalRequests) | order by complianceRate asc",
+        "size": 1,
+        "title": "SLA compliance per categoria asset",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "query-sla-compliance-per-categoria-asset"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "DecommissionRequests_CL | where overallStatus_s !in (\"Completed\",\"Failed\",\"TimedOut\") | extend minutesUntilDue = datetime_diff(\"minute\", dueAt_t, now()) | where slaState_s in (\"AtRisk\",\"Breached\",\"SlaAtRisk\",\"SlaBreached\") or (isnotempty(dueAt_t) and dueAt_t <= now() + 4h) | project TimeGenerated, requestId_s, ticketNumber_s, assetId_s, assetCategory_s, overallStatus_s, slaState_s, dueAt_t, minutesUntilDue | order by dueAt_t asc",
+        "size": 1,
+        "title": "SLA a rischio / in violazione",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "query-sla-a-rischio-/-in-violazione"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 🚧 Guardrail & callback"
+      },
+      "name": "h-guardrails"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "GuardrailResults_CL | summarize evaluations = count(), failures = countif(result_s in (\"Failed\",\"Blocked\")) by guardrailId_s, mandatory_b, overridable_b | extend failureRate = todouble(failures)/todouble(evaluations) | order by failures desc",
+        "size": 1,
+        "title": "Esiti guardrail",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "query-esiti-guardrail"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "CallbackEvents_CL | summarize callbacks = count(), delivered = countif(status_s == \"Delivered\"), deadLettered = countif(deadLettered_b == true), retries = sum(tolong(retryCount_d)) by eventType_s | extend deliveryRate = todouble(delivered)/todouble(callbacks) | order by deadLettered desc, retries desc",
+        "size": 1,
+        "title": "Salute consegna callback",
+        "timeContext": {
+          "durationMs": 2592000000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "query-salute-consegna-callback"
+    }
+  ],
+  "isLocked": false,
+  "fallbackResourceIds": [
+    "{LogAnalyticsResourceId}"
+  ]
+}

@@ -21,6 +21,18 @@ param sqlAdminGroupObjectId string
 @description('Set true to keep Service Bus SAS/local auth enabled for a simple on-premises agent bootstrap.')
 param useLocalAuth bool = false
 
+@description('Deploy the Azure Monitor Workbook with operational KPI/SLA tiles.')
+param deployWorkbook bool = true
+
+@description('Deploy an Azure Managed Grafana instance wired to Azure Monitor.')
+param deployGrafana bool = false
+
+@description('Grafana instance name. When empty a name is derived from the Log Analytics name.')
+param grafanaName string = ''
+
+@description('Entra object IDs (users or groups) granted the Grafana Admin role on the instance.')
+param grafanaAdminObjectIds array = []
+
 var tags = {
   solution: 'Asset-Terminator'
   env: env
@@ -54,6 +66,10 @@ module monitoring './modules/monitoring.bicep' = {
     tags: tags
     logAnalyticsName: logAnalyticsName
     appInsightsName: appInsightsName
+    deployWorkbook: deployWorkbook
+    deployGrafana: deployGrafana
+    grafanaName: grafanaName
+    grafanaAdminObjectIds: grafanaAdminObjectIds
   }
 }
 
@@ -196,3 +212,5 @@ output orchestratorUamiResourceId string = identity.outputs.orchestratorResource
 output onpremUamiClientId string = identity.outputs.onpremClientId
 output onpremUamiPrincipalId string = identity.outputs.onpremPrincipalId
 output onpremUamiResourceId string = identity.outputs.onpremResourceId
+output workbookResourceId string = monitoring.outputs.workbookResourceId
+output grafanaEndpoint string = monitoring.outputs.grafanaEndpoint
