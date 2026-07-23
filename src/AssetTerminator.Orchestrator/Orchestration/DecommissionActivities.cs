@@ -88,6 +88,7 @@ public sealed class DecommissionActivities
         record.DeviceContextJson = JsonSerializer.Serialize(context, Json);
         record.State = RequestState.Validated;
         await _store.UpdateAsync(record, ct);
+        await _telemetry.RequestSnapshotAsync(record, ct);
 
         await Audit(record, "Validated", null, "Validated",
             $"disposition={record.DispositionType}; intuneId={context.IntuneManagedDeviceId}; entraId={context.EntraDeviceId}; encrypted={context.IsEncrypted}", ct);

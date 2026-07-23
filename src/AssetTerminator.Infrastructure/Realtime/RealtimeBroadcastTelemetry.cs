@@ -6,11 +6,14 @@ namespace AssetTerminator.Infrastructure.Realtime;
 
 /// <summary>
 /// Decorator over <see cref="IOperationalTelemetry"/> that also fans a request state change out
-/// to the realtime channel on every <see cref="RequestSnapshotAsync"/> call (which already fires
-/// on every state transition). Keeps the live board wiring out of the orchestration call sites.
+/// to the realtime channel whenever <see cref="RequestSnapshotAsync"/> is called. Realtime delivery
+/// is strictly best-effort: the primary telemetry runs first and the broadcast is bounded by a short
+/// timeout so a slow/unavailable Event Grid can never delay the orchestration path.
 /// </summary>
 public sealed class RealtimeBroadcastTelemetry : IOperationalTelemetry
 {
+    private static readonly TimeSpan BroadcastTimeout = TimeSpan.FromSeconds(5);
+
     private readonly IOperationalTelemetry _inner;
     private readonly IRealtimeEventPublisher _realtime;
 
@@ -22,8 +25,12 @@ public sealed class RealtimeBroadcastTelemetry : IOperationalTelemetry
 
     public async Task RequestSnapshotAsync(DecommissionRecord record, CancellationToken ct)
     {
-        await _realtime.PublishStateChangeAsync(record, ct);
+        // Primary telemetry first — it must never be blocked or preceded by best-effort realtime.
         await _inner.RequestSnapshotAsync(record, ct);
+
+        using var timeout = new CancellationTokenSource(BroadcastTimeout);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+        await _realtime.PublishStateChangeAsync(record, linked.Token);
     }
 
     public Task ActionSnapshotAsync(DecommissionRecord record, SubAction action, CancellationToken ct) =>

@@ -88,30 +88,43 @@
             return known.includes(key) ? 's-' + key : 's-default';
         }
 
+        function td(text, className) {
+            const el = document.createElement('td');
+            if (className) el.className = className;
+            el.textContent = (text === undefined || text === null || text === '') ? '—' : text;
+            return el;
+        }
         function upsert(d) {
             if (!d) return;
             const id = d.requestId || d.RequestId || d.assetId || d.AssetId;
             if (!id) return;
+            const state = d.overallStatus || d.OverallStatus || d.state || d.State || '';
+            const sla = d.slaState || d.SlaState || '';
+            const updatedRaw = d.updatedAt || d.UpdatedAt || d.lastUpdatedAtUtc || d.LastUpdatedAtUtc || '';
+            const updated = String(updatedRaw).replace('T', ' ').replace('Z', '').replace(/\.\d+/, '');
             const empty = document.getElementById('emptyRow');
             if (empty) empty.remove();
-
-            const state = d.state || d.State || '';
-            const sla = d.slaState || d.SlaState || '';
             const rowId = 'r-' + String(id).replace(/[^a-zA-Z0-9]/g, '');
             let tr = document.getElementById(rowId);
-            if (!tr) {
-                tr = document.createElement('tr');
-                tr.id = rowId;
-                rows.prepend(tr);
-            }
-            tr.innerHTML = `
-                <td>${d.ticketNumber || d.TicketNumber || '—'}</td>
-                <td>${d.deviceName || d.DeviceName || '—'}</td>
-                <td>${d.deviceType || d.DeviceType || '—'}</td>
-                <td>${d.dispositionType || d.DispositionType || '—'}</td>
-                <td><span class="badge ${stateClass(state)}">${state || '—'}</span></td>
-                <td class="${slaClass(sla)}">${sla || '—'}</td>
-                <td class="muted">${(d.lastUpdatedAtUtc || d.LastUpdatedAtUtc || '').replace('T', ' ').replace('Z', '')}</td>`;
+            // Event Grid is at-least-once and unordered: drop stale/duplicate updates.
+            const ts = Date.parse(updatedRaw);
+            if (tr && !isNaN(ts) && tr.dataset.ts && Number(tr.dataset.ts) > ts) return;
+            if (!tr) { tr = document.createElement('tr'); tr.id = rowId; rows.prepend(tr); }
+            if (!isNaN(ts)) tr.dataset.ts = String(ts);
+            // Build cells with textContent (never innerHTML) to prevent XSS from device/ticket values.
+            tr.replaceChildren();
+            tr.appendChild(td(d.ticketNumber || d.TicketNumber));
+            tr.appendChild(td(d.deviceName || d.DeviceName));
+            tr.appendChild(td(d.deviceType || d.DeviceType));
+            tr.appendChild(td(d.dispositionType || d.DispositionType));
+            const stateTd = document.createElement('td');
+            const badge = document.createElement('span');
+            badge.className = 'badge ' + stateClass(state);
+            badge.textContent = state || '—';
+            stateTd.appendChild(badge);
+            tr.appendChild(stateTd);
+            tr.appendChild(td(sla, slaClass(sla)));
+            tr.appendChild(td(updated, 'muted'));
             tr.classList.remove('flash');
             void tr.offsetWidth;
             tr.classList.add('flash');
