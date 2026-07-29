@@ -1,0 +1,235 @@
+From: Mittente <mittente@dominio.it>
+To: Destinatario <destinatario@dominio.it>
+Cc: 
+Subject: Deploy soluzione poc-powershell-dispatch (Asset-Terminator) - guida operativa
+Date: Wed, 29 Jul 2026 16:00:00 +0200
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="=_at_boundary_2026"
+
+--=_at_boundary_2026
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+Deploy soluzione poc-powershell-dispatch (Asset-Terminator)
+
+1) Prerequisiti
+- Azure CLI + Azure Functions Core Tools (func) + Bicep.
+- Ruolo Owner sul Resource Group dedicato (lo script crea role assignment RBAC:
+  con il solo ruolo Contributor il deploy fallisce).
+- App registration Entra con permessi applicativi su Microsoft Graph
+  (DeviceManagementManagedDevices.Read.All, admin consent) e un certificato
+  app-only per l'autenticazione dei runbook.
+
+2) Comando di deploy
+  cd poc-powershell-dispatch/infra
+  ./deploy.ps1 -ResourceGroup ASSET-TERMINATOR-DISPATCH-RG `
+     -Subscription <subscription-id> -Location westeurope `
+     -GraphTenantId <tenant> -GraphClientId <appId> -GraphClientSecret <secret>
+
+Parametri: ResourceGroup (obbl.), Subscription, Location (def westeurope),
+NamePrefix (def attdisp), Env (def dev), GraphTenantId/GraphClientId/
+GraphClientSecret (obbl.), -SkipPublish (ferma dopo infra + runbook).
+Nota: GraphClientSecret e' usato SOLO dalla Function API per i lookup
+read-only del device su Graph. I runbook preferiscono il certificato e usano
+ClientSecret solo come fallback opzionale se l'autenticazione con certificato
+non e' disponibile.
+
+3) Cosa fa lo script
+- Provisiona l'infrastruttura (main.bicep): 2 Function App, Service Bus,
+  Automation Account, App Insights, runtime PowerShell 7.4, tabella di stato,
+  private endpoint, role assignment e le Automation Variables.
+- Sincronizza i moduli condivisi (build.ps1) e pubblica le due Function App.
+- Carica e pubblica i 3 runbook RBK-WindowsDisposal / RBK-AppleDisposal /
+  RBK-AndroidDisposal.
+
+4) Automation Variables
+Create e valorizzate dal bicep: ClientId, TenantId, GraphCertificateName
+(GraphAppCert), AppInsightsConnectionString.
+Create vuote e cifrate, da valorizzare dopo il deploy: Certificate_thumbprint,
+ClientSecret (opzionale, fallback), ABM-ClientId, ABM-KeyId, ABM-PrivateKey,
+KME-ClientIdentifier, KME-KeysJson, KME-CustomerId.
+Certificato Graph: caricare l'asset GraphAppCert (Automation Certificate).
+Auth runbook: certificato (GraphAppCert) -> thumbprint (cert store) ->
+client secret (ClientSecret) come ultimo fallback.
+
+  az automation variable update -g ASSET-TERMINATOR-DISPATCH-RG `
+    --automation-account-name attdisp-auto-dev `
+    --name Certificate_thumbprint --value '"<thumbprint>"' --encrypted true
+
+  az automation variable update -g ASSET-TERMINATOR-DISPATCH-RG `
+    --automation-account-name attdisp-auto-dev `
+    --name ClientSecret --value '"<client-secret>"' --encrypted true
+
+  az automation certificate create -g ASSET-TERMINATOR-DISPATCH-RG `
+    --automation-account-name attdisp-auto-dev `
+    --name GraphAppCert --path ./graph-app.pfx --password '<pfx-password>'
+
+5) Verifica post-deploy
+- Recuperare la function key (WipeIntake) e inviare una richiesta con dryRun=true.
+- Controllare i customEvents su App Insights e il Workbook "Asset-Terminator -
+  Wipe Requests".
+
+--=_at_boundary_2026
+Content-Type: text/html; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  body { margin:0; padding:0; background:#f4f5f7; color:#1f2933;
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         font-size:15px; line-height:1.6; }
+  .wrap { width:100%; background:#ffffff; }
+  .header { background:#1f2933; padding:28px 40px; }
+  .header h1 { margin:0; color:#ffffff; font-size:22px; font-weight:600; letter-spacing:.2px; }
+  .header p { margin:6px 0 0; color:#9aa5b1; font-size:13px; }
+  .content { padding:8px 40px 32px; }
+  h2 { font-size:16px; font-weight:600; color:#1f2933; margin:32px 0 8px;
+       padding-bottom:8px; border-bottom:1px solid #e4e7eb; }
+  h2 .num { color:#0e7490; font-weight:700; margin-right:8px; }
+  p { margin:10px 0; }
+  .muted { color:#616e7c; font-size:13px; }
+  a { color:#0e7490; }
+  code { font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+         background:#f1f5f9; color:#0f172a; padding:1px 5px; border-radius:3px; font-size:13px; }
+  pre { background:#f1f5f9; color:#0f172a; border-left:3px solid #0e7490;
+        padding:14px 16px; border-radius:4px; overflow-x:auto; font-size:13px;
+        font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+        line-height:1.5; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; margin:12px 0; font-size:13.5px; }
+  th, td { text-align:left; padding:9px 12px; border:1px solid #e4e7eb; vertical-align:top; }
+  th { background:#f1f5f9; color:#334155; font-weight:600; }
+  tr:nth-child(even) td { background:#fafbfc; }
+  .req { color:#b91c1c; font-weight:600; }
+  .opt { color:#616e7c; }
+  .note { background:#f0f9fb; border:1px solid #cfe8ee; border-left:3px solid #0e7490;
+          padding:12px 16px; border-radius:4px; margin:14px 0; font-size:13.5px; color:#334155; }
+  .footer { padding:20px 40px 32px; color:#9aa5b1; font-size:12px; border-top:1px solid #e4e7eb; }
+  ul { margin:8px 0; padding-left:20px; }
+  li { margin:4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h1>Deploy &mdash; poc-powershell-dispatch (Asset-Terminator)</h1>
+    <p>Guida operativa: esecuzione di <code style="background:#2b3441;color:#e5e9ef">deploy.ps1</code>, parametri, creazione e valorizzazione delle Automation Variables.</p>
+  </div>
+  <div class="content">
+
+    <p>Ciao,<br>
+    di seguito la procedura completa per il deploy della soluzione di dismissione
+    asset <strong>poc-powershell-dispatch</strong> (Function API &rarr; Service Bus
+    &rarr; worker &rarr; runbook Azure Automation per piattaforma) su un Resource
+    Group dedicato.</p>
+
+    <h2><span class="num">1</span>Prerequisiti</h2>
+    <ul>
+      <li><strong>Tooling</strong>: Azure CLI, Azure Functions Core Tools (<code>func</code>) e Bicep.</li>
+      <li><strong>Permessi</strong>: ruolo <strong>Owner</strong> sul Resource Group dedicato. Lo script crea <em>role assignment</em> RBAC per le managed identity delle Function App: con il solo ruolo <em>Contributor</em> il deploy fallisce con <code>AuthorizationFailed</code>. In alternativa: <em>Contributor</em> + <em>User Access Administrator</em> (o <em>Role Based Access Control Administrator</em>).</li>
+      <li><strong>App registration</strong> Entra con permessi applicativi Microsoft Graph (<code>DeviceManagementManagedDevices.Read.All</code>, admin consent) e un <strong>certificato app-only</strong> per l'autenticazione dei runbook.</li>
+    </ul>
+
+    <h2><span class="num">2</span>Comando di deploy</h2>
+    <pre>cd poc-powershell-dispatch/infra
+
+./deploy.ps1 `
+  -ResourceGroup    ASSET-TERMINATOR-DISPATCH-RG `
+  -Subscription     &lt;subscription-id&gt; `
+  -Location         westeurope `
+  -GraphTenantId    &lt;tenant-id&gt; `
+  -GraphClientId    &lt;app-id&gt; `
+  -GraphClientSecret &lt;secret&gt;</pre>
+
+    <table>
+      <tr><th>Parametro</th><th>Obbl.</th><th>Default</th><th>Descrizione</th></tr>
+      <tr><td><code>-ResourceGroup</code></td><td class="req">S&igrave;</td><td>&mdash;</td><td>Resource Group dedicato (creato se assente).</td></tr>
+      <tr><td><code>-Subscription</code></td><td class="opt">No</td><td>contesto <code>az</code></td><td>Subscription di destinazione.</td></tr>
+      <tr><td><code>-Location</code></td><td class="opt">No</td><td><code>westeurope</code></td><td>Region delle risorse.</td></tr>
+      <tr><td><code>-NamePrefix</code></td><td class="opt">No</td><td><code>attdisp</code></td><td>Prefisso dei nomi risorsa.</td></tr>
+      <tr><td><code>-Env</code></td><td class="opt">No</td><td><code>dev</code></td><td>Suffisso ambiente.</td></tr>
+      <tr><td><code>-GraphTenantId</code></td><td class="req">S&igrave;</td><td>&mdash;</td><td>Tenant ID Entra.</td></tr>
+      <tr><td><code>-GraphClientId</code></td><td class="req">S&igrave;</td><td>&mdash;</td><td>Application (client) ID dell'app registration.</td></tr>
+      <tr><td><code>-GraphClientSecret</code></td><td class="req">S&igrave;</td><td>&mdash;</td><td>Secret dell'app, usato <strong>solo dalla Function API</strong> per i lookup read-only del device su Graph.</td></tr>
+      <tr><td><code>-SkipPublish</code></td><td class="opt">No</td><td>&mdash;</td><td>Switch: ferma dopo infrastruttura + runbook, senza ripubblicare le Function App.</td></tr>
+    </table>
+
+    <div class="note"><strong>Autenticazione Graph.</strong> I <strong>runbook</strong> si autenticano a Microsoft Graph con questo ordine di preferenza: (1) <strong>certificato</strong> dall'Automation Certificate asset <code>GraphAppCert</code>; (2) certificato nel cert store del sandbox via <code>Certificate_thumbprint</code>; (3) <strong>client secret</strong> dalla variabile cifrata <code>ClientSecret</code>, usato <strong>solo come fallback</strong> se non &egrave; disponibile alcun certificato. Il certificato &egrave; l'opzione raccomandata. Il parametro <code>-GraphClientSecret</code> dello script riguarda invece la Function API.</div>
+
+    <h2><span class="num">3</span>Cosa fa lo script</h2>
+    <ul>
+      <li>Provisiona l'infrastruttura (<code>main.bicep</code>): 2 Function App (API + worker) con managed identity, Service Bus (topic + subscription per piattaforma), Automation Account, Application Insights, runtime <strong>PowerShell 7.4</strong>, tabella di stato, private endpoint, role assignment e le Automation Variables.</li>
+      <li>Sincronizza i moduli PowerShell condivisi (<code>build.ps1</code>) e pubblica <strong>entrambe</strong> le Function App.</li>
+      <li>Carica e pubblica i 3 runbook: <code>RBK-WindowsDisposal</code>, <code>RBK-AppleDisposal</code>, <code>RBK-AndroidDisposal</code>.</li>
+    </ul>
+
+    <h2><span class="num">4</span>Automation Variables &amp; certificato</h2>
+    <p>Il template <strong>crea</strong> tutte le variabili. Quelle in chiaro sono gi&agrave; valorizzate; quelle segrete sono create <strong>vuote e cifrate</strong> e vanno popolate dopo il deploy.</p>
+
+    <table>
+      <tr><th>Variabile</th><th>Cifrata</th><th>Stato al deploy</th><th>Usata da</th><th>Contenuto</th></tr>
+      <tr><td><code>ClientId</code></td><td>no</td><td>valorizzata</td><td>tutti</td><td>Application ID dell'app Graph.</td></tr>
+      <tr><td><code>TenantId</code></td><td>no</td><td>valorizzata</td><td>tutti</td><td>Tenant ID Entra.</td></tr>
+      <tr><td><code>GraphCertificateName</code></td><td>no</td><td>valorizzata (<code>GraphAppCert</code>)</td><td>tutti</td><td>Nome dell'Automation Certificate asset con il certificato Graph.</td></tr>
+      <tr><td><code>AppInsightsConnectionString</code></td><td>no</td><td>valorizzata (auto)</td><td>tutti</td><td>Connection string App Insights per gli eventi di audit.</td></tr>
+      <tr><td><code>Certificate_thumbprint</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>tutti</td><td>Thumbprint del certificato app-only (validazione + fallback su cert store).</td></tr>
+      <tr><td><code>ClientSecret</code></td><td>s&igrave;</td><td class="opt">opzionale</td><td>tutti</td><td>Client secret dell'app registration. <strong>Fallback</strong>: usato dai runbook solo se non &egrave; disponibile alcun certificato.</td></tr>
+      <tr><td><code>ABM-ClientId</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>Apple</td><td>Client ID API Apple Business Manager.</td></tr>
+      <tr><td><code>ABM-KeyId</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>Apple</td><td>Key ID API ABM.</td></tr>
+      <tr><td><code>ABM-PrivateKey</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>Apple</td><td>Chiave privata EC P-256 (PEM).</td></tr>
+      <tr><td><code>KME-ClientIdentifier</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>Android</td><td>Client identifier Samsung Knox.</td></tr>
+      <tr><td><code>KME-KeysJson</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>Android</td><td>Keys JSON Knox (contiene la chiave RSA privata).</td></tr>
+      <tr><td><code>KME-CustomerId</code></td><td>s&igrave;</td><td><span class="req">da valorizzare</span></td><td>Android</td><td>Customer ID Knox.</td></tr>
+    </table>
+
+    <p class="muted">Valorizzazione via portale (Automation Account &rarr; Shared Resources &rarr; Variables) oppure via CLI. I valori stringa vanno passati <strong>racchiusi tra virgolette JSON</strong>:</p>
+    <pre>az automation variable update `
+  -g ASSET-TERMINATOR-DISPATCH-RG `
+  --automation-account-name attdisp-auto-dev `
+  --name Certificate_thumbprint `
+  --value '"&lt;thumbprint&gt;"' `
+  --encrypted true</pre>
+
+    <p class="muted">Fallback opzionale: valorizzazione del client secret dell'app registration. Il runbook lo usa solo quando non riesce ad autenticarsi con alcun certificato:</p>
+    <pre>az automation variable update `
+  -g ASSET-TERMINATOR-DISPATCH-RG `
+  --automation-account-name attdisp-auto-dev `
+  --name ClientSecret `
+  --value '"&lt;client-secret&gt;"' `
+  --encrypted true</pre>
+
+    <p class="muted">Caricamento del certificato Graph app-only come Automation Certificate asset:</p>
+    <pre>az automation certificate create `
+  -g ASSET-TERMINATOR-DISPATCH-RG `
+  --automation-account-name attdisp-auto-dev `
+  --name GraphAppCert `
+  --path ./graph-app.pfx `
+  --password '&lt;pfx-password&gt;'</pre>
+
+    <div class="note">Le variabili segrete e il certificato sono necessari <strong>solo per il wipe reale</strong>. Per un test end-to-end &egrave; sufficiente inviare una richiesta con <code>dryRun=true</code>.</div>
+
+    <h2><span class="num">5</span>Verifica post-deploy</h2>
+    <ul>
+      <li>Recuperare la function key dell'intake:
+        <pre>az functionapp function keys list `
+  -g ASSET-TERMINATOR-DISPATCH-RG -n attdisp-func-api-dev `
+  --function-name WipeIntake --query default -o tsv</pre>
+      </li>
+      <li>Inviare una richiesta di prova (<code>POST /api/v1/wipe</code>) con <code>dryRun=true</code> e verificare lo stato con <code>GET /api/v1/wipe/status</code>.</li>
+      <li>Controllare gli eventi di audit su <strong>Application Insights</strong> (<code>customEvents | where name startswith 'Wipe'</code>) e il <strong>Workbook</strong> &ldquo;Asset-Terminator &mdash; Wipe Requests&rdquo;.</li>
+    </ul>
+
+    <p>Per qualsiasi necessit&agrave; resto a disposizione.<br>Grazie,</p>
+
+  </div>
+  <div class="footer">
+    Asset-Terminator &middot; poc-powershell-dispatch &middot; documento operativo di deploy.
+  </div>
+</div>
+</body>
+</html>
+
+--=_at_boundary_2026--

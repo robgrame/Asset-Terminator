@@ -323,9 +323,11 @@ resource automation 'Microsoft.Automation/automationAccounts@2023-11-01' = {
 var automationPlainVariables = [
   { name: 'ClientId', value: graphClientId, description: 'Graph app registration (application) ID used by the runbooks.' }
   { name: 'TenantId', value: graphTenantId, description: 'Entra tenant ID.' }
+  { name: 'GraphCertificateName', value: 'GraphAppCert', description: 'Name of the Automation Certificate asset holding the Graph app-only certificate used by the runbooks.' }
 ]
 
 var automationSecretVariables = [
+  { name: 'ClientSecret', description: 'Graph app registration client secret (optional fallback used by the runbooks only when no certificate is available).' }
   { name: 'Certificate_thumbprint', description: 'Thumbprint of the certificate used for Graph app-only authentication.' }
   { name: 'ABM-ClientId', description: 'Apple Business Manager API client ID (BUSINESSAPI.<guid>).' }
   { name: 'ABM-KeyId', description: 'Apple Business Manager API key ID.' }
