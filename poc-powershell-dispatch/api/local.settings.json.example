@@ -1,0 +1,27 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "powershell",
+    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.4",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "STATE_TABLE_ENDPOINT": "https://<storage>.table.core.windows.net",
+    "STATE_TABLE_NAME": "wiperequests",
+
+    "SERVICEBUS_FQDN": "<namespace>.servicebus.windows.net",
+    "SERVICEBUS_TOPIC": "asset-disposal",
+
+    "UAMI_CLIENT_ID": "",
+
+    "GRAPH_TENANT_ID": "<tenant-guid>",
+    "GRAPH_CLIENT_ID": "<app-guid>",
+    "GRAPH_CLIENT_SECRET": "<secret>",
+    "GRAPH_BASE_URI": "https://graph.microsoft.com/beta",
+    "GRAPH_AUTHORITY_HOST": "https://login.microsoftonline.com",
+    "GRAPH_SCOPE": "https://graph.microsoft.com/.default",
+
+    "DEFAULT_DRY_RUN": "true",
+    "GUARDRAIL_REQUIRE_ENCRYPTION": "true",
+    "GUARDRAIL_REQUIRE_USER_CONFIRMATION": "true"
+  }
+}

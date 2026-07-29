@@ -1,0 +1,464 @@
+<#
+.SYNOPSIS
+    Windows Autopilot removal + Intune wipe. Corrected version for the
+    Service Bus dispatch pipeline.
+
+.DESCRIPTION
+    Corrections and changes vs the original Windows_Disposal_Device.ps1:
+
+      * FIXED: three occurrences of ':IsNullOrWhiteSpace(...)' instead of
+        '[string]::IsNullOrWhiteSpace(...)'. The original does not parse, so the
+        webhook branch could never run.
+      * FIXED: assignment to '$matches', a PowerShell automatic variable
+        populated by -match. Renamed to '$autopilotMatches'.
+      * REMOVED: the -WebhookData branch. The dispatcher starts the runbook with
+        named parameters through ARM, so webhooks (and their tokens in the URL)
+        are no longer used.
+      * ADDED: -RequestId, -Scenario and -DryRun so the runbook honours the
+        business scenario and can be exercised safely.
+      * ADDED: the '##RESULT## {json}' structured output line consumed by the
+        JobMonitor function to build the ServiceNow evidence.
+      * ADDED: the runbook now fails (terminating error) when no wipe could be
+        issued, so the job status itself is meaningful.
+
+    Scenario semantics:
+      Retirement  wipe only, the device stays in Autopilot (asset is reused)
+      Sale        remove from Autopilot, then wipe
+      Disposal    remove from Autopilot, then wipe
+      LostStolen  wipe only, the device stays registered for tracking
+
+    CREDENTIALS
+    All credentials are read from encrypted Azure Automation variables. Nothing
+    secret is ever accepted as a runbook parameter: job parameters are stored in
+    clear text in the job metadata and are visible to any Job Reader.
+
+      ClientId                Graph app registration (application) ID
+      TenantId                Entra tenant ID
+      Certificate_thumbprint  Thumbprint of the certificate in the Automation
+                              Account certificate store
+
+    Required Graph application permissions:
+      DeviceManagementServiceConfig.ReadWrite.All
+      DeviceManagementManagedDevices.Read.All
+      DeviceManagementManagedDevices.PrivilegedOperations.All
+
+.PARAMETER SerialNumbers
+    One or more serial numbers, comma separated.
+
+.PARAMETER RequestId
+    Correlation identifier supplied by the dispatcher (the ServiceNow request).
+
+.PARAMETER Scenario
+    Retirement | Sale | Disposal | LostStolen. Defaults to Disposal.
+
+.PARAMETER DryRun
+    'true' to resolve and log everything without deleting or wiping anything.
+
+.PARAMETER WipeWaitSeconds
+    Delay between the Autopilot delete and the wipe, to let the deletion settle.
+
+.EXAMPLE
+    .\Windows_Disposal_Device.ps1 -SerialNumbers "ABC123,DEF456" -Scenario Disposal
+#>
+
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $SerialNumbers,
+
+    [Parameter(Mandatory = $false)]
+    [string] $RequestId = "",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Retirement", "Sale", "Disposal", "LostStolen")]
+    [string] $Scenario = "Disposal",
+
+    # Automation passes job parameters as strings; a [bool] would bind "false"
+    # to $true because any non-empty string is truthy. Parsed explicitly below.
+    [Parameter(Mandatory = $false)]
+    [string] $DryRun = "false",
+
+    [Parameter(Mandatory = $false)]
+    [int] $WipeWaitSeconds = 60
+)
+
+$ErrorActionPreference = "Stop"
+
+# ============================================================
+# 0. Helpers
+# ============================================================
+
+function ConvertTo-RunbookBool {
+    param([string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return $Value.Trim().ToLowerInvariant() -in @('true', '1', 'yes')
+}
+
+# Secrets live in encrypted Automation variables, never in job parameters.
+# A missing variable must fail loudly instead of producing a confusing 401.
+function Get-RequiredAutomationVariable {
+    param([Parameter(Mandatory = $true)] [string] $Name)
+
+    $value = Get-AutomationVariable -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) {
+        throw "Automation variable '$Name' is missing or empty. Create it in the Automation Account (encrypted) before running this runbook."
+    }
+    return $value
+}
+
+# The dispatcher's JobMonitor parses this single line out of the job output.
+# Everything else in the stream is human-readable diagnostics.
+function Write-RunbookResult {
+    param([Parameter(Mandatory = $true)] $Result)
+    Write-Output ("##RESULT## " + ($Result | ConvertTo-Json -Depth 10 -Compress))
+}
+
+function ConvertTo-ODataStringLiteral {
+    param([Parameter(Mandatory = $true)] [string] $Value)
+    # OData single quote escaping: ' becomes ''
+    return $Value.Replace("'", "''")
+}
+
+function Invoke-GraphRequestSafe {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Uri,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("GET", "POST", "DELETE", "PATCH", "PUT")]
+        [string] $Method,
+        [object] $Body = $null,
+        [string] $ContentType = "application/json"
+    )
+
+    $params = @{
+        Uri         = $Uri
+        Method      = $Method
+        ErrorAction = "Stop"
+    }
+
+    if ($null -ne $Body) {
+        $params["Body"] = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 10 }
+        $params["ContentType"] = $ContentType
+    }
+
+    Write-Verbose "[Graph] $Method $Uri"
+    return Invoke-MgGraphRequest @params
+}
+
+function Get-GraphPagedResult {
+    param([Parameter(Mandatory = $true)] [string] $Uri)
+
+    $allItems = @()
+    $nextUri = $Uri
+
+    while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
+        $response = Invoke-GraphRequestSafe -Uri $nextUri -Method "GET"
+        if ($null -ne $response.value) { $allItems += $response.value }
+
+        if ($response.PSObject.Properties.Name -contains "@odata.nextLink") {
+            $nextUri = $response.'@odata.nextLink'
+        }
+        else {
+            $nextUri = $null
+        }
+    }
+
+    return $allItems
+}
+
+# ============================================================
+# 1. Autopilot
+# ============================================================
+
+function Find-AutopilotDeviceBySerial {
+    param([Parameter(Mandatory = $true)] [string] $SerialNumber)
+
+    $escapedSerial = ConvertTo-ODataStringLiteral -Value $SerialNumber
+    # 'contains' tolerates service-side formatting differences on the serial.
+    $uri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$filter=contains(serialNumber,'$escapedSerial')&`$top=25"
+
+    Write-Warning "[Autopilot] Searching Autopilot identity for serial '$SerialNumber'"
+
+    try {
+        $response = Invoke-GraphRequestSafe -Uri $uri -Method "GET"
+        $candidates = @($response.value)
+        $exactMatches = @($candidates | Where-Object { $_.serialNumber -eq $SerialNumber })
+
+        if ($exactMatches.Count -gt 0) { return $exactMatches }
+
+        foreach ($candidate in $candidates) {
+            Write-Warning "[Autopilot] Non-exact candidate: ID=$($candidate.id), Serial=$($candidate.serialNumber)"
+        }
+        return @()
+    }
+    catch {
+        Write-Warning "[Autopilot] Filtered search failed for '$SerialNumber': $($_.Exception.Message)"
+        Write-Warning "[Autopilot] Falling back to a paged full-list search"
+
+        $fallbackUri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$top=100"
+        $allAutopilotDevices = Get-GraphPagedResult -Uri $fallbackUri
+        return @($allAutopilotDevices | Where-Object { $_.serialNumber -eq $SerialNumber })
+    }
+}
+
+function Remove-AutopilotDevice {
+    param(
+        [Parameter(Mandatory = $true)] [object] $AutopilotDevice,
+        [bool] $WhatIfMode = $false
+    )
+
+    $autopilotId = $AutopilotDevice.id
+    $serial = $AutopilotDevice.serialNumber
+
+    # FIXED: was ':IsNullOrWhiteSpace($autopilotId)'
+    if ([string]::IsNullOrWhiteSpace($autopilotId)) {
+        throw "[Autopilot] Autopilot device ID is empty for serial '$serial'"
+    }
+
+    Write-Warning "[Autopilot] Device found: ID=$autopilotId, Serial=$serial, DisplayName=$($AutopilotDevice.displayName), ManagedDeviceId=$($AutopilotDevice.managedDeviceId)"
+
+    if ($WhatIfMode) {
+        Write-Warning "[Autopilot] DRY RUN: skipping DELETE for AutopilotId=$autopilotId"
+        return $true
+    }
+
+    try {
+        Invoke-GraphRequestSafe -Uri "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/$autopilotId" -Method "DELETE" | Out-Null
+        Write-Warning "[Autopilot] Deleted: Serial=$serial, AutopilotId=$autopilotId"
+        return $true
+    }
+    catch {
+        Write-Warning "[Autopilot] Delete failed for Serial=${serial}: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ============================================================
+# 2. Intune
+# ============================================================
+
+function Find-ManagedDeviceBySerial {
+    param([Parameter(Mandatory = $true)] [string] $SerialNumber)
+
+    $escapedSerial = ConvertTo-ODataStringLiteral -Value $SerialNumber
+    Write-Warning "[Wipe] Searching Intune managed device for serial '$SerialNumber'"
+
+    try {
+        $response = Invoke-GraphRequestSafe -Method "GET" `
+            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=serialNumber eq '$escapedSerial'"
+        return @($response.value)
+    }
+    catch {
+        Write-Warning "[Wipe] Search failed for serial '$SerialNumber': $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Invoke-ManagedDeviceWipe {
+    param(
+        [Parameter(Mandatory = $true)] [object] $ManagedDevice,
+        [bool] $KeepEnrollmentData = $false,
+        [bool] $KeepUserData = $false,
+        [bool] $WhatIfMode = $false
+    )
+
+    $deviceId = $ManagedDevice.id
+    $deviceName = $ManagedDevice.deviceName
+
+    if ([string]::IsNullOrWhiteSpace($deviceId)) {
+        throw "[Wipe] ManagedDeviceId is empty for serial '$($ManagedDevice.serialNumber)'"
+    }
+
+    Write-Warning "[Wipe] Managed device: Name=$deviceName, Id=$deviceId, Serial=$($ManagedDevice.serialNumber), OS=$($ManagedDevice.operatingSystem) $($ManagedDevice.osVersion), UPN=$($ManagedDevice.userPrincipalName)"
+
+    if ($WhatIfMode) {
+        Write-Warning "[Wipe] DRY RUN: skipping wipe for '$deviceName'"
+        return $true
+    }
+
+    try {
+        Invoke-GraphRequestSafe `
+            -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$deviceId/wipe" `
+            -Method "POST" `
+            -Body @{ keepEnrollmentData = $KeepEnrollmentData; keepUserData = $KeepUserData } | Out-Null
+
+        Write-Warning "[Wipe] Wipe command sent for '$deviceName' (Id=$deviceId)"
+        return $true
+    }
+    catch {
+        Write-Warning "[Wipe] Wipe failed for '$deviceName': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ============================================================
+# 3. MAIN
+# ============================================================
+
+$isDryRun = ConvertTo-RunbookBool -Value $DryRun
+# Retirement and LostStolen keep the Autopilot registration: the hardware stays
+# in the corporate estate and must be able to re-enroll.
+$removeFromAutopilot = $Scenario -in @('Sale', 'Disposal')
+
+$result = [ordered]@{
+    requestId   = $RequestId
+    platform    = 'Windows'
+    scenario    = $Scenario
+    dryRun      = $isDryRun
+    wipeIssued  = $false
+    devices     = @()
+    errors      = @()
+    startedAt   = (Get-Date).ToUniversalTime().ToString('o')
+    completedAt = $null
+}
+
+Write-Warning "=========================================="
+Write-Warning "Windows disposal - RequestId=$RequestId Scenario=$Scenario DryRun=$isDryRun"
+Write-Warning "Remove from Autopilot: $removeFromAutopilot"
+Write-Warning "=========================================="
+
+$serials = @($SerialNumbers -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+
+if ($serials.Count -eq 0) {
+    $result.errors += "No serial number provided."
+    $result.completedAt = (Get-Date).ToUniversalTime().ToString('o')
+    Write-RunbookResult -Result $result
+    throw "[Main] No serial number provided in -SerialNumbers."
+}
+
+Write-Warning "[Main] Serials ($($serials.Count)): $($serials -join ', ')"
+
+# --- Connect to Graph -------------------------------------------------------
+Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+$graphClientId   = Get-RequiredAutomationVariable -Name 'ClientId'
+$graphTenantId   = Get-RequiredAutomationVariable -Name 'TenantId'
+$graphThumbprint = Get-RequiredAutomationVariable -Name 'Certificate_thumbprint'
+
+Write-Warning "[Graph] ClientId=$graphClientId TenantId=$graphTenantId"
+
+try {
+    Connect-MgGraph -ClientId $graphClientId -TenantId $graphTenantId `
+        -CertificateThumbprint $graphThumbprint -NoWelcome -ErrorAction Stop
+    Write-Warning "[Graph] Connected"
+}
+catch {
+    $result.errors += "Graph connection failed: $($_.Exception.Message)"
+    $result.completedAt = (Get-Date).ToUniversalTime().ToString('o')
+    Write-RunbookResult -Result $result
+    throw
+}
+
+try {
+    $deviceResults = [ordered]@{}
+    foreach ($serial in $serials) {
+        $deviceResults[$serial] = [ordered]@{
+            serialNumber     = $serial
+            autopilotFound   = $false
+            autopilotDeleted = $false
+            autopilotId      = $null
+            managedDeviceId  = $null
+            deviceName       = $null
+            wipeIssued       = $false
+            message          = ''
+        }
+    }
+
+    # --- Step 1: Autopilot --------------------------------------------------
+    if ($removeFromAutopilot) {
+        Write-Warning "=========================================="
+        Write-Warning "[Main] Step 1: remove devices from Windows Autopilot"
+        Write-Warning "=========================================="
+
+        foreach ($serial in $serials) {
+            # FIXED: was '$matches', a PowerShell automatic variable.
+            $autopilotMatches = @(Find-AutopilotDeviceBySerial -SerialNumber $serial)
+
+            if ($autopilotMatches.Count -eq 0) {
+                Write-Warning "[Autopilot] No Autopilot identity found for '$serial'"
+                $deviceResults[$serial].message = 'No Autopilot identity found'
+                continue
+            }
+
+            $deviceResults[$serial].autopilotFound = $true
+            $deviceResults[$serial].autopilotId = $autopilotMatches[0].id
+
+            $allDeleted = $true
+            foreach ($autopilotDevice in $autopilotMatches) {
+                if (-not (Remove-AutopilotDevice -AutopilotDevice $autopilotDevice -WhatIfMode $isDryRun)) {
+                    $allDeleted = $false
+                    $result.errors += "Autopilot delete failed for serial '$serial' (id $($autopilotDevice.id))."
+                }
+            }
+            $deviceResults[$serial].autopilotDeleted = $allDeleted
+        }
+    }
+    else {
+        Write-Warning "[Main] Step 1 skipped: scenario '$Scenario' keeps the Autopilot registration."
+    }
+
+    # --- Step 2: settle -----------------------------------------------------
+    if ($removeFromAutopilot -and -not $isDryRun -and $WipeWaitSeconds -gt 0) {
+        Write-Warning "[Main] Step 2: waiting $WipeWaitSeconds seconds before the wipe"
+        Start-Sleep -Seconds $WipeWaitSeconds
+    }
+
+    # --- Step 3: wipe -------------------------------------------------------
+    Write-Warning "=========================================="
+    Write-Warning "[Main] Step 3: wipe devices in Intune"
+    Write-Warning "=========================================="
+
+    foreach ($serial in $serials) {
+        $managedDevices = @(Find-ManagedDeviceBySerial -SerialNumber $serial)
+
+        if ($managedDevices.Count -eq 0) {
+            Write-Warning "[Wipe] No Intune managed device found for '$serial'"
+            $result.errors += "No Intune managed device found for serial '$serial'."
+            $deviceResults[$serial].message = 'No Intune managed device found'
+            continue
+        }
+
+        foreach ($managedDevice in $managedDevices) {
+            $wipeSent = Invoke-ManagedDeviceWipe -ManagedDevice $managedDevice -WhatIfMode $isDryRun
+
+            $deviceResults[$serial].managedDeviceId = $managedDevice.id
+            $deviceResults[$serial].deviceName = $managedDevice.deviceName
+            $deviceResults[$serial].wipeIssued = $wipeSent
+
+            if ($wipeSent) {
+                $result.wipeIssued = $true
+                $deviceResults[$serial].message = 'Wipe command sent'
+            }
+            else {
+                $result.errors += "Wipe failed for serial '$serial' (device $($managedDevice.deviceName))."
+                $deviceResults[$serial].message = 'Wipe failed'
+            }
+        }
+    }
+
+    $result.devices = @($serials | ForEach-Object { [pscustomobject]$deviceResults[$_] })
+}
+finally {
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+
+# ============================================================
+# 4. Outcome
+# ============================================================
+
+$result.completedAt = (Get-Date).ToUniversalTime().ToString('o')
+
+Write-Warning "=========================================="
+Write-Warning "[Main] Summary"
+Write-Warning "=========================================="
+foreach ($item in $result.devices) {
+    Write-Warning "[Summary] Serial=$($item.serialNumber) AutopilotFound=$($item.autopilotFound) AutopilotDeleted=$($item.autopilotDeleted) Device=$($item.deviceName) WipeIssued=$($item.wipeIssued) - $($item.message)"
+}
+
+Write-RunbookResult -Result $result
+
+# The job status must reflect the business outcome: a runbook that wiped nothing
+# is a failure, not a success with warnings.
+if (-not $result.wipeIssued) {
+    throw "[Main] No wipe command could be issued for any of the requested serials."
+}
+
+Write-Warning "[Main] Completed."

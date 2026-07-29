@@ -1,0 +1,27 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "powershell",
+    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.4",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "STATE_TABLE_ENDPOINT": "https://<storage>.table.core.windows.net",
+    "STATE_TABLE_NAME": "wiperequests",
+
+    "SERVICEBUS_FQDN": "<namespace>.servicebus.windows.net",
+    "SERVICEBUS_TOPIC": "asset-disposal",
+    "ServiceBusConnection__fullyQualifiedNamespace": "<namespace>.servicebus.windows.net",
+
+    "UAMI_CLIENT_ID": "",
+
+    "AUTOMATION_SUBSCRIPTION_ID": "<subscription-guid>",
+    "AUTOMATION_RESOURCE_GROUP": "ASSET-TERMINATOR-DISPATCH-RG",
+    "AUTOMATION_ACCOUNT_NAME": "attdisp-aa-dev",
+
+    "DISPATCH_MODE": "arm",
+    "RUNBOOK_MAP": "{\"Apple\":{\"runbook\":\"APPLE_Device_Disposal\",\"parameters\":{\"SerialNumbers\":\"$.device.serialNumber\",\"MdmServerId\":\"$.options.mdmServerId\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":45},\"Android\":{\"runbook\":\"ITA_SAMSUNG_KME_Device_Disposal\",\"parameters\":{\"Serials\":\"$.device.serialNumber\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":20},\"Windows\":{\"runbook\":\"Windows_Disposal_Device\",\"parameters\":{\"SerialNumbers\":\"$.device.serialNumber\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":20}}",
+    "RUNBOOKS_SUPPORT_SCENARIO": "true",
+    "JOBMONITOR_SCHEDULE": "0 */2 * * * *"
+  }
+}
+

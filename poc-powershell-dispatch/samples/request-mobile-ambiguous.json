@@ -1,0 +1,9 @@
+{
+  "requestId": "SNOW-RITM0012348",
+  "operatingSystem": "Mobile",
+  "scenario": "Disposal",
+  "serialNumber": "R58NXXXXXXX",
+  "userConfirmed": true,
+  "dryRun": true,
+  "_comment": "operatingSystem=Mobile is ambiguous: the intake resolves iOS vs Android against Intune before routing."
+}

@@ -1,0 +1,2 @@
+# Nothing to warm up: the app talks to Graph, ARM, Service Bus and Table Storage
+# over REST with managed-identity tokens (see shared/Modules).

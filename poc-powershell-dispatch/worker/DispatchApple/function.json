@@ -1,0 +1,13 @@
+{
+  "bindings": [
+    {
+      "name": "Message",
+      "type": "serviceBusTrigger",
+      "direction": "in",
+      "topicName": "%SERVICEBUS_TOPIC%",
+      "subscriptionName": "sub-apple",
+      "connection": "ServiceBusConnection",
+      "isSessionsEnabled": true
+    }
+  ]
+}

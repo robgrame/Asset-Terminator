@@ -1,0 +1,10 @@
+{
+  "requestId": "SNOW-RITM0012345",
+  "operatingSystem": "Windows",
+  "scenario": "Disposal",
+  "serialNumber": "5CG1234ABC",
+  "deviceName": "FC1WRK001",
+  "userConfirmed": true,
+  "callbackUrl": "https://enel.service-now.com/api/x_enel_disposal/wipe/callback",
+  "dryRun": false
+}

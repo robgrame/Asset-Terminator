@@ -1,0 +1,10 @@
+{
+  "requestId": "SNOW-RITM0012347",
+  "operatingSystem": "Android",
+  "scenario": "Retirement",
+  "serialNumber": "R58NXXXXXXX",
+  "imei": "358240051111110",
+  "userConfirmed": true,
+  "callbackUrl": "https://enel.service-now.com/api/x_enel_disposal/wipe/callback",
+  "dryRun": true
+}

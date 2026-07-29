@@ -1,0 +1,10 @@
+{
+  "requestId": "SNOW-RITM0012346",
+  "operatingSystem": "iOS",
+  "scenario": "Sale",
+  "serialNumber": "DMPXXXXXXXXX",
+  "mdmServerId": "0123456789ABCDEF0123456789ABCDEF",
+  "userConfirmed": true,
+  "callbackUrl": "https://enel.service-now.com/api/x_enel_disposal/wipe/callback",
+  "dryRun": false
+}
