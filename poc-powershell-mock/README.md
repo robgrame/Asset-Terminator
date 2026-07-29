@@ -216,9 +216,32 @@ Functions host to storage — Graph auth uses the app registration + secret.
 
 All application configuration is set as **Application Settings** by the template.
 
+#### Private connectivity to the host storage account
+
+Many tenants enforce an Azure Policy that pins `publicNetworkAccess=Disabled` on
+every storage account. When that happens the Functions host cannot reach its own
+host storage over the public endpoint and fails with
+`Unable to access AzureWebJobsStorage (AuthorizationFailure)` — the app starts,
+but key listing and function indexing break.
+
+The template therefore deploys (controlled by `usePrivateEndpoints`, default
+`true`):
+
+* a VNet with a subnet delegated to `Microsoft.Web/serverFarms` (regional VNet
+  integration) and a subnet for private endpoints;
+* private endpoints for the storage `blob`, `queue`, `table` and `file`
+  sub-resources, with the matching `privatelink.*` private DNS zones linked to
+  the VNet;
+* `vnetRouteAllEnabled = true` on the Function App so host storage traffic is
+  routed through the VNet.
+
+Set `usePrivateEndpoints=false` only if public network access to storage is
+allowed in the target subscription.
+
 ```powershell
 cd infra
 ./deploy.ps1 -ResourceGroup ASSET-TERMINATOR-RG -Location northeurope `
+    -Subscription   <subscription-id> `
     -GraphTenantId  <tenant-id> `
     -GraphClientId  <app-id> `
     -GraphClientSecret <secret>

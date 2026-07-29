@@ -23,6 +23,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $ResourceGroup,
+    [string] $Subscription,
     [string] $Location = 'northeurope',
     [string] $NamePrefix = 'attmock',
     [string] $Env = 'dev',
@@ -38,6 +39,12 @@ $ErrorActionPreference = 'Stop'
 $infraDir = $PSScriptRoot
 $root = Split-Path -Parent $infraDir
 
+if ($Subscription) {
+    Write-Host "==> Selecting subscription '$Subscription'" -ForegroundColor Cyan
+    az account set --subscription $Subscription
+}
+$subId = az account show --query id --output tsv
+
 Write-Host "==> Ensuring resource group '$ResourceGroup' ($Location)" -ForegroundColor Cyan
 az group create --name $ResourceGroup --location $Location --output none
 
@@ -45,6 +52,7 @@ Write-Host "==> Deploying infrastructure (main.bicep)" -ForegroundColor Cyan
 $deployName = "attmock-$(Get-Date -Format yyyyMMddHHmmss)"
 $outputs = az deployment group create `
     --name $deployName `
+    --subscription $subId `
     --resource-group $ResourceGroup `
     --template-file (Join-Path $infraDir 'main.bicep') `
     --parameters `
@@ -74,6 +82,7 @@ if (-not $SkipPublish) {
 
     Write-Host "==> Retrieving function key" -ForegroundColor Cyan
     $key = az functionapp function keys list `
+        --subscription $subId `
         --resource-group $ResourceGroup `
         --name $functionAppName `
         --function-name WipeDevice `

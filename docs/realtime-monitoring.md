@@ -92,22 +92,71 @@ UAMI **SignalR Service Owner** + storage data roles.
   a callback nor call the seam will not appear until the next event.
 
 ## ⚠️ Known blocker: function code publish
-The target subscription enforces an **Azure Policy that disables storage shared-key access**
-(`allowSharedKeyAccess=false`, non-overridable). The Flex Consumption Kudu deployment pipeline's
-`StorageAccessibleCheck` fails with **403** when uploading the zip, for both system-assigned and
-user-assigned identity configurations (`func azure functionapp publish` and `az functionapp deploy`
-both fail — the latter with 415 as Flex rejects that endpoint).
 
-The infrastructure, RBAC, and orchestrator wiring are complete; only the function **code** could not
-be pushed from this environment. To finish the PoC once publishing is unblocked:
+### Root cause (re-diagnosed)
+The blocker was originally attributed to the Azure Policy that disables storage shared-key access
+(`allowSharedKeyAccess=false`). That is **not** the cause: Flex Consumption fully supports
+identity-based deployment storage, and `realtime.bicep` already configures it correctly
+(`deployment.storage.authentication.type = UserAssignedIdentity` + `Storage Blob Data Owner` on the
+UAMI).
 
-1. Publish the function code:
+The actual cause is a **network** one. Policy also forces `publicNetworkAccess = Disabled` on every
+storage account in the subscription, while `networkRuleSet.bypass` is `None` and **no private
+endpoint exists**:
+
+```
+asttermrtfndevfqe3fiq2eh   sharedKey=False  publicNet=Disabled  bypass=None  privateEndpoints=0
+```
+
+So the storage account is unreachable by *anything* — the deploying client, and the Functions
+platform itself. The 403 raised by `StorageAccessibleCheck` is a network denial, not an
+authorization one. Confirmed with `az storage blob list --auth-mode login`, which returns
+*"The request may be blocked by network rules of storage account"*.
+
+> This affects the **whole `dev` environment**, not just the realtime PoC: `astterm-func-api-dev`
+> and `astterm-func-orchestrator-dev` sit on identically locked-down storage accounts, have no VNet
+> integration either, and their hosts are likewise unreachable (`az functionapp function list`
+> returns `Request Timeout`).
+
+### Fix: private endpoints + VNet integration
+Private endpoints alone are not enough — the apps need a route into the VNet, and DNS must resolve
+the storage FQDNs to the private IPs. All three pieces are provided by
+[`infra/modules/network.bicep`](../infra/modules/network.bicep):
+
+1. A VNet with an **app subnet delegated to `Microsoft.App/environments`** (the delegation Flex
+   Consumption requires; `/27` minimum) and a **separate subnet for the private endpoints** — Flex
+   forbids sharing the delegated subnet with private endpoints.
+2. **blob / queue / table** private endpoints for each storage account (queue is required by
+   Durable Functions, blob and table by the Functions host).
+3. The matching **Private DNS zones** (`privatelink.<sub>.core.windows.net`), linked to the VNet
+   with private DNS zone groups.
+
+```powershell
+az deployment group create -g ASSET-TERMINATOR-RG -n network `
+  --template-file infra/modules/network.bicep `
+  --parameters namePrefix=astterm env=dev location=northeurope `
+  --parameters storageAccountNames="['asttermrtfndevfqe3fiq2eh','asttermapiflexdevi3waevy','asttermorchflexdevi3waev']"
+```
+
+Then bind each function app to the delegated subnet (`appSubnetId` output):
+
+```powershell
+az functionapp vnet-integration add -g ASSET-TERMINATOR-RG -n astterm-func-realtime-dev `
+  --vnet astterm-vnet-dev --subnet snet-functions
+```
+
+> **The deploying client also needs a network path.** Your workstation and any hosted CI runner sit
+> outside the VNet, so the zip upload still fails from there. Publish from an agent inside the VNet
+> (self-hosted runner / VM / Container Apps job), over VPN or ExpressRoute, or temporarily add your
+> IP to the storage firewall if policy allows it.
+
+The infrastructure, RBAC, and orchestrator wiring are otherwise complete. To finish the PoC:
+
+1. Publish the function code (from inside the VNet, see above):
    ```powershell
    cd src/AssetTerminator.Realtime.Functions
    func azure functionapp publish astterm-func-realtime-dev --dotnet-isolated
    ```
-   If the 403 persists, publish from an environment/identity permitted to write to the deployment
-   container, or request a policy exemption for the realtime storage account.
 2. Create the Event Grid → Function subscription (the function must exist first):
    ```powershell
    az deployment group create -g ASSET-TERMINATOR-RG -n realtime-poc `

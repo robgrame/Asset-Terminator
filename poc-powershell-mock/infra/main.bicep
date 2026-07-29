@@ -59,6 +59,18 @@ param wipeKeepEnrollmentData bool = false
 @description('keepUserData flag on the Intune wipe.')
 param wipeKeepUserData bool = false
 
+@description('Reach the host storage account over a private endpoint (required when Azure Policy forces publicNetworkAccess=Disabled on storage accounts).')
+param usePrivateEndpoints bool = true
+
+@description('Address space of the VNet created for private connectivity.')
+param vnetAddressPrefix string = '10.60.0.0/22'
+
+@description('Subnet delegated to the App Service plan for regional VNet integration.')
+param integrationSubnetPrefix string = '10.60.0.0/26'
+
+@description('Subnet hosting the storage private endpoints.')
+param privateEndpointSubnetPrefix string = '10.60.0.64/26'
+
 // ---------------------------------------------------------------------------
 // Names / tags
 // ---------------------------------------------------------------------------
@@ -70,6 +82,15 @@ var lawName = '${namePrefix}-law-${env}'
 var aiName = '${namePrefix}-appi-${env}'
 var planName = '${namePrefix}-plan-${env}'
 var functionAppName = '${namePrefix}-func-${env}'
+var vnetName = '${namePrefix}-vnet-${env}'
+var integrationSubnetName = 'snet-integration'
+var privateEndpointSubnetName = 'snet-privateendpoints'
+var privateStorageServices = [
+  'blob'
+  'queue'
+  'table'
+  'file'
+]
 
 var tags = {
   solution: 'Asset-Terminator-Mock'
@@ -136,6 +157,89 @@ var queueUri = storage.properties.primaryEndpoints.queue
 var tableUri = storage.properties.primaryEndpoints.table
 
 // ---------------------------------------------------------------------------
+// Private connectivity -- VNet + private endpoints for the host storage.
+//
+// Required because tenant policy forces publicNetworkAccess=Disabled on
+// storage accounts: the Functions host can only reach its host storage from
+// inside the VNet.
+// ---------------------------------------------------------------------------
+resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = if (usePrivateEndpoints) {
+  name: vnetName
+  location: location
+  tags: tags
+  properties: {
+    addressSpace: { addressPrefixes: [ vnetAddressPrefix ] }
+    subnets: [
+      {
+        name: integrationSubnetName
+        properties: {
+          addressPrefix: integrationSubnetPrefix
+          delegations: [
+            {
+              name: 'webapp'
+              properties: { serviceName: 'Microsoft.Web/serverFarms' }
+            }
+          ]
+        }
+      }
+      {
+        name: privateEndpointSubnetName
+        properties: {
+          addressPrefix: privateEndpointSubnetPrefix
+          privateEndpointNetworkPolicies: 'Disabled'
+        }
+      }
+    ]
+  }
+}
+
+resource privateDnsZones 'Microsoft.Network/privateDnsZones@2020-06-01' = [for svc in privateStorageServices: if (usePrivateEndpoints) {
+  name: 'privatelink.${svc}.${environment().suffixes.storage}'
+  location: 'global'
+  tags: tags
+}]
+
+resource privateDnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [for (svc, i) in privateStorageServices: if (usePrivateEndpoints) {
+  name: '${privateDnsZones[i].name}/link-${vnetName}'
+  location: 'global'
+  properties: {
+    registrationEnabled: false
+    virtualNetwork: { id: vnet.id }
+  }
+}]
+
+resource storagePrivateEndpoints 'Microsoft.Network/privateEndpoints@2023-11-01' = [for (svc, i) in privateStorageServices: if (usePrivateEndpoints) {
+  name: '${storageName}-pe-${svc}'
+  location: location
+  tags: tags
+  properties: {
+    subnet: { id: '${vnet.id}/subnets/${privateEndpointSubnetName}' }
+    privateLinkServiceConnections: [
+      {
+        name: 'pls-${svc}'
+        properties: {
+          privateLinkServiceId: storage.id
+          groupIds: [ svc ]
+        }
+      }
+    ]
+  }
+}]
+
+resource privateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = [for (svc, i) in privateStorageServices: if (usePrivateEndpoints) {
+  name: '${storagePrivateEndpoints[i].name}/default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'config'
+        properties: { privateDnsZoneId: privateDnsZones[i].id }
+      }
+    ]
+  }
+  dependsOn: [ privateDnsLinks ]
+}]
+
+// ---------------------------------------------------------------------------
 // App Service Plan -- Linux, B1 (Basic, dedicated)
 // ---------------------------------------------------------------------------
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
@@ -169,11 +273,14 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
+    virtualNetworkSubnetId: usePrivateEndpoints ? '${vnet.id}/subnets/${integrationSubnetName}' : null
+    vnetRouteAllEnabled: usePrivateEndpoints
     siteConfig: {
       linuxFxVersion: 'POWERSHELL|7.4'
       alwaysOn: true
       ftpsState: 'Disabled'
       minTlsVersion: '1.2'
+      vnetRouteAllEnabled: usePrivateEndpoints
       appSettings: [
         // --- Functions runtime -------------------------------------------
         { name: 'FUNCTIONS_EXTENSION_VERSION', value: '~4' }
@@ -202,6 +309,7 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
       ]
     }
   }
+  dependsOn: usePrivateEndpoints ? [ privateEndpointDnsGroups ] : []
 }
 
 // ---------------------------------------------------------------------------
