@@ -38,6 +38,7 @@ function Invoke-DisposalDispatch {
     }
 
     Write-AtLog -Level 'Information' -Message 'Dispatching disposal request.' -Properties $logProps
+    Write-AtAudit -Action 'WipeDispatchStarted' -Properties $logProps
 
     # Retirement never removes the device from its enrollment platform. Until the
     # runbooks accept a -Scenario parameter, a retirement request must not be sent
@@ -60,12 +61,12 @@ function Invoke-DisposalDispatch {
     Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
         status  = 'Dispatching'
         runbook = $binding.Runbook
-        dispatchMode = $binding.DispatchMode
         timeoutMinutes = $binding.TimeoutMinutes
     }
 
     if ([bool]$payload.options.dryRun) {
         Write-AtLog -Level 'Information' -Message 'Dry run: runbook not started.' -Properties $logProps
+        Write-AtAudit -Action 'WipeDryRunCompleted' -Properties ($logProps + @{ status = 'Completed'; runbook = $binding.Runbook; dryRun = 'true' })
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
             status = 'Completed'
             completedAt = (Get-Date).ToUniversalTime()
@@ -84,6 +85,7 @@ function Invoke-DisposalDispatch {
     catch {
         # Let Service Bus retry transient failures; persist the attempt either way.
         Write-AtLog -Level 'Error' -Message "Runbook dispatch failed: $($_.Exception.Message)" -Properties $logProps
+        Write-AtAudit -Action 'WipeDispatchFailed' -Level 'Error' -Properties ($logProps + @{ status = 'DispatchFailed'; error = $_.Exception.Message })
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
             status = 'DispatchFailed'; errorMessage = $_.Exception.Message
         }
@@ -100,6 +102,7 @@ function Invoke-DisposalDispatch {
 
     $logProps.automationJobName = [string]$job.JobName
     Write-AtLog -Level 'Information' -Message 'Runbook job started.' -Properties $logProps
+    Write-AtAudit -Action 'WipeJobStarted' -Properties ($logProps + @{ status = 'Dispatched'; runbook = $binding.Runbook; automationJobId = [string]$job.JobId })
 }
 
 Export-ModuleMember -Function Invoke-DisposalDispatch

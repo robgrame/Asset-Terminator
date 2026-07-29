@@ -68,7 +68,7 @@ param jobMonitorSchedule string = '0 */2 * * * *'
 @description('Platform -> runbook routing table (see docs/evoluzione-dispatch-runbook.md).')
 param runbookMap object = {
   Windows: {
-    runbook: 'Windows_Disposal_Device'
+    runbook: 'RBK-WindowsDisposal'
     parameters: {
       SerialNumbers: '$.device.serialNumber'
       RequestId: '$.requestId'
@@ -78,7 +78,7 @@ param runbookMap object = {
     timeoutMinutes: 20
   }
   Apple: {
-    runbook: 'APPLE_Device_Disposal'
+    runbook: 'RBK-AppleDisposal'
     parameters: {
       SerialNumbers: '$.device.serialNumber'
       MdmServerId: '$.options.mdmServerId'
@@ -89,7 +89,7 @@ param runbookMap object = {
     timeoutMinutes: 45
   }
   Android: {
-    runbook: 'ITA_SAMSUNG_KME_Device_Disposal'
+    runbook: 'RBK-AndroidDisposal'
     parameters: {
       Serials: '$.device.serialNumber'
       RequestId: '$.requestId'
@@ -197,6 +197,22 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
   properties: {
     Application_Type: 'web'
     WorkspaceResourceId: law.id
+  }
+}
+
+// Ad-hoc workbook to monitor the disposal requests end-to-end from the audit
+// customEvents emitted by the API, worker and runbooks.
+resource wipeWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
+  name: guid(resourceGroup().id, 'asset-terminator-wipe-workbook')
+  location: location
+  tags: tags
+  kind: 'shared'
+  properties: {
+    displayName: 'Asset-Terminator — Wipe Requests'
+    serializedData: loadTextContent('workbook-wipe.json')
+    category: 'workbook'
+    sourceId: appInsights.id
+    version: 'Notebook/1.0'
   }
 }
 
@@ -330,6 +346,19 @@ resource automationPlainVars 'Microsoft.Automation/automationAccounts/variables@
   }
 }]
 
+// Kept out of the for-loop above because its value derives from a resource
+// runtime property (ConnectionString), which cannot be evaluated at the start
+// of the deployment.
+resource automationAiConnVar 'Microsoft.Automation/automationAccounts/variables@2023-11-01' = {
+  parent: automation
+  name: 'AppInsightsConnectionString'
+  properties: {
+    isEncrypted: false
+    description: 'Application Insights connection string used by the runbooks to emit audit customEvents.'
+    value: '"${appInsights.properties.ConnectionString}"'
+  }
+}
+
 resource automationSecretVars 'Microsoft.Automation/automationAccounts/variables@2023-11-01' = [for v in automationSecretVariables: {
   parent: automation
   name: v.name
@@ -343,21 +372,38 @@ resource automationSecretVars 'Microsoft.Automation/automationAccounts/variables
 // embedding it here would put it in the deployment history and make every code
 // change a template change.
 var runbookNames = [
-  'Windows_Disposal_Device'
-  'APPLE_Device_Disposal'
-  'ITA_SAMSUNG_KME_Device_Disposal'
+  'RBK-WindowsDisposal'
+  'RBK-AppleDisposal'
+  'RBK-AndroidDisposal'
 ]
 
-resource runbooks 'Microsoft.Automation/automationAccounts/runbooks@2023-11-01' = [for name in runbookNames: {
+// PowerShell 7.4 runtime environment. The runbooks use the Microsoft.Graph
+// SDK v2, which requires PowerShell 7.4; the runbooks are linked to this
+// environment so they never fall back to the legacy 5.1 runtime.
+resource ps74Runtime 'Microsoft.Automation/automationAccounts/runtimeEnvironments@2024-10-23' = {
+  parent: automation
+  name: 'PowerShell-74'
+  location: location
+  tags: tags
+  properties: {
+    runtime: {
+      language: 'PowerShell'
+      version: '7.4'
+    }
+  }
+}
+
+resource runbooks 'Microsoft.Automation/automationAccounts/runbooks@2024-10-23' = [for name in runbookNames: {
   parent: automation
   name: name
   location: location
   tags: tags
   properties: {
     runbookType: 'PowerShell'
+    runtimeEnvironment: ps74Runtime.name
     logProgress: false
     logVerbose: false
-    description: 'Asset disposal runbook dispatched by the worker function app.'
+    description: 'Asset disposal runbook dispatched by the worker function app (PowerShell 7.4).'
   }
 }]
 
@@ -554,7 +600,6 @@ resource workerApp 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'AUTOMATION_SUBSCRIPTION_ID', value: subscription().subscriptionId }
         { name: 'AUTOMATION_RESOURCE_GROUP', value: resourceGroup().name }
         { name: 'AUTOMATION_ACCOUNT_NAME', value: automation.name }
-        { name: 'DISPATCH_MODE', value: 'arm' }
         { name: 'RUNBOOK_MAP', value: string(runbookMap) }
         { name: 'RUNBOOKS_SUPPORT_SCENARIO', value: toLower(string(runbooksSupportScenario)) }
         { name: 'JOBMONITOR_SCHEDULE', value: jobMonitorSchedule }

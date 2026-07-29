@@ -79,6 +79,116 @@ function Write-AtLog {
 }
 
 # ---------------------------------------------------------------------------
+# Application Insights audit trail
+# ---------------------------------------------------------------------------
+# Audit events are posted straight to the App Insights ingestion endpoint as
+# customEvents (and optionally traces). This bypasses the Functions host
+# sampling, so an audit record is never dropped, and gives ServiceNow / the SOC
+# a queryable, immutable trail of every meaningful action in the pipeline.
+#
+# The same wire contract is reused verbatim by the runbooks (which run in Azure
+# Automation, outside the Functions host) so the whole flow lands in one place.
+
+function Get-AppInsightsConfig {
+    # Parse 'InstrumentationKey=..;IngestionEndpoint=https://..;' into a hashtable.
+    $conn = Get-AppSetting -Name 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+    if ([string]::IsNullOrWhiteSpace($conn)) { return $null }
+
+    $map = @{}
+    foreach ($part in $conn.Split(';')) {
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        $kv = $part.Split('=', 2)
+        if ($kv.Count -eq 2) { $map[$kv[0].Trim()] = $kv[1].Trim() }
+    }
+
+    if (-not $map.ContainsKey('InstrumentationKey')) { return $null }
+
+    $endpoint = if ($map.ContainsKey('IngestionEndpoint')) { $map['IngestionEndpoint'] } else { 'https://dc.services.visualstudio.com/' }
+    if (-not $endpoint.EndsWith('/')) { $endpoint += '/' }
+
+    return @{
+        InstrumentationKey = $map['InstrumentationKey']
+        TrackUri           = "${endpoint}v2/track"
+        RoleName           = (Get-AppSetting -Name 'WEBSITE_SITE_NAME' -Default 'asset-terminator')
+    }
+}
+
+function Send-AppInsightsTelemetry {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('Event', 'Trace')] [string] $Kind,
+        [Parameter(Mandatory)] [string] $Name,
+        [hashtable] $Properties,
+        [ValidateSet('Information', 'Warning', 'Error')] [string] $Level = 'Information',
+        [string] $OperationId,
+        $Config
+    )
+
+    # Telemetry must never break the pipeline: swallow every error.
+    try {
+        if (-not $Config) { $Config = Get-AppInsightsConfig }
+        if (-not $Config) { return }
+
+        $props = @{}
+        if ($Properties) {
+            foreach ($key in $Properties.Keys) {
+                $value = $Properties[$key]
+                if ($null -ne $value -and "$value" -ne '') { $props[$key] = "$value" }
+            }
+        }
+
+        $tags = @{ 'ai.cloud.role' = $Config.RoleName }
+        if (-not [string]::IsNullOrWhiteSpace($OperationId)) { $tags['ai.operation.id'] = $OperationId }
+
+        if ($Kind -eq 'Event') {
+            $baseType = 'EventData'
+            $baseData = @{ ver = 2; name = $Name; properties = $props }
+        }
+        else {
+            $severity = switch ($Level) { 'Error' { 3 } 'Warning' { 2 } default { 1 } }
+            $baseType = 'MessageData'
+            $baseData = @{ ver = 2; message = $Name; severityLevel = $severity; properties = $props }
+        }
+
+        $envelope = @{
+            name = "Microsoft.ApplicationInsights.$($Kind)"
+            time = (Get-Date).ToUniversalTime().ToString('o')
+            iKey = $Config.InstrumentationKey
+            tags = $tags
+            data = @{ baseType = $baseType; baseData = $baseData }
+        }
+
+        Invoke-RestMethod -Uri $Config.TrackUri -Method POST -ContentType 'application/json' `
+            -Body ($envelope | ConvertTo-Json -Depth 10 -Compress) -TimeoutSec 10 | Out-Null
+    }
+    catch {
+        # Never rethrow: log locally so the failure is at least visible.
+        Write-Warning "App Insights telemetry '$Name' failed: $($_.Exception.Message)"
+    }
+}
+
+# Emit one audit record: a structured local log line (-> AI traces via the
+# Functions host) AND an immutable customEvent (-> AI customEvents table).
+function Write-AtAudit {
+    param(
+        [Parameter(Mandatory)] [string] $Action,
+        [hashtable] $Properties,
+        [ValidateSet('Information', 'Warning', 'Error')] [string] $Level = 'Information'
+    )
+
+    $auditProps = @{ auditAction = $Action }
+    if ($Properties) {
+        foreach ($key in $Properties.Keys) { $auditProps[$key] = $Properties[$key] }
+    }
+
+    Write-AtLog -Level $Level -Message "AUDIT: $Action" -Properties $auditProps
+
+    $operationId = $null
+    if ($Properties -and $Properties.ContainsKey('correlationId')) { $operationId = [string]$Properties['correlationId'] }
+
+    Send-AppInsightsTelemetry -Kind 'Event' -Name $Action -Properties $auditProps -Level $Level -OperationId $operationId
+}
+
+# ---------------------------------------------------------------------------
 # Managed identity tokens (Functions IDENTITY_ENDPOINT protocol)
 # ---------------------------------------------------------------------------
 function Get-ManagedIdentityToken {
@@ -204,5 +314,6 @@ function ConvertFrom-JsonBody {
 }
 
 Export-ModuleMember -Function Get-AppSetting, Get-AppSettingBool, Get-AppSettingInt, Write-AtLog, `
+    Get-AppInsightsConfig, Send-AppInsightsTelemetry, Write-AtAudit, `
     Get-ManagedIdentityToken, ConvertTo-EnrollmentPlatform, ConvertTo-ValidScenario, `
     Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody

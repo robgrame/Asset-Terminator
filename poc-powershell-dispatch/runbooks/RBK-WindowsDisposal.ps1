@@ -1,3 +1,4 @@
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Windows Autopilot removal + Intune wipe. Corrected version for the
@@ -58,7 +59,7 @@
     Delay between the Autopilot delete and the wipe, to let the deletion settle.
 
 .EXAMPLE
-    .\Windows_Disposal_Device.ps1 -SerialNumbers "ABC123,DEF456" -Scenario Disposal
+    .\RBK-WindowsDisposal.ps1 -SerialNumbers "ABC123,DEF456" -Scenario Disposal
 #>
 
 param(
@@ -103,6 +104,64 @@ function Get-RequiredAutomationVariable {
         throw "Automation variable '$Name' is missing or empty. Create it in the Automation Account (encrypted) before running this runbook."
     }
     return $value
+}
+
+# --- Application Insights audit (optional) ---------------------------------
+# Runbooks run in Azure Automation, outside the Functions host, so their only
+# native trace is the job stream. To land every action in the same App Insights
+# resource as the API/worker we POST customEvents directly to the ingestion
+# endpoint. The connection string comes from the 'AppInsightsConnectionString'
+# Automation variable; if it is absent telemetry is silently skipped.
+$script:AiConfig = $null
+$script:AiResolved = $false
+
+function Get-RunbookAiConfig {
+    if ($script:AiResolved) { return $script:AiConfig }
+    $script:AiResolved = $true
+    try {
+        $conn = Get-AutomationVariable -Name 'AppInsightsConnectionString' -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace([string]$conn)) { return $null }
+        $map = @{}
+        foreach ($part in ([string]$conn).Split(';')) {
+            if ([string]::IsNullOrWhiteSpace($part)) { continue }
+            $kv = $part.Split('=', 2)
+            if ($kv.Count -eq 2) { $map[$kv[0].Trim()] = $kv[1].Trim() }
+        }
+        if (-not $map.ContainsKey('InstrumentationKey')) { return $null }
+        $endpoint = if ($map.ContainsKey('IngestionEndpoint')) { $map['IngestionEndpoint'] } else { 'https://dc.services.visualstudio.com/' }
+        if (-not $endpoint.EndsWith('/')) { $endpoint += '/' }
+        $script:AiConfig = @{ InstrumentationKey = $map['InstrumentationKey']; TrackUri = "${endpoint}v2/track" }
+    }
+    catch { $script:AiConfig = $null }
+    return $script:AiConfig
+}
+
+function Send-RunbookAudit {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Action,
+        [hashtable] $Properties,
+        [ValidateSet('Information', 'Warning', 'Error')] [string] $Level = 'Information'
+    )
+    try {
+        $cfg = Get-RunbookAiConfig
+        if (-not $cfg) { return }
+        $props = @{ auditAction = $Action; runbook = 'RBK-WindowsDisposal'; platform = 'Windows'; requestId = [string]$RequestId; scenario = [string]$Scenario }
+        if ($Properties) {
+            foreach ($k in $Properties.Keys) {
+                if ($null -ne $Properties[$k] -and "$($Properties[$k])" -ne '') { $props[$k] = "$($Properties[$k])" }
+            }
+        }
+        $envelope = @{
+            name = 'Microsoft.ApplicationInsights.Event'
+            time = (Get-Date).ToUniversalTime().ToString('o')
+            iKey = $cfg.InstrumentationKey
+            tags = @{ 'ai.cloud.role' = 'RBK-WindowsDisposal'; 'ai.operation.id' = [string]$RequestId }
+            data = @{ baseType = 'EventData'; baseData = @{ ver = 2; name = $Action; properties = $props } }
+        }
+        Invoke-RestMethod -Uri $cfg.TrackUri -Method POST -ContentType 'application/json' `
+            -Body ($envelope | ConvertTo-Json -Depth 10 -Compress) -TimeoutSec 10 | Out-Null
+    }
+    catch { Write-Warning "AI audit '$Action' failed: $($_.Exception.Message)" }
 }
 
 # The dispatcher's JobMonitor parses this single line out of the job output.
@@ -325,6 +384,7 @@ if ($serials.Count -eq 0) {
 }
 
 Write-Warning "[Main] Serials ($($serials.Count)): $($serials -join ', ')"
+Send-RunbookAudit -Action 'RunbookStarted' -Properties @{ dryRun = $isDryRun; serialCount = $serials.Count; removeFromAutopilot = $removeFromAutopilot }
 
 # --- Connect to Graph -------------------------------------------------------
 Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
@@ -339,10 +399,12 @@ try {
     Connect-MgGraph -ClientId $graphClientId -TenantId $graphTenantId `
         -CertificateThumbprint $graphThumbprint -NoWelcome -ErrorAction Stop
     Write-Warning "[Graph] Connected"
+    Send-RunbookAudit -Action 'GraphConnected'
 }
 catch {
     $result.errors += "Graph connection failed: $($_.Exception.Message)"
     $result.completedAt = (Get-Date).ToUniversalTime().ToString('o')
+    Send-RunbookAudit -Action 'GraphConnectFailed' -Level 'Error' -Properties @{ error = $_.Exception.Message }
     Write-RunbookResult -Result $result
     throw
 }
@@ -426,10 +488,12 @@ try {
             if ($wipeSent) {
                 $result.wipeIssued = $true
                 $deviceResults[$serial].message = 'Wipe command sent'
+                Send-RunbookAudit -Action 'DeviceWipeIssued' -Properties @{ serialNumber = $serial; deviceName = $managedDevice.deviceName; managedDeviceId = $managedDevice.id; dryRun = $isDryRun }
             }
             else {
                 $result.errors += "Wipe failed for serial '$serial' (device $($managedDevice.deviceName))."
                 $deviceResults[$serial].message = 'Wipe failed'
+                Send-RunbookAudit -Action 'DeviceWipeFailed' -Level 'Error' -Properties @{ serialNumber = $serial; deviceName = $managedDevice.deviceName; managedDeviceId = $managedDevice.id }
             }
         }
     }
@@ -454,6 +518,7 @@ foreach ($item in $result.devices) {
 }
 
 Write-RunbookResult -Result $result
+Send-RunbookAudit -Action 'RunbookCompleted' -Level ($(if ($result.wipeIssued) { 'Information' } else { 'Error' })) -Properties @{ wipeIssued = $result.wipeIssued; deviceCount = @($result.devices).Count; errorCount = @($result.errors).Count; status = ($(if ($result.wipeIssued -and @($result.errors).Count -eq 0) { 'Completed' } elseif ($result.wipeIssued) { 'PartiallyCompleted' } else { 'Failed' })) }
 
 # The job status must reflect the business outcome: a runbook that wiped nothing
 # is a failure, not a success with warnings.

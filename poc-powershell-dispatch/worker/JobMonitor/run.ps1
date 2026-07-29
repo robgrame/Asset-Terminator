@@ -128,6 +128,7 @@ foreach ($request in $requests) {
     if (-not (Test-AutomationJobTerminal -Status $job.Status)) {
         if ($expired) {
             Write-AtLog -Level 'Warning' -Message "JobMonitor: request timed out after $timeoutMinutes minutes." -Properties $logProps
+            Write-AtAudit -Action 'WipeTimeout' -Level 'Warning' -Properties ($logProps + @{ status = 'Failed'; timeoutMinutes = $timeoutMinutes; lastJobStatus = [string]$job.Status })
             Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
                 status = 'Failed'; errorMessage = "Runbook job timeout after $timeoutMinutes minutes (last status: $($job.Status))."
                 completedAt = (Get-Date).ToUniversalTime()
@@ -163,6 +164,8 @@ foreach ($request in $requests) {
 
     $logProps.status = $status
     Write-AtLog -Level 'Information' -Message 'JobMonitor: request reached a terminal state.' -Properties $logProps
+    $auditLevel = if ($status -eq 'Completed') { 'Information' } elseif ($status -eq 'PartiallyCompleted') { 'Warning' } else { 'Error' }
+    Write-AtAudit -Action 'WipeTerminalState' -Level $auditLevel -Properties ($logProps + @{ jobStatus = [string]$job.Status; errorMessage = $errorMessage })
 
     # --- Callback -----------------------------------------------------------
     $callbackUrl = if ($request.PSObject.Properties.Name -contains 'callbackUrl') { [string]$request.callbackUrl } else { '' }
@@ -191,9 +194,11 @@ foreach ($request in $requests) {
     try {
         Send-ServiceNowCallback -Url $callbackUrl -Payload $callback | Out-Null
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{ callbackStatus = 'Sent' }
+        Write-AtAudit -Action 'WipeCallbackSent' -Properties ($logProps + @{ status = $status })
     }
     catch {
         Write-AtLog -Level 'Error' -Message "JobMonitor: callback failed: $($_.Exception.Message)" -Properties $logProps
+        Write-AtAudit -Action 'WipeCallbackFailed' -Level 'Error' -Properties ($logProps + @{ status = $status; error = $_.Exception.Message })
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
             callbackStatus = 'Failed'; callbackError = $_.Exception.Message
         }

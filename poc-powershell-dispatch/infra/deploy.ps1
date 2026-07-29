@@ -92,9 +92,9 @@ Write-Host "==> Synchronising shared modules" -ForegroundColor Cyan
 $automationAccount = $outputs.automationAccountName.value
 $runbookDir = Join-Path $root 'runbooks'
 $runbookFiles = @{
-    'Windows_Disposal_Device'         = 'Windows_Disposal_Device.ps1'
-    'APPLE_Device_Disposal'           = 'APPLE_Device_Disposal.ps1'
-    'ITA_SAMSUNG_KME_Device_Disposal' = 'ITA_SAMSUNG_KME_Device_Disposal.ps1'
+    'RBK-WindowsDisposal' = 'RBK-WindowsDisposal.ps1'
+    'RBK-AppleDisposal'   = 'RBK-AppleDisposal.ps1'
+    'RBK-AndroidDisposal' = 'RBK-AndroidDisposal.ps1'
 }
 
 foreach ($runbookName in $runbookFiles.Keys) {

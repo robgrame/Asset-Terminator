@@ -1,3 +1,4 @@
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Samsung Knox Mobile Enrollment removal + Intune wipe. Corrected version for
@@ -108,6 +109,63 @@ function Get-RequiredAutomationVariable {
     return $value
 }
 
+# --- Application Insights audit (optional) ---------------------------------
+# See RBK-WindowsDisposal for the rationale: runbooks POST customEvents straight
+# to the App Insights ingestion endpoint so their actions land in the same
+# resource as the API/worker. Connection string comes from the
+# 'AppInsightsConnectionString' Automation variable; absent = telemetry skipped.
+$script:AiConfig = $null
+$script:AiResolved = $false
+
+function Get-RunbookAiConfig {
+    if ($script:AiResolved) { return $script:AiConfig }
+    $script:AiResolved = $true
+    try {
+        $conn = Get-AutomationVariable -Name 'AppInsightsConnectionString' -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace([string]$conn)) { return $null }
+        $map = @{}
+        foreach ($part in ([string]$conn).Split(';')) {
+            if ([string]::IsNullOrWhiteSpace($part)) { continue }
+            $kv = $part.Split('=', 2)
+            if ($kv.Count -eq 2) { $map[$kv[0].Trim()] = $kv[1].Trim() }
+        }
+        if (-not $map.ContainsKey('InstrumentationKey')) { return $null }
+        $endpoint = if ($map.ContainsKey('IngestionEndpoint')) { $map['IngestionEndpoint'] } else { 'https://dc.services.visualstudio.com/' }
+        if (-not $endpoint.EndsWith('/')) { $endpoint += '/' }
+        $script:AiConfig = @{ InstrumentationKey = $map['InstrumentationKey']; TrackUri = "${endpoint}v2/track" }
+    }
+    catch { $script:AiConfig = $null }
+    return $script:AiConfig
+}
+
+function Send-RunbookAudit {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Action,
+        [hashtable] $Properties,
+        [ValidateSet('Information', 'Warning', 'Error')] [string] $Level = 'Information'
+    )
+    try {
+        $cfg = Get-RunbookAiConfig
+        if (-not $cfg) { return }
+        $props = @{ auditAction = $Action; runbook = 'RBK-AndroidDisposal'; platform = 'Android'; requestId = [string]$RequestId; scenario = [string]$Scenario }
+        if ($Properties) {
+            foreach ($k in $Properties.Keys) {
+                if ($null -ne $Properties[$k] -and "$($Properties[$k])" -ne '') { $props[$k] = "$($Properties[$k])" }
+            }
+        }
+        $envelope = @{
+            name = 'Microsoft.ApplicationInsights.Event'
+            time = (Get-Date).ToUniversalTime().ToString('o')
+            iKey = $cfg.InstrumentationKey
+            tags = @{ 'ai.cloud.role' = 'RBK-AndroidDisposal'; 'ai.operation.id' = [string]$RequestId }
+            data = @{ baseType = 'EventData'; baseData = @{ ver = 2; name = $Action; properties = $props } }
+        }
+        Invoke-RestMethod -Uri $cfg.TrackUri -Method POST -ContentType 'application/json' `
+            -Body ($envelope | ConvertTo-Json -Depth 10 -Compress) -TimeoutSec 10 | Out-Null
+    }
+    catch { Write-Warning "AI audit '$Action' failed: $($_.Exception.Message)" }
+}
+
 function Write-RunbookResult {
     param([Parameter(Mandatory = $true)] $Result)
     Write-Output ("##RESULT## " + ($Result | ConvertTo-Json -Depth 10 -Compress))
@@ -200,6 +258,7 @@ if ($serialsToProcess.Count -eq 0) {
 }
 
 Write-Warning "[Main] Serials/IMEIs ($($serialsToProcess.Count)): $($serialsToProcess -join ', ')"
+Send-RunbookAudit -Action 'RunbookStarted' -Properties @{ dryRun = $isDryRun; serialCount = $serialsToProcess.Count }
 
 $deviceResults = [ordered]@{}
 foreach ($serial in $serialsToProcess) {
@@ -373,10 +432,12 @@ try {
     Connect-MgGraph -ClientId $graphClientId -TenantId $graphTenantId `
         -CertificateThumbprint $graphThumbprint -NoWelcome -ErrorAction Stop
     Write-KmeLog "Intune" "Connected to Graph"
+    Send-RunbookAudit -Action 'GraphConnected'
 }
 catch {
     $result.errors += "Graph connection failed: $($_.Exception.Message)"
     $result.completedAt = (Get-Date).ToUniversalTime().ToString('o')
+    Send-RunbookAudit -Action 'GraphConnectFailed' -Level 'Error' -Properties @{ error = $_.Exception.Message }
     Write-RunbookResult -Result $result
     throw
 }
@@ -433,12 +494,14 @@ try {
                     $deviceResults[$serialNumber].wipeIssued = $true
                     $deviceResults[$serialNumber].message = 'Wipe command sent'
                     $result.wipeIssued = $true
+                    Send-RunbookAudit -Action 'DeviceWipeIssued' -Properties @{ serialNumber = $serialNumber; deviceName = $managedDevice.deviceName; managedDeviceId = $managedDevice.id; dryRun = $isDryRun }
                 }
                 catch {
                     # FIXED: this used to be a Write-Error that left the job Completed.
                     Write-KmeLog "Intune" "Wipe failed for '$($managedDevice.deviceName)': $($_.Exception.Message)"
                     $result.errors += "Wipe failed for '$serialNumber': $($_.Exception.Message)"
                     $deviceResults[$serialNumber].message = 'Wipe failed'
+                    Send-RunbookAudit -Action 'DeviceWipeFailed' -Level 'Error' -Properties @{ serialNumber = $serialNumber; deviceName = $managedDevice.deviceName; managedDeviceId = $managedDevice.id; error = $_.Exception.Message }
                 }
             }
         }
@@ -468,6 +531,7 @@ foreach ($item in $result.devices) {
 }
 
 Write-RunbookResult -Result $result
+Send-RunbookAudit -Action 'RunbookCompleted' -Level ($(if ($result.wipeIssued) { 'Information' } else { 'Error' })) -Properties @{ wipeIssued = $result.wipeIssued; deviceCount = @($result.devices).Count; errorCount = @($result.errors).Count; status = ($(if ($result.wipeIssued -and @($result.errors).Count -eq 0) { 'Completed' } elseif ($result.wipeIssued) { 'PartiallyCompleted' } else { 'Failed' })) }
 
 if (-not $result.wipeIssued) {
     throw "[Main] No wipe command could be issued for any of the requested identifiers."

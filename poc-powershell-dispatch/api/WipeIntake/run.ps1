@@ -75,6 +75,7 @@ $logProps = @{
 }
 
 Write-AtLog -Level 'Information' -Message 'Disposal request received.' -Properties $logProps
+Write-AtAudit -Action 'WipeRequestReceived' -Properties $logProps
 
 # --- Idempotency ------------------------------------------------------------
 # Same requestId already in flight or done: return the current state instead of
@@ -115,6 +116,7 @@ catch {
 # Guardrail: the process requires a manual task when the device is not managed.
 if (-not $device) {
     Write-AtLog -Level 'Warning' -Message 'Managed device not found in Intune: routed to manual handling.' -Properties $logProps
+    Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'DeviceNotManagedByIntune' })
     Write-Json -StatusCode 422 -Object @{
         requestId     = $requestId
         correlationId = $correlationId
@@ -154,6 +156,7 @@ if (Get-AppSettingBool -Name 'GUARDRAIL_REQUIRE_USER_CONFIRMATION' -Default $tru
 $failed = @($guardrails | Where-Object { -not $_.passed })
 if ($failed.Count -gt 0 -and -not $dryRun) {
     Write-AtLog -Level 'Warning' -Message 'Guardrails failed: routed to manual handling.' -Properties $logProps
+    Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'GuardrailFailed'; guardrails = (($failed.name) -join ',') })
 
     try {
         Save-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
@@ -249,6 +252,7 @@ catch {
 }
 
 Write-AtLog -Level 'Information' -Message 'Disposal request queued.' -Properties $logProps
+Write-AtAudit -Action 'WipeRequestQueued' -Properties ($logProps + @{ status = 'Queued' })
 
 Write-Json -StatusCode 202 -Object @{
     requestId     = $requestId

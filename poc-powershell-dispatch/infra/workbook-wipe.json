@@ -1,0 +1,218 @@
+{
+  "version": "Notebook/1.0",
+  "isLocked": false,
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# Asset-Terminator — Wipe Requests\nAudit e monitoraggio end-to-end delle richieste di dismissione. I dati provengono dagli audit `customEvents` emessi da API, worker e runbook (nome evento = `auditAction`, dimensioni: `requestId`, `platform`, `scenario`, `status`, `serialNumber`)."
+      },
+      "name": "title"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "b1a1e0c0-0001-4a00-9000-000000000001",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Intervallo",
+            "type": 4,
+            "isRequired": true,
+            "value": { "durationMs": 86400000 },
+            "typeSettings": {
+              "selectableValues": [
+                { "durationMs": 3600000 },
+                { "durationMs": 14400000 },
+                { "durationMs": 43200000 },
+                { "durationMs": 86400000 },
+                { "durationMs": 259200000 },
+                { "durationMs": 604800000 },
+                { "durationMs": 2592000000 }
+              ]
+            }
+          },
+          {
+            "id": "b1a1e0c0-0002-4a00-9000-000000000002",
+            "version": "KqlParameterItem/1.0",
+            "name": "Platform",
+            "label": "Piattaforma",
+            "type": 2,
+            "isRequired": false,
+            "multiSelect": true,
+            "quote": "'",
+            "delimiter": ",",
+            "query": "customEvents | where name startswith 'Wipe' or name startswith 'Runbook' | extend platform = tostring(customDimensions.platform) | where isnotempty(platform) | distinct platform | order by platform asc",
+            "typeSettings": { "additionalResourceOptions": [ "value::all" ], "selectAllValue": "*" },
+            "timeContext": { "durationMs": 0 },
+            "timeContextFromParameter": "TimeRange"
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 1,
+      "content": { "json": "## Funnel della pipeline\nRichieste uniche (`requestId`) che hanno raggiunto ciascuna fase." },
+      "name": "text-funnel"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let stages = datatable(stage:string, ord:long)['1. Received',1,'2. Queued',2,'3. Dispatched',3,'4. Terminal',4]; customEvents | where name in ('WipeRequestReceived','WipeRequestQueued','WipeJobStarted','WipeDryRunCompleted','WipeTerminalState') | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform) | where isnotempty(requestId) | where '*' in (Platform) or platform in (Platform) | extend stage = case(name == 'WipeRequestReceived','1. Received', name == 'WipeRequestQueued','2. Queued', name in ('WipeJobStarted','WipeDryRunCompleted'),'3. Dispatched', name == 'WipeTerminalState','4. Terminal','other') | summarize Requests = dcount(requestId) by stage | join kind=rightouter stages on stage | project ord, stage, Requests = coalesce(Requests, 0) | order by ord asc",
+        "size": 1,
+        "title": "Funnel (richieste uniche per fase)",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "barchart",
+        "chartSettings": { "xAxis": "stage", "yAxis": [ "Requests" ] }
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "funnel"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where name == 'WipeRequestReceived' | extend platform = tostring(customDimensions.platform) | where '*' in (Platform) or platform in (Platform) | summarize Requests = count() by bin(timestamp, 30m) | render timechart",
+        "size": 0,
+        "title": "Richieste ricevute nel tempo",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "timechart"
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "volume",
+      "styleSettings": { "showBorder": true, "maxWidth": "50" }
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where name == 'WipeTerminalState' | extend status = tostring(customDimensions.status), platform = tostring(customDimensions.platform) | where '*' in (Platform) or platform in (Platform) | summarize Count = count() by status | render piechart",
+        "size": 0,
+        "title": "Esiti terminali",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "piechart"
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "outcomes",
+      "styleSettings": { "showBorder": true, "maxWidth": "50" }
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where name == 'WipeRequestReceived' | extend platform = tostring(customDimensions.platform) | where '*' in (Platform) or platform in (Platform) | summarize Count = count() by platform | render piechart",
+        "size": 0,
+        "title": "Richieste per piattaforma",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "piechart"
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "by-platform",
+      "styleSettings": { "showBorder": true, "maxWidth": "50" }
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where name == 'WipeRequestReceived' | extend scenario = tostring(customDimensions.scenario), platform = tostring(customDimensions.platform) | where '*' in (Platform) or platform in (Platform) | summarize Count = count() by scenario | render piechart",
+        "size": 0,
+        "title": "Richieste per scenario",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "piechart"
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "by-scenario",
+      "styleSettings": { "showBorder": true, "maxWidth": "50" }
+    },
+    {
+      "type": 1,
+      "content": { "json": "## Richieste recenti\nUltimo stato noto per ciascun `requestId`." },
+      "name": "text-recent"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where name startswith 'Wipe' | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform), scenario = tostring(customDimensions.scenario), status = tostring(customDimensions.status), serialNumber = tostring(customDimensions.serialNumber) | where isnotempty(requestId) | where '*' in (Platform) or platform in (Platform) | summarize arg_max(timestamp, name, status, platform, scenario, serialNumber) by requestId | project LastSeen = timestamp, requestId, platform, scenario, serialNumber, lastAction = name, status | order by LastSeen desc | take 200",
+        "size": 0,
+        "title": "Richieste recenti (ultimo stato per requestId)",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            { "columnMatch": "status", "formatter": 18, "formatOptions": { "thresholdsOptions": "colors", "thresholdsGrid": [
+              { "operator": "==", "thresholdValue": "Completed", "representation": "green", "text": "{0}{1}" },
+              { "operator": "==", "thresholdValue": "PartiallyCompleted", "representation": "orange", "text": "{0}{1}" },
+              { "operator": "==", "thresholdValue": "Failed", "representation": "redBright", "text": "{0}{1}" },
+              { "operator": "==", "thresholdValue": "Rejected", "representation": "redBright", "text": "{0}{1}" },
+              { "operator": "Default", "representation": "blue", "text": "{0}{1}" }
+            ] } }
+          ]
+        }
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "recent-requests"
+    },
+    {
+      "type": 1,
+      "content": { "json": "## Errori, rifiuti e wipe falliti\nEventi che richiedono attenzione operativa." },
+      "name": "text-failures"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where name in ('WipeRequestRejected','WipeDispatchFailed','WipeTimeout','WipeCallbackFailed','DeviceWipeFailed','GraphConnectFailed') or (name == 'WipeTerminalState' and tostring(customDimensions.status) in ('Failed','PartiallyCompleted')) | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform), status = tostring(customDimensions.status), reason = tostring(customDimensions.reason), error = coalesce(tostring(customDimensions.error), tostring(customDimensions.errorMessage)), serialNumber = tostring(customDimensions.serialNumber) | where '*' in (Platform) or platform in (Platform) | project timestamp, requestId, platform, action = name, status, reason, error, serialNumber, role = cloud_RoleName | order by timestamp desc | take 200",
+        "size": 0,
+        "title": "Errori e rifiuti",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "table"
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "failures"
+    },
+    {
+      "type": 1,
+      "content": { "json": "## Attività dei runbook\nEventi emessi dai runbook di piattaforma (`cloud_RoleName` inizia con `RBK-`)." },
+      "name": "text-runbooks"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "customEvents | where cloud_RoleName startswith 'RBK-' | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform), serialNumber = tostring(customDimensions.serialNumber), dryRun = tostring(customDimensions.dryRun) | where '*' in (Platform) or platform in (Platform) | project timestamp, runbook = cloud_RoleName, action = name, requestId, serialNumber, dryRun | order by timestamp desc | take 200",
+        "size": 0,
+        "title": "Eventi runbook",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "visualization": "table"
+      },
+      "timeContext": { "durationMs": 0 },
+      "timeContextFromParameter": "TimeRange",
+      "name": "runbook-activity"
+    }
+  ],
+  "styleSettings": {},
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

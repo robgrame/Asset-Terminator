@@ -56,7 +56,15 @@ function Resolve-RunbookBinding {
 
     if ($entry.PSObject.Properties.Name -contains 'parameters' -and $entry.parameters) {
         foreach ($property in $entry.parameters.PSObject.Properties) {
-            $value = Resolve-JsonPath -InputObject $Message -Path ([string]$property.Value)
+            $spec = [string]$property.Value
+            # A spec starting with '$.' is a JSON path into the message; anything
+            # else is a literal, so constants (KmeRegion, WipeWaitSeconds, ...)
+            # can be pinned in configuration without a code change.
+            $value = if ($spec.StartsWith('$.')) {
+                Resolve-JsonPath -InputObject $Message -Path $spec
+            }
+            else { $spec }
+
             if ($null -eq $value -or "$value" -eq '') { continue }
             # Automation runbook parameters are always passed as strings.
             $parameters[$property.Name] = if ($value -is [bool]) { $value.ToString().ToLowerInvariant() } else { "$value" }

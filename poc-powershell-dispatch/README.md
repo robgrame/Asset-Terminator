@@ -106,7 +106,7 @@ nominali, eliminando il ramo `$WebhookData` dell'originale.
 ```jsonc
 {
   "Windows": {
-    "runbook": "Windows_Disposal_Device",
+    "runbook": "RBK-WindowsDisposal",
     "parameters": {
       "SerialNumbers": "$.device.serialNumber",
       "RequestId": "$.requestId",
@@ -116,7 +116,7 @@ nominali, eliminando il ramo `$WebhookData` dell'originale.
     "timeoutMinutes": 20
   },
   "Apple": {
-    "runbook": "APPLE_Device_Disposal",
+    "runbook": "RBK-AppleDisposal",
     "parameters": {
       "SerialNumbers": "$.device.serialNumber",
       "MdmServerId": "$.options.mdmServerId",
@@ -127,7 +127,7 @@ nominali, eliminando il ramo `$WebhookData` dell'originale.
     "timeoutMinutes": 45
   },
   "Android": {
-    "runbook": "ITA_SAMSUNG_KME_Device_Disposal",
+    "runbook": "RBK-AndroidDisposal",
     "parameters": {
       "Serials": "$.device.serialNumber",
       "RequestId": "$.requestId",
