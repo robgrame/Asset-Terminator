@@ -116,6 +116,73 @@ function Get-RequiredAutomationVariable {
     return $value
 }
 
+# App-only Microsoft Graph authentication.
+#
+# Order of preference: (1) certificate from the Automation Certificate asset,
+# (2) certificate already present in the sandbox store (by thumbprint),
+# (3) client secret from an encrypted Automation variable, used only as a last
+# resort when no certificate is available.
+#
+# In Azure Automation the reliable way to use a certificate is to upload it as
+# an Automation Certificate asset and retrieve the X509Certificate2 (with its
+# private key) via Get-AutomationCertificate, then pass it to Connect-MgGraph
+# with -Certificate. Relying on -CertificateThumbprint alone fails because the
+# sandbox certificate store does not contain the asset. The asset name defaults
+# to 'GraphAppCert' and can be overridden with the 'GraphCertificateName'
+# Automation variable. The 'Certificate_thumbprint' variable, when present, is
+# used to validate the loaded certificate (and as a store-based fallback).
+function Connect-GraphAppOnly {
+    param(
+        [Parameter(Mandatory = $true)] [string] $ClientId,
+        [Parameter(Mandatory = $true)] [string] $TenantId
+    )
+
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+
+    $certName = Get-AutomationVariable -Name 'GraphCertificateName' -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace([string]$certName)) { $certName = 'GraphAppCert' }
+
+    $cert = $null
+    try { $cert = Get-AutomationCertificate -Name $certName -ErrorAction SilentlyContinue } catch { $cert = $null }
+
+    $expectedThumbprint = Get-AutomationVariable -Name 'Certificate_thumbprint' -ErrorAction SilentlyContinue
+    $expectedThumbprint = ([string]$expectedThumbprint).Trim().Replace(' ', '')
+
+    if ($cert) {
+        if (-not [string]::IsNullOrWhiteSpace($expectedThumbprint) -and $cert.Thumbprint -ne $expectedThumbprint) {
+            Write-Warning "[Graph] Loaded certificate thumbprint $($cert.Thumbprint) does not match the Certificate_thumbprint variable ($expectedThumbprint)."
+        }
+        Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -Certificate $cert -NoWelcome -ErrorAction Stop
+        return
+    }
+
+    # Fallback 1: a certificate already present in the runbook certificate
+    # store, referenced only by thumbprint.
+    if (-not [string]::IsNullOrWhiteSpace($expectedThumbprint)) {
+        try {
+            Connect-MgGraph -ClientId $ClientId -TenantId $TenantId -CertificateThumbprint $expectedThumbprint -NoWelcome -ErrorAction Stop
+            return
+        }
+        catch {
+            Write-Warning "[Graph] Certificate thumbprint authentication failed: $($_.Exception.Message). Trying client-secret fallback."
+        }
+    }
+
+    # Fallback 2: client secret (app-only) from the encrypted 'ClientSecret'
+    # Automation variable. Certificate authentication is preferred; the secret
+    # is used only when no certificate is available.
+    $clientSecret = Get-AutomationVariable -Name 'ClientSecret' -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace([string]$clientSecret)) {
+        Write-Warning "[Graph] No certificate available: falling back to client-secret authentication."
+        $secure = ConvertTo-SecureString ([string]$clientSecret) -AsPlainText -Force
+        $cred = [System.Management.Automation.PSCredential]::new($ClientId, $secure)
+        Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $cred -NoWelcome -ErrorAction Stop
+        return
+    }
+
+    throw "No Graph credentials available: create the Automation Certificate asset '$certName' (recommended), or set 'Certificate_thumbprint' (certificate present in the store), or set the encrypted 'ClientSecret' variable."
+}
+
 # --- Application Insights audit (optional) ---------------------------------
 # See RBK-WindowsDisposal for the rationale: runbooks POST customEvents straight
 # to the App Insights ingestion endpoint so their actions land in the same
@@ -610,11 +677,9 @@ Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
 $graphClientId   = Get-RequiredAutomationVariable -Name 'ClientId'
 $graphTenantId   = Get-RequiredAutomationVariable -Name 'TenantId'
-$graphThumbprint = Get-RequiredAutomationVariable -Name 'Certificate_thumbprint'
 
 try {
-    Connect-MgGraph -ClientId $graphClientId -TenantId $graphTenantId `
-        -CertificateThumbprint $graphThumbprint -NoWelcome -ErrorAction Stop
+    Connect-GraphAppOnly -ClientId $graphClientId -TenantId $graphTenantId
     Write-Warning "[Graph] Connected"
     Send-RunbookAudit -Action 'GraphConnected'
 }

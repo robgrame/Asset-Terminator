@@ -116,8 +116,8 @@ foreach ($runbookName in $runbookFiles.Keys) {
 }
 
 Write-Host "    Runbooks published: $($runbookFiles.Count)" -ForegroundColor Green
-Write-Host "    NOTE: the encrypted Automation variables (Certificate_thumbprint, ABM-*, KME-*)" -ForegroundColor Yellow
-Write-Host "          are created empty and must be populated before a non-dry-run wipe." -ForegroundColor Yellow
+Write-Host "    NOTE: the encrypted Automation variables (ClientSecret, Certificate_thumbprint, ABM-*, KME-*)" -ForegroundColor Yellow
+Write-Host "          are created empty and must be populated as required before a non-dry-run wipe." -ForegroundColor Yellow
 
 if ($SkipPublish) {
     Write-Host ""

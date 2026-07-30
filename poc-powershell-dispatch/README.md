@@ -158,13 +158,34 @@ vanno popolate dopo il deploy (portale o `az automation variable update`).
 |---|---|---|---|
 | `ClientId` | no | tutti | App registration (application) ID per Graph |
 | `TenantId` | no | tutti | Tenant ID Entra |
-| `Certificate_thumbprint` | sì | tutti | Thumbprint del certificato per l'auth app-only |
+| `GraphCertificateName` | no | tutti | Nome dell'**Automation Certificate asset** con il certificato Graph app-only (default `GraphAppCert`) |
+| `Certificate_thumbprint` | sì | tutti | Thumbprint del certificato app-only (validazione + fallback su cert store) |
+| `ClientSecret` | sì | tutti | Client secret dell'app registration. **Fallback opzionale**: usato dai runbook solo se non è disponibile alcun certificato |
 | `ABM-ClientId` | sì | Apple | Client ID API Apple Business Manager |
 | `ABM-KeyId` | sì | Apple | Key ID API ABM |
 | `ABM-PrivateKey` | sì | Apple | Chiave privata EC P-256 in PEM |
 | `KME-ClientIdentifier` | sì | Android | Client identifier Knox |
 | `KME-KeysJson` | sì | Android | Keys JSON Knox (contiene la chiave RSA privata) |
 | `KME-CustomerId` | sì | Android | Customer ID Knox |
+
+> **Autenticazione Graph app-only (runbook).** I runbook si autenticano a
+> Microsoft Graph con questo **ordine di preferenza**: (1) **certificato**
+> dall'Automation Certificate asset (default `GraphAppCert`, recuperato con
+> `Get-AutomationCertificate` e passato a `Connect-MgGraph -Certificate`);
+> (2) certificato già presente nel cert store del sandbox, referenziato via
+> `Certificate_thumbprint`; (3) **client secret** dalla variabile cifrata
+> `ClientSecret`, usato **solo come ultima risorsa** se non è disponibile alcun
+> certificato. Il certificato è l'opzione raccomandata. Esempio di caricamento
+> del certificato:
+>
+> ```powershell
+> az automation certificate create `
+>   --resource-group ASSET-TERMINATOR-DISPATCH-RG `
+>   --automation-account-name attdisp-auto-dev `
+>   --name GraphAppCert `
+>   --path .\graph-app.pfx `
+>   --password '<pfx-password>'
+> ```
 
 ## Deploy
 
