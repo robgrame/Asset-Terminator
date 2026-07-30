@@ -13,10 +13,32 @@ La chiave può essere passata in due modi equivalenti:
 - come query string: `?code=<functionKey>`
 - come header HTTP: `x-functions-key: <functionKey>`
 
-> La chiave concede accesso a **tutte** le function dell'app. Trattala come un
-> segreto: non commitarla, non loggarla, ruotala se esposta.
+> Negli esempi viene usata la **host key** `default`, valida per tutte le
+> function dell'app (`WipeIntake` e `GetStatus`). Trattala come un segreto: non
+> commitarla, non loggarla, ruotala se esposta.
 
 ### Recuperare la Function Key
+
+#### Dal portale Azure
+
+1. Accedere al [portale Azure](https://portal.azure.com).
+2. Aprire il Resource Group `ASSET-TERMINATOR-DISPATCH-RG`.
+3. Selezionare la Function App API `attdisp-func-api-dev`.
+4. Nel menu della Function App, aprire **Functions** > **App keys**.
+5. Nella sezione **Host keys**, individuare la chiave `default` e selezionare
+   **Show values**, quindi **Copy**.
+6. Usare il valore copiato come parametro `code` oppure nell'header
+   `x-functions-key`.
+
+> Usare la **host key** e non una chiave creata nella pagina
+> **Functions > WipeIntake > Function Keys**: una chiave specifica di
+> `WipeIntake` autorizza soltanto il `POST /api/v1/wipe` e non il successivo
+> `GET /api/v1/wipe/status`.
+
+Il nome host è visibile nella pagina **Overview** della Function App, nel campo
+**Default domain**. La Base URL è `https://<default-domain>`.
+
+#### Con Azure CLI
 
 ```powershell
 $rg  = 'ASSET-TERMINATOR-DISPATCH-RG'
