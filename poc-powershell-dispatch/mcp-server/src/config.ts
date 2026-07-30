@@ -8,7 +8,7 @@
 export interface ServerConfig {
   /** Base URL of the intake Function App, e.g. https://attdisp-func-api-dev.azurewebsites.net */
   baseUrl: string;
-  /** Function key sent as the x-functions-key header. */
+  /** Host key sent as the x-functions-key header. */
   functionKey: string;
   /** Per-request timeout in milliseconds. */
   timeoutMs: number;
@@ -27,8 +27,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       "AT_FUNCTION_BASE_URL is required (e.g. https://attdisp-func-api-dev.azurewebsites.net)."
     );
   }
+  let parsedBaseUrl: URL;
+  try {
+    parsedBaseUrl = new URL(baseUrl);
+  } catch {
+    throw new Error("AT_FUNCTION_BASE_URL must be a valid absolute URL.");
+  }
+  if (!["http:", "https:"].includes(parsedBaseUrl.protocol)) {
+    throw new Error("AT_FUNCTION_BASE_URL must use the http or https protocol.");
+  }
   if (!functionKey) {
-    throw new Error("AT_FUNCTION_KEY is required (the intake function key).");
+    throw new Error(
+      "AT_FUNCTION_KEY is required (use a Function App host key valid for both WipeIntake and GetStatus)."
+    );
   }
 
   const timeoutRaw = env.AT_FUNCTION_TIMEOUT_MS?.trim();
@@ -38,7 +49,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   }
 
   return {
-    baseUrl: stripTrailingSlash(baseUrl),
+    baseUrl: stripTrailingSlash(parsedBaseUrl.toString()),
     functionKey,
     timeoutMs,
   };

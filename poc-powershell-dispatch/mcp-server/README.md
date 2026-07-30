@@ -21,24 +21,29 @@ Set via environment variables (see `.env.example`):
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AT_FUNCTION_BASE_URL` | yes | Base URL of the intake Function App, e.g. `https://attdisp-func-api-dev.azurewebsites.net`. |
-| `AT_FUNCTION_KEY` | yes | Intake function key (`x-functions-key`). |
+| `AT_FUNCTION_KEY` | yes | Function App **host key** (`x-functions-key`), valid for both API endpoints. |
 | `AT_FUNCTION_TIMEOUT_MS` | no | Per-request timeout in ms (default `30000`). |
 
 Retrieve the key with:
 
 ```powershell
-az functionapp function keys list `
+az functionapp keys list `
   -g ASSET-TERMINATOR-DISPATCH-RG `
   -n attdisp-func-api-dev `
-  --function-name WipeIntake `
-  --query default -o tsv
+  --query functionKeys.default -o tsv
 ```
+
+> Use a **host key**, not a key scoped to `WipeIntake`: the MCP server uses the
+> same credential for both `WipeIntake` and `GetStatus`.
 
 ## Build & run
 
+Prerequisite: Node.js 20 or later.
+
 ```bash
-npm install
+npm ci
 npm run build
+npm test
 npm start        # runs dist/index.js over stdio
 ```
 
@@ -66,8 +71,9 @@ Claude Desktop style `mcpServers` block):
 
 ## Notes
 
-- Business outcomes (HTTP 400 validation, 422 guardrail rejection) are returned
-  as normal tool results so the agent can reason about them; only HTTP 5xx and
-  transport failures are surfaced as tool errors.
+- Business outcomes (HTTP 400 validation, 404 not found and 422 guardrail
+  rejection) are returned as normal tool results so the agent can reason about
+  them. HTTP 401/403, timeout/rate-limit responses, HTTP 5xx and transport
+  failures are surfaced as tool errors.
 - The function key is a secret: prefer injecting it through the host's `env`
   block or a local `.env` (git-ignored) rather than committing it.

@@ -11,7 +11,8 @@ const SCENARIOS = ["Retirement", "Sale", "Disposal", "LostStolen"] as const;
  * Render an API result as an MCP tool response. Business outcomes such as
  * validation errors (400) or rejected guardrails (422) are returned as normal
  * (successful) tool calls with isError=false so the agent can reason about the
- * body; only transport failures throw.
+ * body. Authentication/authorization failures and server failures are exposed
+ * as MCP errors; only transport failures throw.
  */
 function toToolResult(result: ApiResult, action: string) {
   const bodyText =
@@ -19,7 +20,8 @@ function toToolResult(result: ApiResult, action: string) {
       ? result.body
       : JSON.stringify(result.body, null, 2);
 
-  const isError = result.status >= 500;
+  const isError =
+    [401, 403, 408, 429].includes(result.status) || result.status >= 500;
   const summary = `${action}: HTTP ${result.status}${result.ok ? " (accepted)" : ""}`;
 
   return {
@@ -127,13 +129,13 @@ async function main(): Promise<void> {
       },
     },
     async ({ requestId, serialNumber }) => {
-      if (!requestId && !serialNumber) {
+      if (Number(Boolean(requestId)) + Number(Boolean(serialNumber)) !== 1) {
         return {
           isError: true,
           content: [
             {
               type: "text" as const,
-              text: "Provide requestId or serialNumber.",
+              text: "Provide exactly one of requestId or serialNumber.",
             },
           ],
         };
