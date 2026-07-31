@@ -148,14 +148,29 @@ interrogando `managedDevices.operatingSystem` in Intune prima di instradare.
 Restituisce lo stato dalla macchina a stati:
 
 ```
-Accepted → Queued → Dispatching → Dispatched → Running → Completed
-                                                       ↘ PartiallyCompleted
-                                                       ↘ Failed
+Accepted → Queued → Dispatching → Dispatched → Running
+                                                  ├─ Failed
+                                                  └─ PendingDeviceAction
+                                                        ├─ Completed
+                                                        ├─ PartiallyCompleted
+                                                        └─ Failed (errore/timeout)
 Rejected (guardrail)   DispatchFailed (runbook non avviabile)
 ```
 
+In condizioni normali `Queued` deve durare pochi secondi; 30 secondi è la soglia
+operativa che segnala un listener worker non sano, non un limite di scadenza del
+messaggio. `WipeDispatchStarted` registra `queueLatencySeconds` e
+`WipeQueueSlaBreached` evidenzia le latenze anomale senza perdere la richiesta.
+
 `PartiallyCompleted` copre il caso "unenrollment riuscito ma wipe fallito", che
 il processo deve poter distinguere da un successo pieno.
+
+`PendingDeviceAction` significa che Intune ha accettato il comando, ma il device
+non lo ha ancora eseguito (per esempio perché è offline). `JobMonitor` controlla
+asincronamente `deviceActionResults` a ogni esecuzione del timer, registra ogni
+poll nell'audit e non mantiene aperto il runbook. Il timeout è configurabile con
+`deviceActionTimeoutMinutes` (default 7 giorni); allo scadere la richiesta passa
+a `Failed` invece di restare pendente indefinitamente.
 
 ## Meccanismo di dispatch
 

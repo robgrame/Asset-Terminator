@@ -67,6 +67,13 @@ param runbooksSupportScenario bool = true
 @description('CRON expression for the JobMonitor timer.')
 param jobMonitorSchedule string = '0 */2 * * * *'
 
+@description('Maximum minutes to poll an asynchronous Intune device wipe before marking the request as failed.')
+param deviceActionTimeoutMinutes int = 10080
+
+@description('Queue latency threshold used for operational telemetry. It does not expire or reject messages.')
+@minValue(1)
+param queueSlaSeconds int = 30
+
 @description('Platform -> runbook routing table (see docs/evoluzione-dispatch-runbook.md).')
 param runbookMap object = {
   Windows: {
@@ -642,6 +649,15 @@ resource workerApp 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'RUNBOOK_MAP', value: string(runbookMap) }
         { name: 'RUNBOOKS_SUPPORT_SCENARIO', value: toLower(string(runbooksSupportScenario)) }
         { name: 'JOBMONITOR_SCHEDULE', value: jobMonitorSchedule }
+        { name: 'QUEUE_SLA_SECONDS', value: string(queueSlaSeconds) }
+        { name: 'DEVICE_ACTION_TIMEOUT_MINUTES', value: string(deviceActionTimeoutMinutes) }
+        // JobMonitor only reads deviceActionResults to reconcile asynchronous wipes.
+        { name: 'GRAPH_TENANT_ID', value: graphTenantId }
+        { name: 'GRAPH_CLIENT_ID', value: graphClientId }
+        { name: 'GRAPH_CLIENT_SECRET', value: graphClientSecret }
+        { name: 'GRAPH_BASE_URI', value: graphBaseUri }
+        { name: 'GRAPH_AUTHORITY_HOST', value: graphAuthorityHost }
+        { name: 'GRAPH_SCOPE', value: graphScope }
       ])
     }
   }

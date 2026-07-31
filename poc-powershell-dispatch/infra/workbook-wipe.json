@@ -65,7 +65,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "let stages = datatable(stage:string, ord:long)['1. Received',1,'2. Queued',2,'3. Dispatched',3,'4. Terminal',4]; customEvents | where name in ('WipeRequestReceived','WipeRequestQueued','WipeJobStarted','WipeDryRunCompleted','WipeTerminalState') | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform) | where isnotempty(requestId) | where '*' in (Platform) or platform in (Platform) | extend stage = case(name == 'WipeRequestReceived','1. Received', name == 'WipeRequestQueued','2. Queued', name in ('WipeJobStarted','WipeDryRunCompleted'),'3. Dispatched', name == 'WipeTerminalState','4. Terminal','other') | summarize Requests = dcount(requestId) by stage | join kind=rightouter stages on stage | project ord, stage, Requests = coalesce(Requests, 0) | order by ord asc",
+        "query": "let stages = datatable(stage:string, ord:long)['1. Received',1,'2. Queued',2,'3. Dispatched',3,'4. Pending device',4,'5. Terminal',5]; customEvents | where name in ('WipeRequestReceived','WipeRequestQueued','WipeJobStarted','WipeDryRunCompleted','WipePendingDeviceAction','WipeTerminalState') | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform) | where isnotempty(requestId) | where '*' in (Platform) or platform in (Platform) | extend stage = case(name == 'WipeRequestReceived','1. Received', name == 'WipeRequestQueued','2. Queued', name in ('WipeJobStarted','WipeDryRunCompleted'),'3. Dispatched', name == 'WipePendingDeviceAction','4. Pending device', name == 'WipeTerminalState','5. Terminal','other') | summarize Requests = dcount(requestId) by stage | join kind=rightouter stages on stage | project ord, stage, Requests = coalesce(Requests, 0) | order by ord asc",
         "size": 1,
         "title": "Funnel (richieste uniche per fase)",
         "queryType": 0,
@@ -160,6 +160,7 @@
           "formatters": [
             { "columnMatch": "status", "formatter": 18, "formatOptions": { "thresholdsOptions": "colors", "thresholdsGrid": [
               { "operator": "==", "thresholdValue": "Completed", "representation": "green", "text": "{0}{1}" },
+              { "operator": "==", "thresholdValue": "PendingDeviceAction", "representation": "yellow", "text": "{0}{1}" },
               { "operator": "==", "thresholdValue": "PartiallyCompleted", "representation": "orange", "text": "{0}{1}" },
               { "operator": "==", "thresholdValue": "Failed", "representation": "redBright", "text": "{0}{1}" },
               { "operator": "==", "thresholdValue": "Rejected", "representation": "redBright", "text": "{0}{1}" },
@@ -181,7 +182,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "customEvents | where name in ('WipeRequestRejected','WipeDispatchFailed','WipeTimeout','WipeCallbackFailed','DeviceWipeFailed','GraphConnectFailed') or (name == 'WipeTerminalState' and tostring(customDimensions.status) in ('Failed','PartiallyCompleted')) | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform), status = tostring(customDimensions.status), reason = tostring(customDimensions.reason), error = coalesce(tostring(customDimensions.error), tostring(customDimensions.errorMessage)), serialNumber = tostring(customDimensions.serialNumber) | where '*' in (Platform) or platform in (Platform) | project timestamp, requestId, platform, action = name, status, reason, error, serialNumber, role = cloud_RoleName | order by timestamp desc | take 200",
+        "query": "customEvents | where name in ('WipeRequestRejected','WipeDispatchFailed','WipeTimeout','WipeCallbackFailed','WipeDeviceActionCheckFailed','DeviceWipeFailed','GraphConnectFailed') or (name == 'WipeTerminalState' and tostring(customDimensions.status) in ('Failed','PartiallyCompleted')) | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform), status = tostring(customDimensions.status), reason = tostring(customDimensions.reason), error = coalesce(tostring(customDimensions.error), tostring(customDimensions.errorMessage)), serialNumber = tostring(customDimensions.serialNumber) | where '*' in (Platform) or platform in (Platform) | project timestamp, requestId, platform, action = name, status, reason, error, serialNumber, role = cloud_RoleName | order by timestamp desc | take 200",
         "size": 0,
         "title": "Errori e rifiuti",
         "queryType": 0,

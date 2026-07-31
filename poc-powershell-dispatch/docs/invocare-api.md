@@ -115,7 +115,7 @@ $resp = iwr -Uri "https://$fqdn/api/v1/wipe" `
 $reqId = $result.requestId
 $stResp = iwr -Uri "https://$fqdn/api/v1/wipe/status?requestId=$reqId&code=$key" -Method Get
 $state  = $stResp.Content | ConvertFrom-Json
-$state.status              # Queued | Running | Completed | Failed | Rejected
+$state.status              # Queued | Running | PendingDeviceAction | Completed | Failed | Rejected
 $state.automationJobName
 $state.errorMessage
 $state.result
@@ -161,7 +161,7 @@ do {
     Start-Sleep -Seconds 10
     $st = (iwr -Uri "https://$fqdn/api/v1/wipe/status?requestId=$reqId&code=$key" -Method Get).Content | ConvertFrom-Json
     Write-Host ("   [{0:HH:mm:ss}] status = {1}" -f (Get-Date), $st.status)
-} until ($st.status -in 'Completed','Failed','Rejected' -or (Get-Date) -gt $deadline)
+} until ($st.status -in 'Completed','PartiallyCompleted','Failed','Rejected','DispatchFailed' -or (Get-Date) -gt $deadline)
 
 Write-Host "`n=== Esito finale ===" -ForegroundColor Cyan
 $st | Format-List requestId, status, platform, automationJobName, errorMessage, result

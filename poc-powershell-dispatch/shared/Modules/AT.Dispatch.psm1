@@ -37,8 +37,33 @@ function Invoke-DisposalDispatch {
         serialNumber  = [string]$payload.device.serialNumber
     }
 
+    $queueLatencySeconds = $null
+    if ($payload.PSObject.Properties.Name -contains 'enqueuedAt' -and $payload.enqueuedAt) {
+        try {
+            $enqueuedAt = [datetime]::Parse([string]$payload.enqueuedAt).ToUniversalTime()
+            $queueLatencySeconds = [Math]::Max(0, [Math]::Round(((Get-Date).ToUniversalTime() - $enqueuedAt).TotalSeconds, 3))
+            $logProps.queueLatencySeconds = $queueLatencySeconds
+        }
+        catch {
+            Write-AtLog -Level 'Warning' -Message "Unable to parse enqueuedAt '$($payload.enqueuedAt)'." -Properties $logProps
+        }
+    }
+
     Write-AtLog -Level 'Information' -Message 'Dispatching disposal request.' -Properties $logProps
     Write-AtAudit -Action 'WipeDispatchStarted' -Properties $logProps
+
+    $queueSlaSeconds = Get-AppSettingInt -Name 'QUEUE_SLA_SECONDS' -Default 30
+    if ($null -ne $queueLatencySeconds -and $queueLatencySeconds -gt $queueSlaSeconds) {
+        Write-AtAudit -Action 'WipeQueueSlaBreached' -Level 'Error' -Properties ($logProps + @{
+            status = 'Dispatching'
+            queueSlaSeconds = $queueSlaSeconds
+        })
+    }
+
+    # Claim the durable request as soon as the Service Bus trigger starts.
+    Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+        status = 'Dispatching'
+    }
 
     # Retirement never removes the device from its enrollment platform. Until the
     # runbooks accept a -Scenario parameter, a retirement request must not be sent

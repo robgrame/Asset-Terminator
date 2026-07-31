@@ -123,17 +123,40 @@ function Find-WipeRequestState {
     #>
     param(
         [string] $Filter,
-        [int] $Top = 100
+        [int] $Top = 100,
+        [switch] $All
     )
 
-    $uri = '{0}()?$top={1}' -f (Get-StateTableUri), $Top
-    if (-not [string]::IsNullOrWhiteSpace($Filter)) {
-        $uri += '&$filter=' + [uri]::EscapeDataString($Filter)
-    }
+    $entities = [System.Collections.Generic.List[object]]::new()
+    $nextPartitionKey = $null
+    $nextRowKey = $null
 
-    $response = Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders)
-    if ($null -eq $response -or -not ($response.PSObject.Properties.Name -contains 'value')) { return @() }
-    return @($response.value)
+    do {
+        $uri = '{0}()?$top={1}' -f (Get-StateTableUri), $Top
+        if (-not [string]::IsNullOrWhiteSpace($Filter)) {
+            $uri += '&$filter=' + [uri]::EscapeDataString($Filter)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($nextPartitionKey)) {
+            $uri += '&NextPartitionKey=' + [uri]::EscapeDataString($nextPartitionKey)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($nextRowKey)) {
+            $uri += '&NextRowKey=' + [uri]::EscapeDataString($nextRowKey)
+        }
+
+        $responseHeaders = $null
+        $response = Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders) -ResponseHeadersVariable responseHeaders
+        if ($null -ne $response -and $response.PSObject.Properties.Name -contains 'value') {
+            foreach ($entity in @($response.value)) {
+                $entities.Add($entity)
+            }
+        }
+
+        $nextPartitionKey = [string]$responseHeaders['x-ms-continuation-NextPartitionKey']
+        $nextRowKey = [string]$responseHeaders['x-ms-continuation-NextRowKey']
+    }
+    while ($All -and (-not [string]::IsNullOrWhiteSpace($nextPartitionKey) -or -not [string]::IsNullOrWhiteSpace($nextRowKey)))
+
+    return $entities.ToArray()
 }
 
 Export-ModuleMember -Function Save-WipeRequestState, Update-WipeRequestState, Get-WipeRequestState, Find-WipeRequestState

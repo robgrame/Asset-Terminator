@@ -21,6 +21,12 @@ function Write-Json {
     })
 }
 
+function Get-EntityProperty {
+    param($Entity, [string] $Name)
+    if ($Entity.PSObject.Properties.Name -contains $Name) { return $Entity.$Name }
+    return $null
+}
+
 function ConvertTo-StatusView {
     param($Entity)
 
@@ -49,6 +55,14 @@ function ConvertTo-StatusView {
         acceptedAt        = $Entity.acceptedAt
         queuedAt          = $Entity.queuedAt
         dispatchedAt      = $Entity.dispatchedAt
+        runbookCompletedAt = Get-EntityProperty -Entity $Entity -Name 'runbookCompletedAt'
+        wipeIssuedAt      = Get-EntityProperty -Entity $Entity -Name 'wipeIssuedAt'
+        deviceActionState = Get-EntityProperty -Entity $Entity -Name 'deviceActionState'
+        deviceActionPollCount = Get-EntityProperty -Entity $Entity -Name 'deviceActionPollCount'
+        deviceActionLastCheckedAt = Get-EntityProperty -Entity $Entity -Name 'deviceActionLastCheckedAt'
+        deviceActionLastUpdatedAt = Get-EntityProperty -Entity $Entity -Name 'deviceActionLastUpdatedAt'
+        deviceActionLastSyncDateTime = Get-EntityProperty -Entity $Entity -Name 'deviceActionLastSyncDateTime'
+        deviceActionManagementState = Get-EntityProperty -Entity $Entity -Name 'deviceActionManagementState'
         completedAt       = $Entity.completedAt
         errorMessage      = $Entity.errorMessage
         callbackStatus    = $Entity.callbackStatus
@@ -72,7 +86,12 @@ else {
 }
 
 try {
-    $entities = Find-WipeRequestState -Filter $filter -Top 50
+    $entities = if (-not [string]::IsNullOrWhiteSpace($requestId)) {
+        Find-WipeRequestState -Filter $filter -Top 1
+    }
+    else {
+        Find-WipeRequestState -Filter $filter -Top 50 -All
+    }
 }
 catch {
     Write-AtLog -Level 'Error' -Message "State store query failed: $($_.Exception.Message)"

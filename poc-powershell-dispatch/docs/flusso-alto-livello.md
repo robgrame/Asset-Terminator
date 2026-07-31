@@ -96,7 +96,14 @@ sequenceDiagram
 
 ## 5. Stati di una richiesta
 
-`Accepted` → `Queued` → `Running` → **`Completed`** oppure **`Failed`**
+`Accepted` → `Queued` → `Running` → **`PendingDeviceAction`** →
+**`Completed`**, **`PartiallyCompleted`** oppure **`Failed`**
+
+Il completamento del runbook indica solo che Intune ha accettato il comando.
+Se il device è offline, `JobMonitor` continua a interrogare periodicamente
+`deviceActionResults` senza bloccare il runbook. Ogni controllo e transizione
+viene registrato nell'audit; superato il timeout configurato la richiesta passa
+a `Failed`.
 (o **`Rejected`** se un guardrail blocca la richiesta all'ingresso).
 
 ## 6. Principi di progetto

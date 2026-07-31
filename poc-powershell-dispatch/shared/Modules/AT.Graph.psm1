@@ -358,6 +358,7 @@ function Get-DeviceWipeStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $ManagedDeviceId,
+        [datetime] $IssuedAt,
         [hashtable] $LogProperties = @{}
     )
 
@@ -376,7 +377,22 @@ function Get-DeviceWipeStatus {
         throw
     }
 
-    $wipe = @($device.deviceActionResults) | Where-Object { $_.actionName -eq 'wipe' } | Select-Object -First 1
+    $wipe = @($device.deviceActionResults) |
+        Where-Object { $_.actionName -eq 'wipe' } |
+        Sort-Object {
+            $timestamp = if ($_.lastUpdatedDateTime) { $_.lastUpdatedDateTime } else { $_.startDateTime }
+            try { [datetime]::Parse([string]$timestamp).ToUniversalTime() } catch { [datetime]::MinValue }
+        } -Descending |
+        Select-Object -First 1
+
+    if ($wipe -and $IssuedAt -ne [datetime]::MinValue) {
+        $wipeObservedAt = $null
+        $wipeTimestamp = if ($wipe.lastUpdatedDateTime) { $wipe.lastUpdatedDateTime } else { $wipe.startDateTime }
+        try { $wipeObservedAt = [datetime]::Parse([string]$wipeTimestamp).ToUniversalTime() } catch { }
+        if (-not $wipeObservedAt -or $wipeObservedAt -lt $IssuedAt.ToUniversalTime().AddMinutes(-5)) {
+            $wipe = $null
+        }
+    }
 
     $wipeState = if ($wipe) {
         switch ($wipe.actionState) {
