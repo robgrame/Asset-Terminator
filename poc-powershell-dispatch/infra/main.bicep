@@ -6,16 +6,18 @@
 // runbooks.
 //
 // Topology:
-//   * App Service Plan   : Linux, B1, shared by both Function Apps.
+//   * App Service Plan   : Linux, B1, shared by all Function Apps.
 //   * Function App (api) : HTTP intake + status. Identity: uami-api.
 //   * Function App (wrk) : Service Bus + timer triggers. Identity: uami-worker.
+//   * Function App (mcp) : Native remote MCP tools. Identity: uami-mcp.
 //   * Service Bus        : topic `asset-disposal`, one subscription per platform.
 //   * Automation Account : hosts the three disposal runbooks.
 //   * Storage            : Functions host storage + `wiperequests` state table.
 //   * Application Insights (+ Log Analytics).
 //
 // Privilege separation is deliberate: only the worker identity can start
-// runbooks; only the api identity is reachable from the internet.
+// runbooks. The MCP endpoint is protected by its Functions system key and
+// proxies requests to the API with a host key kept in app settings.
 
 // ---------------------------------------------------------------------------
 // Parameters
@@ -120,12 +122,14 @@ var suffix = uniqueString(resourceGroup().id)
 
 var uamiApiName = '${namePrefix}-uami-api-${env}'
 var uamiWorkerName = '${namePrefix}-uami-wrk-${env}'
+var uamiMcpName = '${namePrefix}-uami-mcp-${env}'
 var storageName = take(toLower('${namePrefix}host${suffix}'), 24)
 var lawName = '${namePrefix}-law-${env}'
 var aiName = '${namePrefix}-appi-${env}'
 var planName = '${namePrefix}-plan-${env}'
 var apiAppName = '${namePrefix}-func-api-${env}'
 var workerAppName = '${namePrefix}-func-wrk-${env}'
+var mcpAppName = '${namePrefix}-func-mcp-${env}'
 var serviceBusName = '${namePrefix}-sb-${env}-${suffix}'
 var automationAccountName = '${namePrefix}-auto-${env}'
 var vnetName = '${namePrefix}-vnet-${env}'
@@ -172,6 +176,12 @@ resource uamiApi 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' =
 
 resource uamiWorker 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: uamiWorkerName
+  location: location
+  tags: tags
+}
+
+resource uamiMcp 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: uamiMcpName
   location: location
   tags: tags
 }
@@ -489,7 +499,7 @@ resource storagePrivateEndpointDns 'Microsoft.Network/privateEndpoints/privateDn
 }]
 
 // ---------------------------------------------------------------------------
-// App Service Plan -- shared by both Function Apps
+// App Service Plan -- shared by all Function Apps
 // ---------------------------------------------------------------------------
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   name: planName
@@ -522,6 +532,18 @@ var hostStorageSettings = [
   { name: 'STATE_TABLE_NAME', value: stateTableName }
   { name: 'SERVICEBUS_FQDN', value: '${serviceBus.name}.servicebus.windows.net' }
   { name: 'SERVICEBUS_TOPIC', value: topicName }
+]
+
+var mcpHostStorageSettings = [
+  { name: 'FUNCTIONS_EXTENSION_VERSION', value: '~4' }
+  { name: 'FUNCTIONS_WORKER_RUNTIME', value: 'node' }
+  { name: 'FUNCTIONS_NODE_BLOCK_ON_ENTRY_POINT_ERROR', value: 'true' }
+  { name: 'AzureWebJobsStorage__accountName', value: storage.name }
+  { name: 'AzureWebJobsStorage__blobServiceUri', value: blobUri }
+  { name: 'AzureWebJobsStorage__queueServiceUri', value: queueUri }
+  { name: 'AzureWebJobsStorage__tableServiceUri', value: tableUri }
+  { name: 'AzureWebJobsStorage__credential', value: 'managedidentity' }
+  { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
 ]
 
 // ---------------------------------------------------------------------------
@@ -612,6 +634,41 @@ resource workerApp 'Microsoft.Web/sites@2023-12-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Function App -- remote MCP server (native Azure Functions MCP trigger)
+// ---------------------------------------------------------------------------
+resource mcpApp 'Microsoft.Web/sites@2023-12-01' = {
+  name: mcpAppName
+  location: location
+  tags: tags
+  kind: 'functionapp,linux'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${uamiMcp.id}': {}
+    }
+  }
+  properties: {
+    serverFarmId: plan.id
+    httpsOnly: true
+    virtualNetworkSubnetId: usePrivateEndpoints ? '${vnet.id}/subnets/${integrationSubnetName}' : null
+    vnetRouteAllEnabled: usePrivateEndpoints
+    siteConfig: {
+      linuxFxVersion: 'NODE|22'
+      alwaysOn: true
+      ftpsState: 'Disabled'
+      minTlsVersion: '1.2'
+      vnetRouteAllEnabled: usePrivateEndpoints
+      appSettings: concat(mcpHostStorageSettings, [
+        { name: 'AzureWebJobsStorage__clientId', value: uamiMcp.properties.clientId }
+        { name: 'AT_FUNCTION_BASE_URL', value: 'https://${apiApp.properties.defaultHostName}' }
+        { name: 'AT_FUNCTION_TIMEOUT_MS', value: '30000' }
+      ])
+    }
+  }
+  dependsOn: usePrivateEndpoints ? [ storagePrivateEndpointDns ] : []
+}
+
+// ---------------------------------------------------------------------------
 // Role assignments
 // ---------------------------------------------------------------------------
 var hostStorageRoles = [
@@ -636,6 +693,16 @@ resource workerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01'
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
     principalId: uamiWorker.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
+
+resource mcpStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in hostStorageRoles: {
+  name: guid(storage.id, uamiMcp.id, roleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+    principalId: uamiMcp.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }]
@@ -678,8 +745,11 @@ resource workerAutomationOperator 'Microsoft.Authorization/roleAssignments@2022-
 output apiAppName string = apiApp.name
 output apiAppHostName string = apiApp.properties.defaultHostName
 output workerAppName string = workerApp.name
+output mcpAppName string = mcpApp.name
+output mcpAppHostName string = mcpApp.properties.defaultHostName
 output serviceBusNamespace string = serviceBus.name
 output automationAccountName string = automation.name
 output stateTableName string = stateTableName
 output apiIdentityClientId string = uamiApi.properties.clientId
 output workerIdentityClientId string = uamiWorker.properties.clientId
+output mcpIdentityClientId string = uamiMcp.properties.clientId

@@ -4,12 +4,13 @@
 
 .DESCRIPTION
     1. Provisions the infrastructure with main.bicep: shared App Service plan,
-       two Function Apps (api + worker) with dedicated user-assigned identities,
+       three Function Apps (api + worker + remote MCP) with dedicated
+       user-assigned identities,
        a Service Bus namespace with the asset-disposal topic and one subscription
        per platform, an Automation Account, the state table and the private
        endpoints required by the subscription policy.
-    2. Synchronises the shared PowerShell modules into both apps (build.ps1).
-    3. Publishes both Function Apps.
+    2. Synchronises the shared PowerShell modules into the PowerShell apps.
+    3. Builds the TypeScript MCP app and publishes all three Function Apps.
 
     Microsoft Graph is only used by the intake for read-only device lookups
     (resolve serial -> managedDevice, disambiguate the "Mobile" operating
@@ -76,10 +77,13 @@ if (-not $outputs) { throw 'Infrastructure deployment did not return any output.
 
 $apiAppName = $outputs.apiAppName.value
 $workerAppName = $outputs.workerAppName.value
+$mcpAppName = $outputs.mcpAppName.value
 $apiHostName = $outputs.apiAppHostName.value
+$mcpHostName = $outputs.mcpAppHostName.value
 
 Write-Host "    API Function App    : $apiAppName" -ForegroundColor Green
 Write-Host "    Worker Function App : $workerAppName" -ForegroundColor Green
+Write-Host "    MCP Function App    : $mcpAppName" -ForegroundColor Green
 Write-Host "    Service Bus         : $($outputs.serviceBusNamespace.value)" -ForegroundColor Green
 Write-Host "    Automation Account  : $($outputs.automationAccountName.value)" -ForegroundColor Green
 
@@ -119,6 +123,27 @@ Write-Host "    Runbooks published: $($runbookFiles.Count)" -ForegroundColor Gre
 Write-Host "    NOTE: the encrypted Automation variables (ClientSecret, Certificate_thumbprint, ABM-*, KME-*)" -ForegroundColor Yellow
 Write-Host "          are created empty and must be populated as required before a non-dry-run wipe." -ForegroundColor Yellow
 
+Write-Host "==> Configuring the MCP-to-API credential" -ForegroundColor Cyan
+$apiHostKey = az functionapp keys list `
+    --subscription $subId `
+    --resource-group $ResourceGroup `
+    --name $apiAppName `
+    --query functionKeys.default `
+    --output tsv
+if ($LASTEXITCODE -ne 0 -or -not $apiHostKey) {
+    throw "Unable to retrieve the default host key for $apiAppName."
+}
+
+az functionapp config appsettings set `
+    --subscription $subId `
+    --resource-group $ResourceGroup `
+    --name $mcpAppName `
+    --settings "AT_FUNCTION_KEY=$apiHostKey" `
+    --output none
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to configure AT_FUNCTION_KEY on $mcpAppName."
+}
+
 if ($SkipPublish) {
     Write-Host ""
     Write-Host "Publish skipped. Done." -ForegroundColor Green
@@ -142,6 +167,24 @@ foreach ($app in @(
     }
 }
 
+Write-Host "==> Building the Azure Functions MCP server" -ForegroundColor Cyan
+$mcpPath = Join-Path $root 'mcp-server'
+Push-Location $mcpPath
+try {
+    npm ci
+    if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE." }
+
+    npm run build
+    if ($LASTEXITCODE -ne 0) { throw "MCP build failed with exit code $LASTEXITCODE." }
+
+    Write-Host "==> Publishing $mcpAppName" -ForegroundColor Cyan
+    func azure functionapp publish $mcpAppName --typescript
+    if ($LASTEXITCODE -ne 0) { throw "Publish of $mcpAppName failed with exit code $LASTEXITCODE." }
+}
+finally {
+    Pop-Location
+}
+
 Write-Host "==> Retrieving the intake function key" -ForegroundColor Cyan
 $key = az functionapp function keys list `
     --subscription $subId `
@@ -158,6 +201,9 @@ if ($key) {
 }
 Write-Host "  Body  : see ../samples/request-windows.json" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "Remember to import and publish the platform runbooks into '$($outputs.automationAccountName.value)'." -ForegroundColor Yellow
+Write-Host "Remote MCP server:" -ForegroundColor Yellow
+Write-Host "  URL   : https://$mcpHostName/runtime/webhooks/mcp" -ForegroundColor Yellow
+Write-Host "  Key   : az functionapp keys list -g $ResourceGroup -n $mcpAppName --subscription $subId --query systemKeys.mcp_extension -o tsv" -ForegroundColor Yellow
+Write-Host "  Header: x-functions-key: <mcp_extension-system-key>" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green

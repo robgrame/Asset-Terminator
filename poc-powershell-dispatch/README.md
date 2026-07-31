@@ -27,20 +27,88 @@ ServiceNow ──POST /api/v1/wipe──▶ Function App "api"  (WipeIntake, Get
                               └─ JobMonitor (timer) ─▶ callback ServiceNow
                                       ▲
                              Table Storage  wiperequests  (stato + evidenze)
+
+MCP Client ──Streamable HTTP──▶ Function App "mcp" (Node 22)
+                                  ├─ submit_wipe_request ─▶ API Function
+                                  └─ get_wipe_status ─────▶ API Function
 ```
 
-### Perché due Function App
+### Perché tre Function App
 
-`api` e `worker` girano sullo **stesso App Service Plan** (nessun costo
-aggiuntivo) ma hanno **identità gestite distinte**:
+Le tre app girano sullo **stesso App Service Plan** (nessun piano aggiuntivo) e
+hanno **identità gestite distinte**:
 
 | App | Trigger | Permessi |
 |---|---|---|
 | `api` | HTTP (pubblico) | Graph *read-only*, Service Bus **Sender**, Table |
 | `worker` | Service Bus + timer (nessun endpoint pubblico) | Service Bus **Receiver**, Automation **Job Operator**, Table |
+| `mcp` | MCP Streamable HTTP | Storage host, chiamate HTTPS alla `api` con host key |
 
 L'app esposta su internet non ha quindi alcun permesso per far partire un wipe:
 può solo accodare una richiesta.
+
+La Function App MCP è separata perché una Function App usa un solo worker
+runtime: `api` e `worker` sono PowerShell 7.4, mentre il trigger MCP nativo non
+supporta PowerShell e viene pubblicato come TypeScript su Node.js 22.
+
+## Remote MCP server
+
+La Function App `attdisp-func-mcp-<env>` pubblica due tool nativi tramite
+**Azure Functions MCP**, visibili anche nella sezione **AI (Preview)** del
+portale:
+
+| Tool | Operazione |
+|---|---|
+| `submit_wipe_request` | Valida e accoda una richiesta; supporta `dryRun` |
+| `get_wipe_status` | Legge lo stato per `requestId` o `serialNumber` |
+
+Endpoint Streamable HTTP:
+
+```text
+https://attdisp-func-mcp-dev.azurewebsites.net/runtime/webhooks/mcp
+```
+
+L'endpoint richiede la system key Functions `mcp_extension`, distinta dalla
+host key dell'API:
+
+```powershell
+$mcpKey = az functionapp keys list `
+  --resource-group ASSET-TERMINATOR-DISPATCH-RG `
+  --name attdisp-func-mcp-dev `
+  --query systemKeys.mcp_extension `
+  --output tsv
+```
+
+Il client passa `$mcpKey` nell'header `x-functions-key`. La host key usata per
+chiamare `WipeIntake` e `GetStatus` rimane invece negli App Settings della
+Function MCP e viene configurata automaticamente da `deploy.ps1` dopo la
+pubblicazione dell'API.
+
+Configurazione VS Code:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "asset-terminator-mcp-key",
+      "description": "Asset-Terminator MCP extension system key",
+      "password": true
+    }
+  ],
+  "servers": {
+    "asset-terminator": {
+      "type": "http",
+      "url": "https://attdisp-func-mcp-dev.azurewebsites.net/runtime/webhooks/mcp",
+      "headers": {
+        "x-functions-key": "${input:asset-terminator-mcp-key}"
+      }
+    }
+  }
+}
+```
+
+Dettagli di sviluppo e test sono in [`mcp-server/README.md`](mcp-server/README.md).
 
 ## Contratto REST
 
@@ -202,7 +270,8 @@ cd poc-powershell-dispatch/infra
 ```
 
 Lo script provisiona l'infrastruttura, sincronizza i moduli condivisi
-(`build.ps1`) e pubblica **entrambe** le Function App.
+(`build.ps1`), compila il progetto TypeScript e pubblica **tutte e tre** le
+Function App.
 
 L'app registration Graph serve solo per le letture dell'intake:
 

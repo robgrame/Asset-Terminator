@@ -1,79 +1,86 @@
-# asset-terminator-mcp
+# Asset-Terminator remote MCP server
 
-MCP (Model Context Protocol) server that exposes the Asset-Terminator disposal
-Function API as tools, so an AI agent can submit and track device wipe requests
-without ever handling the function key directly.
+Azure Functions TypeScript app that publishes the Asset-Terminator API as a
+native remote MCP server through the Azure Functions MCP extension.
+
+This is not a local stdio wrapper. After deployment, MCP clients connect to:
+
+```text
+https://<mcp-function-app>.azurewebsites.net/runtime/webhooks/mcp
+```
 
 ## Tools
 
-| Tool | API call | Purpose |
-|------|----------|---------|
-| `submit_wipe_request` | `POST /api/v1/wipe` | Queue a disposal/wipe request (validation, Intune resolution, guardrails, dispatch). Supports `dryRun`. |
-| `get_wipe_status` | `GET /api/v1/wipe/status` | Read the durable state of a request by `requestId` or `serialNumber`. |
+| Tool | Backing API | Purpose |
+|---|---|---|
+| `submit_wipe_request` | `POST /api/v1/wipe` | Validate and queue a disposal request. Supports `dryRun`. |
+| `get_wipe_status` | `GET /api/v1/wipe/status` | Retrieve state by `requestId` or `serialNumber`. |
 
-The server is a thin proxy: the AI agent calls the tools, and this process
-attaches the `x-functions-key` header from the environment.
+The MCP Function App stores the API host key in `AT_FUNCTION_KEY` and attaches
+it to calls to the PowerShell API. MCP clients never receive that key.
 
-## Configuration
+## Authentication
 
-Set via environment variables (see `.env.example`):
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `AT_FUNCTION_BASE_URL` | yes | Base URL of the intake Function App, e.g. `https://attdisp-func-api-dev.azurewebsites.net`. |
-| `AT_FUNCTION_KEY` | yes | Function App **host key** (`x-functions-key`), valid for both API endpoints. |
-| `AT_FUNCTION_TIMEOUT_MS` | no | Per-request timeout in ms (default `30000`). |
-
-Retrieve the key with:
+`host.json` keeps `webhookAuthorizationLevel` at `System`. Remote clients must
+send the Azure Functions system key named `mcp_extension`:
 
 ```powershell
 az functionapp keys list `
-  -g ASSET-TERMINATOR-DISPATCH-RG `
-  -n attdisp-func-api-dev `
-  --query functionKeys.default -o tsv
+  --resource-group ASSET-TERMINATOR-DISPATCH-RG `
+  --name attdisp-func-mcp-dev `
+  --query systemKeys.mcp_extension `
+  --output tsv
 ```
 
-> Use a **host key**, not a key scoped to `WipeIntake`: the MCP server uses the
-> same credential for both `WipeIntake` and `GetStatus`.
-
-## Build & run
-
-Prerequisite: Node.js 20 or later.
-
-```bash
-npm ci
-npm run build
-npm test
-npm start        # runs dist/index.js over stdio
-```
-
-For development without a build step: `npm run dev`.
-
-## Registering with an AI agent host
-
-The server speaks JSON-RPC over **stdio**. Example configuration (VS Code /
-Claude Desktop style `mcpServers` block):
+Example VS Code `.vscode/mcp.json`:
 
 ```json
 {
-  "mcpServers": {
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "asset-terminator-mcp-key",
+      "description": "Asset-Terminator MCP extension system key",
+      "password": true
+    }
+  ],
+  "servers": {
     "asset-terminator": {
-      "command": "node",
-      "args": ["C:/Users/robgrame/source/repos/Asset-Terminator/poc-powershell-dispatch/mcp-server/dist/index.js"],
-      "env": {
-        "AT_FUNCTION_BASE_URL": "https://attdisp-func-api-dev.azurewebsites.net",
-        "AT_FUNCTION_KEY": "<function-key>"
+      "type": "http",
+      "url": "https://attdisp-func-mcp-dev.azurewebsites.net/runtime/webhooks/mcp",
+      "headers": {
+        "x-functions-key": "${input:asset-terminator-mcp-key}"
       }
     }
   }
 }
 ```
 
-## Notes
+The Function App also appears under **AI (Preview)** in the Azure portal,
+where the two MCP tools and connection details can be inspected.
 
-- Business outcomes (HTTP 400 validation, 404 not found and 422 guardrail
-  rejection) are returned as normal tool results so the agent can reason about
-  them. HTTP 401/403, timeout/rate-limit responses, HTTP 5xx and transport
-  failures are surfaced as tool errors.
-- The function key is a secret: prefer injecting it through the host's `env`
-  block or a local `.env` (git-ignored) rather than committing it.
+## Local development
+
+Prerequisites:
+
+- Node.js 22 or later
+- Azure Functions Core Tools 4.0.7030 or later
+- Azurite, when using `UseDevelopmentStorage=true`
+
+```powershell
+Copy-Item local.settings.example.json local.settings.json
+# Set AT_FUNCTION_KEY in local.settings.json.
+npm ci
+npm test
+npm start
+```
+
+The local Streamable HTTP endpoint is:
+
+```text
+http://localhost:7071/runtime/webhooks/mcp
+```
+
+Business outcomes such as HTTP 400 and 422 are returned as structured tool
+results. Authentication failures, throttling, server errors, timeouts and
+transport failures fail the tool call.

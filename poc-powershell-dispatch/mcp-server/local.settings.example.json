@@ -1,0 +1,10 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "AT_FUNCTION_BASE_URL": "https://attdisp-func-api-dev.azurewebsites.net",
+    "AT_FUNCTION_KEY": "<api-host-key>",
+    "AT_FUNCTION_TIMEOUT_MS": "30000"
+  }
+}

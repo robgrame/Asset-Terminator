@@ -2,34 +2,23 @@
   "name": "asset-terminator-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "MCP server exposing the Asset-Terminator disposal Function API (wipe intake + status) as tools for AI agents.",
-  "type": "module",
-  "bin": {
-    "asset-terminator-mcp": "dist/index.js"
-  },
-  "files": [
-    "dist"
-  ],
+  "description": "Azure Functions remote MCP server exposing the Asset-Terminator disposal API as tools.",
+  "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "start": "func start",
     "test": "npm run build && node --test test/*.test.mjs",
-    "prepare": "npm run build"
+    "watch": "tsc --watch"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^3.23.8"
+    "@azure/functions": "^4.13.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
-  },
-  "overrides": {
-    "@hono/node-server": "^2.0.5"
   }
 }

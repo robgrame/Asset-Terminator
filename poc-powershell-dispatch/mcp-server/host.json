@@ -1,0 +1,17 @@
+{
+  "version": "2.0",
+  "extensions": {
+    "mcp": {
+      "serverName": "Asset Terminator",
+      "serverVersion": "0.1.0",
+      "instructions": "Use submit_wipe_request to validate and queue a disposal request. Prefer dryRun=true until the request is confirmed. Use get_wipe_status to monitor asynchronous execution.",
+      "system": {
+        "webhookAuthorizationLevel": "System"
+      }
+    }
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle.Preview",
+    "version": "[4.40, 5.0.0)"
+  }
+}
