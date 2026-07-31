@@ -273,6 +273,10 @@ Lo script provisiona l'infrastruttura, sincronizza i moduli condivisi
 (`build.ps1`), compila il progetto TypeScript e pubblica **tutte e tre** le
 Function App.
 
+Il runtime Azure Automation `PowerShell-74` include automaticamente
+`Microsoft.Graph.Authentication` 2.30.0, richiesto dai tre runbook per
+l'autenticazione app-only a Graph.
+
 L'app registration Graph serve solo per le letture dell'intake:
 
 - `DeviceManagementManagedDevices.Read.All` (application, con consenso admin)

@@ -405,6 +405,21 @@ resource ps74Runtime 'Microsoft.Automation/automationAccounts/runtimeEnvironment
   }
 }
 
+resource graphAuthenticationPackage 'Microsoft.Automation/automationAccounts/runtimeEnvironments/packages@2024-10-23' = {
+  parent: ps74Runtime
+  name: 'Microsoft.Graph.Authentication'
+  #disable-next-line BCP073
+  location: location
+  #disable-next-line BCP073
+  tags: tags
+  properties: {
+    contentLink: {
+      uri: 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Authentication/2.30.0'
+      version: '2.30.0'
+    }
+  }
+}
+
 resource runbooks 'Microsoft.Automation/automationAccounts/runbooks@2024-10-23' = [for name in runbookNames: {
   parent: automation
   name: name
