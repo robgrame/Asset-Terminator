@@ -1,14 +1,13 @@
 #Requires -Version 7.6
 
-# Graph.psm1
-# Self-contained Microsoft Graph helpers for the single-function wipe mock.
+# Graph helpers for the dispatch intake Function.
 #
 # Authentication: OAuth2 *client credentials* using an app registration + client
 # secret (GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET). No managed
 # identity and no certificate are used. The token is cached in-process until a
 # minute before it expires.
 #
-# ALL configuration comes from the Function App Application Settings (environment
+# Configuration comes from the Function App Application Settings (environment
 # variables). Every knob has a safe default so the mock runs with only the three
 # GRAPH_* credential settings populated. Configurable settings:
 #   GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET   (credentials, required)
@@ -19,39 +18,9 @@
 #   WIPE_KEEP_ENROLLMENT_DATA (default false)
 #   WIPE_KEEP_USER_DATA       (default false)
 
-$script:TokenCache = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
+Import-Module "$PSScriptRoot/AT.Common.psm1" -Force
 
-function Get-AppSetting {
-    <#
-        .SYNOPSIS
-            Reads a Function Application Setting (environment variable), returning
-            $Default when it is unset or empty.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $Name,
-        [string] $Default
-    )
-    $value = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
-    return $value
-}
-
-function Get-AppSettingBool {
-    <#
-        .SYNOPSIS
-            Reads a boolean Function Application Setting, returning $Default when
-            unset or not parseable.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $Name,
-        [bool] $Default = $false
-    )
-    $value = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
-    try { return [System.Convert]::ToBoolean($value) } catch { return $Default }
-}
+$script:GraphTokenCache = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
 
 function Write-MockLog {
     <#
@@ -113,8 +82,8 @@ function Get-GraphToken {
     [CmdletBinding()]
     param()
 
-    if ($script:TokenCache -and $script:TokenCache.ExpiresOn -gt (Get-Date).AddMinutes(1)) {
-        return $script:TokenCache.AccessToken
+    if ($script:GraphTokenCache -and $script:GraphTokenCache.ExpiresOn -gt (Get-Date).AddMinutes(1)) {
+        return $script:GraphTokenCache.AccessToken
     }
 
     $tenantId     = $env:GRAPH_TENANT_ID
@@ -137,11 +106,11 @@ function Get-GraphToken {
         -ContentType 'application/x-www-form-urlencoded' `
         -Body $body
 
-    $script:TokenCache = @{
+    $script:GraphTokenCache = @{
         AccessToken = $response.access_token
         ExpiresOn   = (Get-Date).AddSeconds([int]$response.expires_in)
     }
-    return $script:TokenCache.AccessToken
+    return $script:GraphTokenCache.AccessToken
 }
 
 function Invoke-GraphRequest {
@@ -433,4 +402,4 @@ function Get-AutopilotDeviceStatus {
 
 Export-ModuleMember -Function Write-MockLog, ConvertTo-DeviceOs, Get-GraphToken, Invoke-GraphRequest, `
     Get-IntuneManagedDevice, Remove-AutopilotDevice, Invoke-IntuneWipe, Get-DeviceWipeStatus, `
-    Get-AutopilotDeviceStatus, Get-AppSetting, Get-AppSettingBool
+    Get-AutopilotDeviceStatus

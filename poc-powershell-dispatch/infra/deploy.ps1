@@ -115,15 +115,19 @@ foreach ($app in $functionApps) {
     foreach ($runScript in $runScripts) {
         $source = Get-Content $runScript.FullName -Raw
         if ($source -notmatch '(?m)^# GENERATED FILE - DO NOT EDIT DIRECTLY\.\r?$' -or
-            $source -notmatch '(?m)^# region Embedded module: AT\.[A-Za-z]+\.psm1\r?$') {
-            throw "Function script is not a generated embedded artifact: $($runScript.FullName)"
+            $source -notmatch '(?m)^# region Inlined functions from: AT\.[A-Za-z]+\.psm1\r?$') {
+            throw "Function script does not contain directly inlined module functions: $($runScript.FullName)"
         }
         if ($source -match '(?m)^[ \t]*Import-Module[^\r\n]*(?:\.\./)+Modules/AT\.[A-Za-z]+\.psm1') {
             throw "Function script still imports an external AT module: $($runScript.FullName)"
         }
+        if ($source -match '(?m)^[ \t]*(?:Export-ModuleMember|New-Module)\b' -or
+            $source -match '\$embeddedSource\b') {
+            throw "Function script still contains dynamic-module infrastructure: $($runScript.FullName)"
+        }
     }
 }
-Write-Host "    Embedded Function scripts verified: $((($functionApps | ForEach-Object { $_.ExpectedFunctions }) | Measure-Object -Sum).Sum)" -ForegroundColor Green
+Write-Host "    Flat Function scripts verified: $((($functionApps | ForEach-Object { $_.ExpectedFunctions }) | Measure-Object -Sum).Sum)" -ForegroundColor Green
 
 # --- Runbooks ---------------------------------------------------------------
 # The Bicep template creates empty runbook shells; the PowerShell content is

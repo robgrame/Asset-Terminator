@@ -330,7 +330,7 @@ chiaro nell'URL**: vanno revocati e rigenerati, e non vanno versionati.
 
 ```
 poc-powershell-dispatch/
-├── build.ps1                 genera run.ps1 autosufficienti con moduli embedded
+├── build.ps1                 genera run.ps1 autosufficienti con function inline
 ├── shared/Modules/           AT.Common, AT.Graph, AT.State, AT.Messaging,
 │                             AT.Automation, AT.Dispatch
 ├── api/                      WipeIntake (POST), GetStatus (GET)
@@ -342,9 +342,10 @@ poc-powershell-dispatch/
 ```
 
 Ogni Function mantiene il proprio handler in `handler.ps1`. `build.ps1` genera
-il relativo `run.ps1`, incorporando integralmente i moduli richiesti da
-`shared/Modules`. In questo modo il codice pubblicato e revisionabile nella
-cartella della Function è completo, mentre le modifiche continuano ad avere
-un'unica sorgente. Non modificare direttamente i `run.ps1` generati. Il deploy
-verifica che tutti i `run.ps1` contengano i moduli embedded, che non importino
-`../Modules/AT.*.psm1` e che gli `handler.ps1` siano esclusi dal pacchetto.
+il relativo `run.ps1`, copiando direttamente nel file tutte le function e le
+inizializzazioni richieste da `shared/Modules`. Il risultato non usa here-string,
+`New-Module`, `Export-ModuleMember` o import esterni: il cliente può leggere e
+cercare il codice come un unico script PowerShell. Le modifiche continuano ad
+avere un'unica sorgente nei PSM1; non modificare direttamente i `run.ps1`
+generati. Il deploy verifica la struttura flat e che gli `handler.ps1` siano
+esclusi dal pacchetto.

@@ -13,10 +13,7 @@ param($Message, $TriggerMetadata)
 # Regenerate with: ./build.ps1 -Clean
 # -----------------------------------------------------------------------------
 
-# region Embedded module: AT.Common.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# region Inlined functions from: AT.Common.psm1
 # Shared helpers for the Asset-Terminator dispatch PoC:
 # app settings, structured logging, managed-identity tokens, platform mapping
 # and a minimal JSON path resolver used by the runbook parameter binding.
@@ -331,20 +328,8 @@ function ConvertFrom-JsonBody {
     }
     return $Body
 }
-
-Export-ModuleMember -Function Get-AppSetting, Get-AppSettingBool, Get-AppSettingInt, Write-AtLog, `
-    Get-AppInsightsConfig, Send-AppInsightsTelemetry, Write-AtAudit, `
-    Get-ManagedIdentityToken, ConvertTo-EnrollmentPlatform, ConvertTo-ValidScenario, `
-    Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.Common' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.Common.psm1
-# region Embedded module: AT.State.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# endregion Inlined functions from: AT.Common.psm1
+# region Inlined functions from: AT.State.psm1
 # Durable request state on Azure Table Storage, accessed over REST with a
 # managed-identity bearer token (the storage account has shared key access
 # disabled). PartitionKey = platform, RowKey = requestId.
@@ -481,17 +466,8 @@ function Find-WipeRequestState {
     if ($null -eq $response -or -not ($response.PSObject.Properties.Name -contains 'value')) { return @() }
     return @($response.value)
 }
-
-Export-ModuleMember -Function Save-WipeRequestState, Update-WipeRequestState, Get-WipeRequestState, Find-WipeRequestState
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.State' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.State.psm1
-# region Embedded module: AT.Automation.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# endregion Inlined functions from: AT.State.psm1
+# region Inlined functions from: AT.Automation.psm1
 # Azure Automation runbook dispatch.
 #
 # Dispatch is always done through ARM:
@@ -673,19 +649,8 @@ function ConvertFrom-RunbookOutput {
     $json = $line.Substring($line.IndexOf('##RESULT##') + 10).Trim()
     try { return $json | ConvertFrom-Json } catch { return $null }
 }
-
-Export-ModuleMember -Function Resolve-RunbookBinding, Start-AutomationRunbookJob, Get-AutomationRunbookJob, `
-    Get-AutomationRunbookJobOutput, Test-AutomationJobTerminal, `
-    ConvertFrom-RunbookOutput, Get-AutomationAccountResourceId
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.Automation' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.Automation.psm1
-# region Embedded module: AT.Dispatch.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# endregion Inlined functions from: AT.Automation.psm1
+# region Inlined functions from: AT.Dispatch.psm1
 # Shared dispatch handler used by the three platform-specific Service Bus
 # triggers (DispatchWindows / DispatchApple / DispatchAndroid).
 #
@@ -801,13 +766,7 @@ function Invoke-DisposalDispatch {
     Write-AtLog -Level 'Information' -Message 'Runbook job started.' -Properties $logProps
     Write-AtAudit -Action 'WipeJobStarted' -Properties ($logProps + @{ status = 'Dispatched'; runbook = $binding.Runbook; automationJobId = [string]$job.JobId })
 }
-
-Export-ModuleMember -Function Invoke-DisposalDispatch
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.Dispatch' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.Dispatch.psm1
+# endregion Inlined functions from: AT.Dispatch.psm1
 
 
 Invoke-DisposalDispatch -Message $Message -ExpectedPlatform 'Windows'
