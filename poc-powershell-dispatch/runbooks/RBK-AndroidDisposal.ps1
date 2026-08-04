@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Samsung Knox Mobile Enrollment removal + Intune wipe. Corrected version for

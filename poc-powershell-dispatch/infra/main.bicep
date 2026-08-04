@@ -49,6 +49,12 @@ param graphAuthorityHost string = 'https://login.microsoftonline.com'
 @description('OAuth2 scope for the client-credentials token.')
 param graphScope string = 'https://graph.microsoft.com/.default'
 
+@description('PowerShell version used by Azure Automation runbooks and both Function Apps.')
+param powerShellVersion string = '7.6'
+
+@description('Microsoft.Graph.Authentication package version installed in the Automation PowerShell Runtime Environment.')
+param graphAuthenticationModuleVersion string = '2.39.0'
+
 // --- Behaviour -------------------------------------------------------------
 @description('Default dryRun when the request omits it.')
 param defaultDryRun bool = false
@@ -379,18 +385,28 @@ var runbookNames = [
   'RBK-AndroidDisposal'
 ]
 
-// PowerShell 7.4 runtime environment. The runbooks use the Microsoft.Graph
-// SDK v2, which requires PowerShell 7.4; the runbooks are linked to this
-// environment so they never fall back to the legacy 5.1 runtime.
-resource ps74Runtime 'Microsoft.Automation/automationAccounts/runtimeEnvironments@2024-10-23' = {
+// The runbooks are linked explicitly to the current PowerShell runtime so they
+// never fall back to the legacy 5.1 runtime.
+resource powerShellRuntime 'Microsoft.Automation/automationAccounts/runtimeEnvironments@2024-10-23' = {
   parent: automation
-  name: 'PowerShell-74'
+  name: 'PowerShell-${replace(powerShellVersion, '.', '')}'
   location: location
   tags: tags
   properties: {
     runtime: {
       language: 'PowerShell'
-      version: '7.4'
+      version: powerShellVersion
+    }
+  }
+}
+
+resource graphAuthenticationPackage 'Microsoft.Automation/automationAccounts/runtimeEnvironments/packages@2024-10-23' = {
+  parent: powerShellRuntime
+  name: 'Microsoft.Graph.Authentication'
+  properties: {
+    contentLink: {
+      uri: 'https://cdn.powershellgallery.com/packages/microsoft.graph.authentication.${graphAuthenticationModuleVersion}.nupkg'
+      version: graphAuthenticationModuleVersion
     }
   }
 }
@@ -402,11 +418,14 @@ resource runbooks 'Microsoft.Automation/automationAccounts/runbooks@2024-10-23' 
   tags: tags
   properties: {
     runbookType: 'PowerShell'
-    runtimeEnvironment: ps74Runtime.name
+    runtimeEnvironment: powerShellRuntime.name
     logProgress: false
     logVerbose: false
-    description: 'Asset disposal runbook dispatched by the worker function app (PowerShell 7.4).'
+    description: 'Asset disposal runbook dispatched by the worker function app (PowerShell ${powerShellVersion}).'
   }
+  dependsOn: [
+    graphAuthenticationPackage
+  ]
 }]
 
 // ---------------------------------------------------------------------------
@@ -511,7 +530,7 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
 var hostStorageSettings = [
   { name: 'FUNCTIONS_EXTENSION_VERSION', value: '~4' }
   { name: 'FUNCTIONS_WORKER_RUNTIME', value: 'powershell' }
-  { name: 'FUNCTIONS_WORKER_RUNTIME_VERSION', value: '7.4' }
+  { name: 'FUNCTIONS_WORKER_RUNTIME_VERSION', value: powerShellVersion }
   { name: 'AzureWebJobsStorage__accountName', value: storage.name }
   { name: 'AzureWebJobsStorage__blobServiceUri', value: blobUri }
   { name: 'AzureWebJobsStorage__queueServiceUri', value: queueUri }
@@ -544,7 +563,7 @@ resource apiApp 'Microsoft.Web/sites@2023-12-01' = {
     virtualNetworkSubnetId: usePrivateEndpoints ? '${vnet.id}/subnets/${integrationSubnetName}' : null
     vnetRouteAllEnabled: usePrivateEndpoints
     siteConfig: {
-      linuxFxVersion: 'POWERSHELL|7.4'
+      linuxFxVersion: 'POWERSHELL|${powerShellVersion}'
       alwaysOn: true
       ftpsState: 'Disabled'
       minTlsVersion: '1.2'
@@ -587,7 +606,7 @@ resource workerApp 'Microsoft.Web/sites@2023-12-01' = {
     virtualNetworkSubnetId: usePrivateEndpoints ? '${vnet.id}/subnets/${integrationSubnetName}' : null
     vnetRouteAllEnabled: usePrivateEndpoints
     siteConfig: {
-      linuxFxVersion: 'POWERSHELL|7.4'
+      linuxFxVersion: 'POWERSHELL|${powerShellVersion}'
       alwaysOn: true
       ftpsState: 'Disabled'
       minTlsVersion: '1.2'

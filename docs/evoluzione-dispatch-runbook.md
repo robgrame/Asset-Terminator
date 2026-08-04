@@ -494,7 +494,7 @@ Delta rispetto a `poc-powershell-mock/infra/main.bicep`:
 | **Role assignment** UAMI → `Storage Table Data Contributor` | già presente nel mock |
 | **Private endpoint** per Service Bus | necessario se la policy di tenant lo impone, come già accaduto per lo storage nel deploy corrente |
 
-Il resto (piano B1 Linux, Function App PowerShell 7.4, Application Insights, VNet +
+Il resto (piano B1 Linux, Function App PowerShell 7.6, Application Insights, VNet +
 private endpoint verso lo storage) è già in essere e non cambia.
 
 ---

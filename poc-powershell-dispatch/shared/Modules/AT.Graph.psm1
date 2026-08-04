@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 # Graph.psm1
 # Self-contained Microsoft Graph helpers for the single-function wipe mock.
 #

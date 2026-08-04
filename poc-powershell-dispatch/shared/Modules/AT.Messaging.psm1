@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 # Service Bus publishing over the REST API with a managed-identity token.
 #
 # The REST API is used instead of an output binding because the pipeline needs

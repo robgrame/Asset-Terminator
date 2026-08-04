@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 # Shared dispatch handler used by the three platform-specific Service Bus
 # triggers (DispatchWindows / DispatchApple / DispatchAndroid).
 #
@@ -29,12 +31,24 @@ function Invoke-DisposalDispatch {
         throw "Message platform '$platform' does not match the subscription platform '$ExpectedPlatform'."
     }
 
+    $dryRunValue = Resolve-JsonPath -InputObject $payload -Path '$.options.dryRun'
+    if ($null -eq $dryRunValue) { throw 'Message is missing options.dryRun.' }
+    try {
+        # Never cast a string directly to [bool]: in PowerShell [bool]'false' is
+        # true because every non-empty string is truthy.
+        $isDryRun = [System.Convert]::ToBoolean($dryRunValue)
+    }
+    catch {
+        throw "Message options.dryRun must be a boolean, received '$dryRunValue'."
+    }
+
     $logProps = @{
         requestId     = $requestId
         correlationId = [string]$payload.correlationId
         platform      = $platform
         scenario      = [string]$payload.scenario
         serialNumber  = [string]$payload.device.serialNumber
+        dryRun        = $isDryRun
     }
 
     Write-AtLog -Level 'Information' -Message 'Dispatching disposal request.' -Properties $logProps
@@ -64,9 +78,9 @@ function Invoke-DisposalDispatch {
         timeoutMinutes = $binding.TimeoutMinutes
     }
 
-    if ([bool]$payload.options.dryRun) {
+    if ($isDryRun) {
         Write-AtLog -Level 'Information' -Message 'Dry run: runbook not started.' -Properties $logProps
-        Write-AtAudit -Action 'WipeDryRunCompleted' -Properties ($logProps + @{ status = 'Completed'; runbook = $binding.Runbook; dryRun = 'true' })
+        Write-AtAudit -Action 'WipeDryRunCompleted' -Properties ($logProps + @{ status = 'Completed'; runbook = $binding.Runbook })
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
             status = 'Completed'
             completedAt = (Get-Date).ToUniversalTime()

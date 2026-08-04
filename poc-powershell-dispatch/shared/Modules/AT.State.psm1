@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 # Durable request state on Azure Table Storage, accessed over REST with a
 # managed-identity bearer token (the storage account has shared key access
 # disabled). PartitionKey = platform, RowKey = requestId.

@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Apple Business Manager unassign + Intune wipe. Corrected version for the

@@ -24,6 +24,12 @@ param graphClientId string
 @secure()
 param graphClientSecret string
 
+@description('Microsoft.Graph.Authentication package version installed in the Automation Runtime Environment.')
+param graphAuthenticationModuleVersion string = '2.39.0'
+
+@description('PowerShell version used by Azure Automation runbooks and both Function Apps.')
+param powerShellVersion string = '7.6'
+
 module dispatch 'main.bicep' = {
   name: 'asset-terminator-public'
   params: {
@@ -33,6 +39,8 @@ module dispatch 'main.bicep' = {
     graphTenantId: graphTenantId
     graphClientId: graphClientId
     graphClientSecret: graphClientSecret
+    graphAuthenticationModuleVersion: graphAuthenticationModuleVersion
+    powerShellVersion: powerShellVersion
     usePrivateEndpoints: false
   }
 }
