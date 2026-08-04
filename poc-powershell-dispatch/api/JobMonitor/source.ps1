@@ -65,7 +65,7 @@ $inFlight = @('Dispatching', 'Dispatched', 'Running')
 $filter = ($inFlight | ForEach-Object { "status eq '$_'" }) -join ' or '
 
 try {
-    $requests = Find-WipeRequestState -Filter $filter -Top 200
+    $requests = @(Find-WipeRequestState -Filter $filter -Top 200)
 }
 catch {
     Write-AtLog -Level 'Error' -Message "JobMonitor: state store query failed: $($_.Exception.Message)"

@@ -1441,7 +1441,7 @@ Write-AtAudit -Action 'WipeRequestReceived' -Properties $logProps
 # Same requestId already in flight or done: return the current state instead of
 # creating a second job.
 try {
-    $existing = Find-WipeRequestState -Filter "RowKey eq '$requestId'" -Top 1
+    $existing = @(Find-WipeRequestState -Filter "RowKey eq '$requestId'" -Top 1)
     if ($existing.Count -gt 0) {
         Write-AtLog -Level 'Warning' -Message 'Duplicate requestId, returning existing state.' -Properties $logProps
         Write-Json -StatusCode 200 -Object @{

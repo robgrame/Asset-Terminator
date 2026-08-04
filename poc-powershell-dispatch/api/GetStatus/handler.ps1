@@ -630,22 +630,11 @@ function Write-Json {
     })
 }
 
-function Get-OptionalEntityProperty {
-    param(
-        [Parameter(Mandatory)] $Entity,
-        [Parameter(Mandatory)] [string] $Name
-    )
-
-    $property = $Entity.PSObject.Properties[$Name]
-    if ($null -eq $property) { return $null }
-    return $property.Value
-}
-
 function ConvertTo-StatusView {
     param($Entity)
 
     $result = $null
-    $resultJson = Get-OptionalEntityProperty -Entity $Entity -Name 'resultJson'
+    $resultJson = Get-JsonPropertyValue -InputObject $Entity -Name 'resultJson'
     if ($resultJson) {
         try { $result = $resultJson | ConvertFrom-Json } catch { $result = $resultJson }
     }
@@ -653,31 +642,31 @@ function ConvertTo-StatusView {
     return [ordered]@{
         requestId         = $Entity.RowKey
         platform          = $Entity.PartitionKey
-        correlationId     = Get-OptionalEntityProperty -Entity $Entity -Name 'correlationId'
-        status            = Get-OptionalEntityProperty -Entity $Entity -Name 'status'
-        scenario          = Get-OptionalEntityProperty -Entity $Entity -Name 'scenario'
+        correlationId     = Get-JsonPropertyValue -InputObject $Entity -Name 'correlationId'
+        status            = Get-JsonPropertyValue -InputObject $Entity -Name 'status'
+        scenario          = Get-JsonPropertyValue -InputObject $Entity -Name 'scenario'
         device            = [ordered]@{
-            serialNumber    = Get-OptionalEntityProperty -Entity $Entity -Name 'serialNumber'
-            imei            = Get-OptionalEntityProperty -Entity $Entity -Name 'imei'
-            deviceName      = Get-OptionalEntityProperty -Entity $Entity -Name 'deviceName'
-            managedDeviceId = Get-OptionalEntityProperty -Entity $Entity -Name 'managedDeviceId'
-            operatingSystem = Get-OptionalEntityProperty -Entity $Entity -Name 'operatingSystem'
+            serialNumber    = Get-JsonPropertyValue -InputObject $Entity -Name 'serialNumber'
+            imei            = Get-JsonPropertyValue -InputObject $Entity -Name 'imei'
+            deviceName      = Get-JsonPropertyValue -InputObject $Entity -Name 'deviceName'
+            managedDeviceId = Get-JsonPropertyValue -InputObject $Entity -Name 'managedDeviceId'
+            operatingSystem = Get-JsonPropertyValue -InputObject $Entity -Name 'operatingSystem'
         }
-        automationJobName = Get-OptionalEntityProperty -Entity $Entity -Name 'automationJobName'
-        automationJobId   = Get-OptionalEntityProperty -Entity $Entity -Name 'automationJobId'
-        runbook           = Get-OptionalEntityProperty -Entity $Entity -Name 'runbook'
-        attempts          = Get-OptionalEntityProperty -Entity $Entity -Name 'attempts'
-        acceptedAt        = Get-OptionalEntityProperty -Entity $Entity -Name 'acceptedAt'
-        dispatchedAt      = Get-OptionalEntityProperty -Entity $Entity -Name 'dispatchedAt'
-        completedAt       = Get-OptionalEntityProperty -Entity $Entity -Name 'completedAt'
-        errorMessage      = Get-OptionalEntityProperty -Entity $Entity -Name 'errorMessage'
-        callbackStatus    = Get-OptionalEntityProperty -Entity $Entity -Name 'callbackStatus'
+        automationJobName = Get-JsonPropertyValue -InputObject $Entity -Name 'automationJobName'
+        automationJobId   = Get-JsonPropertyValue -InputObject $Entity -Name 'automationJobId'
+        runbook           = Get-JsonPropertyValue -InputObject $Entity -Name 'runbook'
+        attempts          = Get-JsonPropertyValue -InputObject $Entity -Name 'attempts'
+        acceptedAt        = Get-JsonPropertyValue -InputObject $Entity -Name 'acceptedAt'
+        dispatchedAt      = Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchedAt'
+        completedAt       = Get-JsonPropertyValue -InputObject $Entity -Name 'completedAt'
+        errorMessage      = Get-JsonPropertyValue -InputObject $Entity -Name 'errorMessage'
+        callbackStatus    = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackStatus'
         result            = $result
     }
 }
 
-$requestId = [string]$Request.Query.requestId
-$serialNumber = [string]$Request.Query.serialNumber
+$requestId = [string](Get-JsonPropertyValue -InputObject $Request.Query -Name 'requestId')
+$serialNumber = [string](Get-JsonPropertyValue -InputObject $Request.Query -Name 'serialNumber')
 
 if ([string]::IsNullOrWhiteSpace($requestId) -and [string]::IsNullOrWhiteSpace($serialNumber)) {
     Write-Json -StatusCode 400 -Object @{ error = 'Provide requestId or serialNumber as a query parameter.' }
@@ -692,7 +681,7 @@ else {
 }
 
 try {
-    $entities = Find-WipeRequestState -Filter $filter -Top 50
+    $entities = @(Find-WipeRequestState -Filter $filter -Top 50)
 }
 catch {
     Write-AtLog -Level 'Error' -Message "State store query failed: $($_.Exception.Message)"
