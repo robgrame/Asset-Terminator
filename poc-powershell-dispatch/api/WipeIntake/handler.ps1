@@ -338,6 +338,30 @@ function ConvertFrom-JsonBody {
     }
     return $Body
 }
+
+function Get-JsonPropertyValue {
+    param(
+        [Parameter(Mandatory)] $InputObject,
+        [Parameter(Mandatory)] [string] $Name
+    )
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $null
+    }
+
+    if ($InputObject.GetType().FullName -eq 'Newtonsoft.Json.Linq.JObject') {
+        $token = $InputObject[$Name]
+        if ($null -eq $token) { return $null }
+        $valueProperty = $token.PSObject.Properties['Value']
+        if ($null -ne $valueProperty) { return $valueProperty.Value }
+        return $token
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
 # endregion Inlined functions from: AT.Common.psm1
 # region Inlined functions from: AT.Graph.psm1
 # Graph helpers for the dispatch intake Function.
@@ -1358,22 +1382,6 @@ function Remove-CurrentDeviceLease {
     }
 }
 
-function Get-OptionalPayloadProperty {
-    param(
-        [Parameter(Mandatory)] $Payload,
-        [Parameter(Mandatory)] [string] $Name
-    )
-
-    if ($Payload -is [System.Collections.IDictionary]) {
-        if ($Payload.Contains($Name)) { return $Payload[$Name] }
-        return $null
-    }
-
-    $property = $Payload.PSObject.Properties[$Name]
-    if ($null -eq $property) { return $null }
-    return $property.Value
-}
-
 $payload = ConvertFrom-JsonBody -Body $Request.Body
 
 # --- Validation -------------------------------------------------------------
@@ -1382,17 +1390,17 @@ if (-not $payload) {
     return
 }
 
-$inputSerialNumber = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'serialNumber')
-$inputImei = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'imei')
-$inputManagedDeviceId = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'managedDeviceId')
-$inputDeviceName = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'deviceName')
-$inputScenario = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'scenario')
-$inputOperatingSystem = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'operatingSystem')
-$inputRequestId = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'requestId')
-$inputDryRun = Get-OptionalPayloadProperty -Payload $payload -Name 'dryRun'
-$inputUserConfirmed = Get-OptionalPayloadProperty -Payload $payload -Name 'userConfirmed'
-$inputMdmServerId = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'mdmServerId')
-$inputCallbackUrl = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'callbackUrl')
+$inputSerialNumber = [string](Get-JsonPropertyValue -InputObject $payload -Name 'serialNumber')
+$inputImei = [string](Get-JsonPropertyValue -InputObject $payload -Name 'imei')
+$inputManagedDeviceId = [string](Get-JsonPropertyValue -InputObject $payload -Name 'managedDeviceId')
+$inputDeviceName = [string](Get-JsonPropertyValue -InputObject $payload -Name 'deviceName')
+$inputScenario = [string](Get-JsonPropertyValue -InputObject $payload -Name 'scenario')
+$inputOperatingSystem = [string](Get-JsonPropertyValue -InputObject $payload -Name 'operatingSystem')
+$inputRequestId = [string](Get-JsonPropertyValue -InputObject $payload -Name 'requestId')
+$inputDryRun = Get-JsonPropertyValue -InputObject $payload -Name 'dryRun'
+$inputUserConfirmed = Get-JsonPropertyValue -InputObject $payload -Name 'userConfirmed'
+$inputMdmServerId = [string](Get-JsonPropertyValue -InputObject $payload -Name 'mdmServerId')
+$inputCallbackUrl = [string](Get-JsonPropertyValue -InputObject $payload -Name 'callbackUrl')
 
 if (-not $inputSerialNumber -and -not $inputImei -and -not $inputManagedDeviceId -and -not $inputDeviceName) {
     Write-Json -StatusCode 400 -Object @{ error = 'At least one of serialNumber, imei, managedDeviceId or deviceName is required.' }

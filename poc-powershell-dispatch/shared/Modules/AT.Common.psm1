@@ -315,7 +315,31 @@ function ConvertFrom-JsonBody {
     return $Body
 }
 
+function Get-JsonPropertyValue {
+    param(
+        [Parameter(Mandatory)] $InputObject,
+        [Parameter(Mandatory)] [string] $Name
+    )
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $null
+    }
+
+    if ($InputObject.GetType().FullName -eq 'Newtonsoft.Json.Linq.JObject') {
+        $token = $InputObject[$Name]
+        if ($null -eq $token) { return $null }
+        $valueProperty = $token.PSObject.Properties['Value']
+        if ($null -ne $valueProperty) { return $valueProperty.Value }
+        return $token
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 Export-ModuleMember -Function Get-AppSetting, Get-AppSettingBool, Get-AppSettingInt, Write-AtLog, `
     Get-AppInsightsConfig, Send-AppInsightsTelemetry, Write-AtAudit, `
     Get-ManagedIdentityToken, ConvertTo-EnrollmentPlatform, ConvertTo-ValidScenario, `
-    Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody
+    Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody, Get-JsonPropertyValue
