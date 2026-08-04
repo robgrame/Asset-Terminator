@@ -177,6 +177,29 @@ foreach ($app in $functionApps) {
     }
 }
 
+$expectedFunctionNames = @('WipeIntake', 'GetStatus', 'JobMonitor')
+$availableFunctionNames = @()
+for ($attempt = 1; $attempt -le 12; $attempt++) {
+    $availableFunctionNames = @(
+        az functionapp function list `
+            --subscription $subId `
+            --resource-group $ResourceGroup `
+            --name $apiAppName `
+            --query '[].name' `
+            --output tsv 2>$null |
+            ForEach-Object { ($_ -split '/')[-1] }
+    )
+
+    $missingFunctions = @($expectedFunctionNames | Where-Object { $_ -notin $availableFunctionNames })
+    if ($missingFunctions.Count -eq 0) { break }
+    Start-Sleep -Seconds 10
+}
+
+if ($missingFunctions.Count -gt 0) {
+    throw "The new Function package was published, but these handlers were not indexed: $($missingFunctions -join ', '). Legacy resources were not removed."
+}
+Write-Host "    Function handlers indexed: $($availableFunctionNames -join ', ')" -ForegroundColor Green
+
 Write-Host "==> Removing legacy worker and Service Bus resources" -ForegroundColor Cyan
 
 $legacyWorkerName = "$NamePrefix-func-wrk-$Env"
