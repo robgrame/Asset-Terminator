@@ -126,8 +126,7 @@ Il flusso è stato validato end-to-end in **dry-run**. Per abilitare i wipe real
 occorre completare la configurazione dell'Automation Account:
 
 1. Import del modulo PowerShell **`Microsoft.Graph.Authentication`**
-   nell'Automation Account (runtime **PowerShell 7.2**, richiesto dalla v2 del
-   modulo).
+   nel Runtime Environment Automation **PowerShell 7.6**.
 2. Caricamento del **certificato** per l'autenticazione app-only a Graph.
 3. Valorizzazione delle **Automation Variables segrete** (Graph, ABM per Apple,
    Knox/KME per Android), create cifrate e vuote dal deployment.

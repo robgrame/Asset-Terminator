@@ -1,3 +1,4 @@
 local.settings.json
 *.md
 samples/
+**/handler.ps1

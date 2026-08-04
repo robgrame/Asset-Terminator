@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Deploys the Asset-Terminator dispatch PoC (Service Bus + runbook dispatcher).
@@ -9,7 +11,7 @@
        a Service Bus namespace with the asset-disposal topic and one subscription
        per platform, an Automation Account and the state table. The default
        template includes private connectivity; the public variant omits it.
-    2. Synchronises the shared PowerShell modules into both apps (build.ps1).
+    2. Generates and verifies self-contained Function scripts (build.ps1).
     3. Publishes both Function Apps.
 
     Microsoft Graph is only used by the intake for read-only device lookups
@@ -38,6 +40,8 @@ param(
     [Parameter(Mandatory)] [string] $GraphTenantId,
     [Parameter(Mandatory)] [string] $GraphClientId,
     [Parameter(Mandatory)] [string] $GraphClientSecret,
+    [string] $GraphAuthenticationModuleVersion = '2.39.0',
+    [ValidatePattern('^7\.\d+$')] [string] $PowerShellVersion = '7.6',
 
     [switch] $PublicEndpoints,
     [switch] $SkipPublish
@@ -73,6 +77,8 @@ $outputs = az deployment group create `
         graphTenantId=$GraphTenantId `
         graphClientId=$GraphClientId `
         graphClientSecret=$GraphClientSecret `
+        graphAuthenticationModuleVersion=$GraphAuthenticationModuleVersion `
+        powerShellVersion=$PowerShellVersion `
     --query properties.outputs `
     --output json | ConvertFrom-Json
 
@@ -87,8 +93,37 @@ Write-Host "    Worker Function App : $workerAppName" -ForegroundColor Green
 Write-Host "    Service Bus         : $($outputs.serviceBusNamespace.value)" -ForegroundColor Green
 Write-Host "    Automation Account  : $($outputs.automationAccountName.value)" -ForegroundColor Green
 
-Write-Host "==> Synchronising shared modules" -ForegroundColor Cyan
+Write-Host "==> Generating self-contained Function scripts" -ForegroundColor Cyan
 & (Join-Path $root 'build.ps1') -Clean
+
+$functionApps = @(
+    @{ Name = $apiAppName; Path = Join-Path $root 'api'; ExpectedFunctions = 2 },
+    @{ Name = $workerAppName; Path = Join-Path $root 'worker'; ExpectedFunctions = 4 }
+)
+
+foreach ($app in $functionApps) {
+    $runScripts = @(Get-ChildItem -Path $app.Path -Filter 'run.ps1' -Recurse -File)
+    if ($runScripts.Count -ne $app.ExpectedFunctions) {
+        throw "Expected $($app.ExpectedFunctions) generated run.ps1 files under $($app.Path), found $($runScripts.Count)."
+    }
+
+    $funcIgnore = Get-Content (Join-Path $app.Path '.funcignore') -Raw
+    if ($funcIgnore -notmatch '(?m)^\*\*/handler\.ps1\s*$') {
+        throw "The publish package for $($app.Name) does not exclude handler.ps1."
+    }
+
+    foreach ($runScript in $runScripts) {
+        $source = Get-Content $runScript.FullName -Raw
+        if ($source -notmatch '(?m)^# GENERATED FILE - DO NOT EDIT DIRECTLY\.\r?$' -or
+            $source -notmatch '(?m)^# region Embedded module: AT\.[A-Za-z]+\.psm1\r?$') {
+            throw "Function script is not a generated embedded artifact: $($runScript.FullName)"
+        }
+        if ($source -match '(?m)^[ \t]*Import-Module[^\r\n]*(?:\.\./)+Modules/AT\.[A-Za-z]+\.psm1') {
+            throw "Function script still imports an external AT module: $($runScript.FullName)"
+        }
+    }
+}
+Write-Host "    Embedded Function scripts verified: $((($functionApps | ForEach-Object { $_.ExpectedFunctions }) | Measure-Object -Sum).Sum)" -ForegroundColor Green
 
 # --- Runbooks ---------------------------------------------------------------
 # The Bicep template creates empty runbook shells; the PowerShell content is
@@ -131,9 +166,7 @@ if ($SkipPublish) {
 
 # NOTE: `func azure functionapp publish` resets the az CLI default subscription,
 # so every az call after this point must pass --subscription explicitly.
-foreach ($app in @(
-        @{ Name = $apiAppName; Path = Join-Path $root 'api' },
-        @{ Name = $workerAppName; Path = Join-Path $root 'worker' })) {
+foreach ($app in $functionApps) {
 
     Write-Host "==> Publishing $($app.Name)" -ForegroundColor Cyan
     Push-Location $app.Path
@@ -146,13 +179,12 @@ foreach ($app in @(
     }
 }
 
-Write-Host "==> Retrieving the intake function key" -ForegroundColor Cyan
-$key = az functionapp function keys list `
+Write-Host "==> Retrieving the default host key" -ForegroundColor Cyan
+$key = az functionapp keys list `
     --subscription $subId `
     --resource-group $ResourceGroup `
     --name $apiAppName `
-    --function-name WipeIntake `
-    --query default --output tsv 2>$null
+    --query functionKeys.default --output tsv 2>$null
 
 Write-Host ""
 Write-Host "Submit a disposal request with:" -ForegroundColor Yellow

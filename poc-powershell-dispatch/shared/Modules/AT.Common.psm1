@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 # Shared helpers for the Asset-Terminator dispatch PoC:
 # app settings, structured logging, managed-identity tokens, platform mapping
 # and a minimal JSON path resolver used by the runbook parameter binding.

@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+
 # Azure Automation runbook dispatch.
 #
 # Dispatch is always done through ARM:

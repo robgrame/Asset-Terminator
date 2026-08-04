@@ -227,8 +227,40 @@ cd poc-powershell-dispatch/infra
 Questa variante non è compatibile con Azure Policy che impongono
 `publicNetworkAccess=Disabled` per Storage o Service Bus.
 
-Lo script provisiona l'infrastruttura, sincronizza i moduli condivisi
+Lo script provisiona l'infrastruttura, genera i `run.ps1` autosufficienti
 (`build.ps1`) e pubblica **entrambe** le Function App.
+
+Il deploy usa PowerShell 7.6 per entrambe le Function App e crea il Runtime
+Environment Automation `PowerShell-76`, nel quale installa
+`Microsoft.Graph.Authentication` prima di collegare e pubblicare i runbook. La
+versione predefinita del modulo è `2.39.0` e può essere modificata con
+`-GraphAuthenticationModuleVersion`; il runtime può essere sovrascritto con
+`-PowerShellVersion`.
+
+PowerShell 7.6 è generalmente disponibile per Azure Automation. Nelle Azure
+Functions è esposto dallo stack Linux `PowerShell|7.6`; verificare la
+disponibilità nella regione con `az functionapp list-runtimes --os linux` prima
+del deploy.
+
+### Test end-to-end
+
+Il test E2E invia una richiesta con `dryRun=true`, verifica la risposta `202` e
+interroga lo stato fino a `Completed`:
+
+```powershell
+cd poc-powershell-dispatch
+
+./tests/Invoke-DispatchE2E.ps1 `
+    -ResourceGroup DeviceLifecycleAction `
+    -FunctionAppName attdisp02-func-api-dev `
+    -Subscription <subscription-id> `
+    -SerialNumber <serial-number-Intune>
+```
+
+Il seriale deve identificare un dispositivo gestito da Intune. Usare `-Real`
+solo per eseguire intenzionalmente un wipe effettivo. Il test restituisce un
+exit code non zero se l'intake non accetta la richiesta, il polling scade o lo
+stato terminale è diverso da quello atteso.
 
 L'app registration Graph serve solo per le letture dell'intake:
 
@@ -298,7 +330,7 @@ chiaro nell'URL**: vanno revocati e rigenerati, e non vanno versionati.
 
 ```
 poc-powershell-dispatch/
-├── build.ps1                 sincronizza shared/Modules → api/ e worker/
+├── build.ps1                 genera run.ps1 autosufficienti con moduli embedded
 ├── shared/Modules/           AT.Common, AT.Graph, AT.State, AT.Messaging,
 │                             AT.Automation, AT.Dispatch
 ├── api/                      WipeIntake (POST), GetStatus (GET)
@@ -309,5 +341,10 @@ poc-powershell-dispatch/
 └── samples/                  payload di esempio
 ```
 
-`api/Modules` e `worker/Modules` sono generate da `build.ps1`: non modificarle a
-mano, la sorgente è `shared/Modules`.
+Ogni Function mantiene il proprio handler in `handler.ps1`. `build.ps1` genera
+il relativo `run.ps1`, incorporando integralmente i moduli richiesti da
+`shared/Modules`. In questo modo il codice pubblicato e revisionabile nella
+cartella della Function è completo, mentre le modifiche continuano ad avere
+un'unica sorgente. Non modificare direttamente i `run.ps1` generati. Il deploy
+verifica che tutti i `run.ps1` contengano i moduli embedded, che non importino
+`../Modules/AT.*.psm1` e che gli `handler.ps1` siano esclusi dal pacchetto.
