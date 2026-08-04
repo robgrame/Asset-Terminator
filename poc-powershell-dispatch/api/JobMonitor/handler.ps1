@@ -11,7 +11,7 @@
 #   3. on a terminal status, fetch the job output and extract the structured
 #      '##RESULT## {json}' line;
 #   4. persist the outcome and the technical evidence;
-#   5. send the ServiceNow callback (with retry, then a dead-letter queue).
+#   5. send the ServiceNow callback and persist any delivery failure.
 #
 # Requests older than the platform timeout are failed explicitly so they never
 # stay in flight forever.
@@ -20,7 +20,7 @@ param($Timer)
 
 # -----------------------------------------------------------------------------
 # GENERATED FILE - DO NOT EDIT DIRECTLY.
-# Source handler: handler.ps1
+# Trigger source: source.ps1
 # Shared sources: ../../shared/Modules/*.psm1
 # Regenerate with: ./build.ps1 -Clean
 # -----------------------------------------------------------------------------
@@ -458,6 +458,130 @@ function Get-WipeRequestState {
     }
 }
 
+function Get-WipeDeviceLeaseKey {
+    param([Parameter(Mandatory)] [string] $SerialNumber)
+
+    $normalized = $SerialNumber.Trim().ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) { throw 'A serial number is required for the device lease.' }
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normalized))
+        return [System.Convert]::ToHexString($hash).ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Get-WipeDeviceLease {
+    param([Parameter(Mandatory)] [string] $SerialNumber)
+
+    $leaseKey = Get-WipeDeviceLeaseKey -SerialNumber $SerialNumber
+    $uri = "{0}(PartitionKey='__DeviceLease',RowKey='{1}')" -f (Get-StateTableUri), $leaseKey
+
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+
+    return [pscustomobject]@{
+        Entity = $response.Content | ConvertFrom-Json
+        ETag   = [string]$response.Headers.ETag
+    }
+}
+
+function Unlock-WipeDevice {
+    param(
+        [Parameter(Mandatory)] [string] $SerialNumber,
+        [Parameter(Mandatory)] [string] $RequestId
+    )
+
+    $lease = Get-WipeDeviceLease -SerialNumber $SerialNumber
+    if (-not $lease) { return $true }
+    if ([string]$lease.Entity.requestId -ne $RequestId) { return $false }
+    if ([string]::IsNullOrWhiteSpace($lease.ETag)) {
+        throw "Device lease for '$SerialNumber' did not include an ETag."
+    }
+
+    $leaseKey = Get-WipeDeviceLeaseKey -SerialNumber $SerialNumber
+    $uri = "{0}(PartitionKey='__DeviceLease',RowKey='{1}')" -f (Get-StateTableUri), $leaseKey
+    $headers = Get-TableHeaders
+    $headers['If-Match'] = $lease.ETag
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method DELETE -Headers $headers | Out-Null
+        return $true
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -in @(404, 412)) { return $false }
+        throw
+    }
+}
+
+function Lock-WipeDevice {
+    param(
+        [Parameter(Mandatory)] [string] $SerialNumber,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $Platform,
+        [int] $LeaseHours = 4
+    )
+
+    $leaseKey = Get-WipeDeviceLeaseKey -SerialNumber $SerialNumber
+    $uri = Get-StateTableUri
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $now = (Get-Date).ToUniversalTime()
+        $entity = @{
+            PartitionKey = '__DeviceLease'
+            RowKey       = $leaseKey
+            serialNumber = $SerialNumber
+            requestId    = $RequestId
+            platform     = $Platform
+            acquiredAt   = $now.ToString('o')
+            expiresAt    = $now.AddHours($LeaseHours).ToString('o')
+        }
+        $headers = Get-TableHeaders
+        $headers['Content-Type'] = 'application/json'
+        $headers['Prefer'] = 'return-no-content'
+
+        try {
+            Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -Body ($entity | ConvertTo-Json) | Out-Null
+            return [pscustomobject]@{
+                Acquired       = $true
+                ActiveRequestId = $RequestId
+                ActivePlatform = $Platform
+                ExpiresAt      = $entity.expiresAt
+            }
+        }
+        catch {
+            if (-not $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 409) { throw }
+        }
+
+        $existing = Get-WipeDeviceLease -SerialNumber $SerialNumber
+        if (-not $existing) { continue }
+
+        $expiresAt = [datetime]::MinValue
+        [datetime]::TryParse([string]$existing.Entity.expiresAt, [ref]$expiresAt) | Out-Null
+        if ($expiresAt.ToUniversalTime() -le $now) {
+            Unlock-WipeDevice -SerialNumber $SerialNumber -RequestId ([string]$existing.Entity.requestId) | Out-Null
+            continue
+        }
+
+        return [pscustomobject]@{
+            Acquired        = $false
+            ActiveRequestId = [string]$existing.Entity.requestId
+            ActivePlatform  = [string]$existing.Entity.platform
+            ExpiresAt       = [string]$existing.Entity.expiresAt
+        }
+    }
+
+    throw "Unable to acquire the device lease for '$SerialNumber' after removing an expired lease."
+}
+
 function Find-WipeRequestState {
     <#
     .SYNOPSIS
@@ -484,8 +608,8 @@ function Find-WipeRequestState {
 #
 # Dispatch is always done through ARM:
 #   PUT .../automationAccounts/{aa}/jobs/{jobName} with a managed-identity token.
-# The client chooses jobName, so replaying the same Service Bus message never
-# starts a duplicate job, and the job status/output can be polled
+# The client chooses jobName, so replaying the same request never starts a
+# duplicate job, and the job status/output can be polled
 # deterministically. Webhooks are deliberately not supported: their token lives
 # in the URL, they cannot be made idempotent and they return no job status.
 
@@ -663,7 +787,6 @@ function ConvertFrom-RunbookOutput {
 }
 # endregion Inlined functions from: AT.Automation.psm1
 
-
 function Send-ServiceNowCallback {
     param(
         [Parameter(Mandatory)] [string] $Url,
@@ -707,7 +830,7 @@ function Resolve-RequestStatus {
     return 'Completed'
 }
 
-$inFlight = @('Dispatched', 'Running')
+$inFlight = @('Dispatching', 'Dispatched', 'Running')
 $filter = ($inFlight | ForEach-Object { "status eq '$_'" }) -join ' or '
 
 try {
@@ -765,6 +888,12 @@ foreach ($request in $requests) {
                 status = 'Failed'; errorMessage = 'Automation job not found and request timed out.'
                 completedAt = (Get-Date).ToUniversalTime()
             }
+            try {
+                Unlock-WipeDevice -SerialNumber ([string]$request.serialNumber) -RequestId $requestId | Out-Null
+            }
+            catch {
+                Write-AtLog -Level 'Error' -Message "JobMonitor: failed to release the expired device lease: $($_.Exception.Message)" -Properties $logProps
+            }
         }
         continue
     }
@@ -777,9 +906,22 @@ foreach ($request in $requests) {
                 status = 'Failed'; errorMessage = "Runbook job timeout after $timeoutMinutes minutes (last status: $($job.Status))."
                 completedAt = (Get-Date).ToUniversalTime()
             }
+            try {
+                Unlock-WipeDevice -SerialNumber ([string]$request.serialNumber) -RequestId $requestId | Out-Null
+            }
+            catch {
+                Write-AtLog -Level 'Error' -Message "JobMonitor: failed to release the timed-out device lease: $($_.Exception.Message)" -Properties $logProps
+            }
         }
-        elseif ($request.status -ne 'Running' -and $job.Status -eq 'Running') {
-            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{ status = 'Running' }
+        else {
+            $progress = @{ automationJobId = [string]$job.JobId }
+            if ($job.Status -eq 'Running') {
+                $progress.status = 'Running'
+            }
+            elseif ($request.status -eq 'Dispatching') {
+                $progress.status = 'Dispatched'
+            }
+            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties $progress
         }
         continue
     }
@@ -798,6 +940,7 @@ foreach ($request in $requests) {
         status       = $status
         completedAt  = (Get-Date).ToUniversalTime()
         jobStatus    = [string]$job.Status
+        automationJobId = [string]$job.JobId
         errorMessage = $errorMessage
     }
     if ($result) { $updates['resultJson'] = $result }
@@ -805,6 +948,12 @@ foreach ($request in $requests) {
     elseif ($output) { $updates['rawOutput'] = ([string]$output).Substring(0, [Math]::Min(30000, ([string]$output).Length)) }
 
     Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties $updates
+    try {
+        Unlock-WipeDevice -SerialNumber ([string]$request.serialNumber) -RequestId $requestId | Out-Null
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "JobMonitor: failed to release the terminal device lease: $($_.Exception.Message)" -Properties $logProps
+    }
 
     $logProps.status = $status
     Write-AtLog -Level 'Information' -Message 'JobMonitor: request reached a terminal state.' -Properties $logProps
@@ -828,7 +977,7 @@ foreach ($request in $requests) {
             managedDeviceId = $request.managedDeviceId
         }
         automationJobName = $jobName
-        automationJobId   = $request.automationJobId
+        automationJobId   = [string]$job.JobId
         dispatchedAt      = $request.dispatchedAt
         completedAt       = $updates.completedAt.ToString('o')
         errorMessage      = $errorMessage

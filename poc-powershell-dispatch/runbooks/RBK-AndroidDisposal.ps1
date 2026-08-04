@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     Samsung Knox Mobile Enrollment removal + Intune wipe. Corrected version for
-    the Service Bus dispatch pipeline.
+    direct dispatch from the Function App.
 
 .DESCRIPTION
     Corrections and changes vs the original ITA_SAMSUNG_KME_Device_Disposal.ps1:
@@ -179,7 +179,7 @@ function Connect-GraphAppOnly {
 # --- Application Insights audit (optional) ---------------------------------
 # See RBK-WindowsDisposal for the rationale: runbooks POST customEvents straight
 # to the App Insights ingestion endpoint so their actions land in the same
-# resource as the API/worker. Connection string comes from the
+# resource as the Function App. Connection string comes from the
 # 'AppInsightsConnectionString' Automation variable; absent = telemetry skipped.
 $script:AiConfig = $null
 $script:AiResolved = $false

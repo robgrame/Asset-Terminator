@@ -2,8 +2,8 @@
 //
 // This wrapper deploys the same application resources as main.bicep while
 // explicitly disabling VNet integration, private endpoints and private DNS
-// zones. Storage and Service Bus remain protected by managed identity/RBAC;
-// only their network endpoints are public.
+// zones. Storage remains protected by managed identity/RBAC; only its network
+// endpoint is public.
 
 @description('Short resource name prefix.')
 param namePrefix string = 'attdisp'
@@ -27,7 +27,7 @@ param graphClientSecret string
 @description('Microsoft.Graph.Authentication package version installed in the Automation Runtime Environment.')
 param graphAuthenticationModuleVersion string = '2.39.0'
 
-@description('PowerShell version used by Azure Automation runbooks and both Function Apps.')
+@description('PowerShell version used by Azure Automation runbooks and the Function App.')
 param powerShellVersion string = '7.6'
 
 module dispatch 'main.bicep' = {
@@ -47,9 +47,6 @@ module dispatch 'main.bicep' = {
 
 output apiAppName string = dispatch.outputs.apiAppName
 output apiAppHostName string = dispatch.outputs.apiAppHostName
-output workerAppName string = dispatch.outputs.workerAppName
-output serviceBusNamespace string = dispatch.outputs.serviceBusNamespace
 output automationAccountName string = dispatch.outputs.automationAccountName
 output stateTableName string = dispatch.outputs.stateTableName
 output apiIdentityClientId string = dispatch.outputs.apiIdentityClientId
-output workerIdentityClientId string = dispatch.outputs.workerIdentityClientId

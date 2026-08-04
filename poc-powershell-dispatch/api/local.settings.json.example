@@ -2,14 +2,11 @@
   "IsEncrypted": false,
   "Values": {
     "FUNCTIONS_WORKER_RUNTIME": "powershell",
-    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.4",
+    "FUNCTIONS_WORKER_RUNTIME_VERSION": "7.6",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
 
     "STATE_TABLE_ENDPOINT": "https://<storage>.table.core.windows.net",
     "STATE_TABLE_NAME": "wiperequests",
-
-    "SERVICEBUS_FQDN": "<namespace>.servicebus.windows.net",
-    "SERVICEBUS_TOPIC": "asset-disposal",
 
     "UAMI_CLIENT_ID": "",
 
@@ -22,6 +19,13 @@
 
     "DEFAULT_DRY_RUN": "true",
     "GUARDRAIL_REQUIRE_ENCRYPTION": "true",
-    "GUARDRAIL_REQUIRE_USER_CONFIRMATION": "true"
+    "GUARDRAIL_REQUIRE_USER_CONFIRMATION": "true",
+
+    "AUTOMATION_SUBSCRIPTION_ID": "<subscription-guid>",
+    "AUTOMATION_RESOURCE_GROUP": "ASSET-TERMINATOR-DISPATCH-RG",
+    "AUTOMATION_ACCOUNT_NAME": "attdisp-auto-dev",
+    "RUNBOOK_MAP": "{\"Apple\":{\"runbook\":\"RBK-AppleDisposal\",\"parameters\":{\"SerialNumbers\":\"$.device.serialNumber\",\"MdmServerId\":\"$.options.mdmServerId\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":45},\"Android\":{\"runbook\":\"RBK-AndroidDisposal\",\"parameters\":{\"Serials\":\"$.device.serialNumber\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":20},\"Windows\":{\"runbook\":\"RBK-WindowsDisposal\",\"parameters\":{\"SerialNumbers\":\"$.device.serialNumber\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":20}}",
+    "RUNBOOKS_SUPPORT_SCENARIO": "true",
+    "JOBMONITOR_SCHEDULE": "0 */2 * * * *"
   }
 }

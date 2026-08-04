@@ -1,8 +1,8 @@
 #Requires -Version 7.6
 <#
 .SYNOPSIS
-    Windows Autopilot removal + Intune wipe. Corrected version for the
-    Service Bus dispatch pipeline.
+    Windows Autopilot removal + Intune wipe. Corrected version for direct
+    dispatch from the Function App.
 
 .DESCRIPTION
     Corrections and changes vs the original Windows_Disposal_Device.ps1:
@@ -176,7 +176,7 @@ function Connect-GraphAppOnly {
 # --- Application Insights audit (optional) ---------------------------------
 # Runbooks run in Azure Automation, outside the Functions host, so their only
 # native trace is the job stream. To land every action in the same App Insights
-# resource as the API/worker we POST customEvents directly to the ingestion
+# resource as the Function App we POST customEvents directly to the ingestion
 # endpoint. The connection string comes from the 'AppInsightsConnectionString'
 # Automation variable; if it is absent telemetry is silently skipped.
 $script:AiConfig = $null

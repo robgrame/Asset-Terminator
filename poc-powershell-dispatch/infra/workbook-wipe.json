@@ -5,7 +5,7 @@
     {
       "type": 1,
       "content": {
-        "json": "# Asset-Terminator — Wipe Requests\nAudit e monitoraggio end-to-end delle richieste di dismissione. I dati provengono dagli audit `customEvents` emessi da API, worker e runbook (nome evento = `auditAction`, dimensioni: `requestId`, `platform`, `scenario`, `status`, `serialNumber`)."
+        "json": "# Asset-Terminator — Wipe Requests\nAudit e monitoraggio end-to-end delle richieste di dismissione. I dati provengono dagli audit `customEvents` emessi dalla Function App e dai runbook (nome evento = `auditAction`, dimensioni: `requestId`, `platform`, `scenario`, `status`, `serialNumber`)."
       },
       "name": "title"
     },
@@ -65,7 +65,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "let stages = datatable(stage:string, ord:long)['1. Received',1,'2. Queued',2,'3. Dispatched',3,'4. Terminal',4]; customEvents | where name in ('WipeRequestReceived','WipeRequestQueued','WipeJobStarted','WipeDryRunCompleted','WipeTerminalState') | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform) | where isnotempty(requestId) | where '*' in (Platform) or platform in (Platform) | extend stage = case(name == 'WipeRequestReceived','1. Received', name == 'WipeRequestQueued','2. Queued', name in ('WipeJobStarted','WipeDryRunCompleted'),'3. Dispatched', name == 'WipeTerminalState','4. Terminal','other') | summarize Requests = dcount(requestId) by stage | join kind=rightouter stages on stage | project ord, stage, Requests = coalesce(Requests, 0) | order by ord asc",
+        "query": "let stages = datatable(stage:string, ord:long)['1. Received',1,'2. Accepted',2,'3. Dispatched',3,'4. Terminal',4]; customEvents | where name in ('WipeRequestReceived','WipeRequestAccepted','WipeJobStarted','WipeDryRunCompleted','WipeTerminalState') | extend requestId = tostring(customDimensions.requestId), platform = tostring(customDimensions.platform) | where isnotempty(requestId) | where '*' in (Platform) or platform in (Platform) | extend stage = case(name == 'WipeRequestReceived','1. Received', name == 'WipeRequestAccepted','2. Accepted', name == 'WipeJobStarted','3. Dispatched', name in ('WipeDryRunCompleted','WipeTerminalState'),'4. Terminal','other') | summarize Requests = dcount(requestId) by stage | join kind=rightouter stages on stage | project ord, stage, Requests = coalesce(Requests, 0) | order by ord asc",
         "size": 1,
         "title": "Funnel (richieste uniche per fase)",
         "queryType": 0,

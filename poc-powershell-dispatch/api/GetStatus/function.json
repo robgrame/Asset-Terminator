@@ -1,4 +1,5 @@
 {
+  "scriptFile": "handler.ps1",
   "bindings": [
     {
       "authLevel": "function",

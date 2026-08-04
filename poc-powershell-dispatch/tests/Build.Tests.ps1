@@ -5,12 +5,9 @@ BeforeAll {
     & (Join-Path $root 'build.ps1') -Clean
 
     $script:GeneratedFunctions = @(
-        'api/WipeIntake/run.ps1'
-        'api/GetStatus/run.ps1'
-        'worker/DispatchWindows/run.ps1'
-        'worker/DispatchApple/run.ps1'
-        'worker/DispatchAndroid/run.ps1'
-        'worker/JobMonitor/run.ps1'
+        'api/WipeIntake/handler.ps1'
+        'api/GetStatus/handler.ps1'
+        'api/JobMonitor/handler.ps1'
     )
 }
 
@@ -39,5 +36,11 @@ Describe 'Generated Function scripts' {
             $functions.Count | Should -BeGreaterThan 0
             @($functions | Group-Object Name | Where-Object Count -gt 1).Count | Should -Be 0
         }
+    }
+
+    It 'builds only the three functions hosted by the single app' {
+        @(Get-ChildItem -Path (Join-Path $root 'api') -Filter 'handler.ps1' -Recurse -File).Count | Should -Be 3
+        @(Get-ChildItem -Path (Join-Path $root 'api') -Filter 'run.ps1' -Recurse -File).Count | Should -Be 0
+        Test-Path (Join-Path $root 'worker') | Should -BeFalse
     }
 }

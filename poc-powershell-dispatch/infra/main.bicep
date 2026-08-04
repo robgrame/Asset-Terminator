@@ -1,21 +1,16 @@
 // Asset-Terminator dispatch PoC -- infrastructure.
 //
-// Evolution of poc-powershell-mock: the wipe is no longer executed by the HTTP
-// function. The intake publishes on a Service Bus topic and a separate worker
-// Function App starts the customer's platform-specific Azure Automation
-// runbooks.
+// Evolution of poc-powershell-mock: the HTTP intake validates each request and
+// directly starts the customer's platform-specific Azure Automation runbook.
 //
 // Topology:
-//   * App Service Plan   : Linux, B1, shared by both Function Apps.
-//   * Function App (api) : HTTP intake + status. Identity: uami-api.
-//   * Function App (wrk) : Service Bus + timer triggers. Identity: uami-worker.
-//   * Service Bus        : topic `asset-disposal`, one subscription per platform.
+//   * App Service Plan   : Linux, B1.
+//   * Function App (api) : HTTP intake + status + job monitor. Identity: uami-api.
 //   * Automation Account : hosts the three disposal runbooks.
 //   * Storage            : Functions host storage + `wiperequests` state table.
 //   * Application Insights (+ Log Analytics).
 //
-// Privilege separation is deliberate: only the worker identity can start
-// runbooks; only the api identity is reachable from the internet.
+// The Function identity can read/write request state and start/monitor runbooks.
 
 // ---------------------------------------------------------------------------
 // Parameters
@@ -44,12 +39,12 @@ param graphClientSecret string
 param graphBaseUri string = 'https://graph.microsoft.com/beta'
 
 @description('Entra authority host (change for sovereign clouds).')
-param graphAuthorityHost string = 'https://login.microsoftonline.com'
+param graphAuthorityHost string = environment().authentication.loginEndpoint
 
 @description('OAuth2 scope for the client-credentials token.')
 param graphScope string = 'https://graph.microsoft.com/.default'
 
-@description('PowerShell version used by Azure Automation runbooks and both Function Apps.')
+@description('PowerShell version used by Azure Automation runbooks and the Function App.')
 param powerShellVersion string = '7.6'
 
 @description('Microsoft.Graph.Authentication package version installed in the Automation PowerShell Runtime Environment.')
@@ -107,7 +102,7 @@ param runbookMap object = {
 }
 
 // --- Private connectivity --------------------------------------------------
-@description('Reach storage and Service Bus over private endpoints (required when Azure Policy forces publicNetworkAccess=Disabled).')
+@description('Reach storage over private endpoints (required when Azure Policy forces publicNetworkAccess=Disabled).')
 param usePrivateEndpoints bool = true
 
 @description('Address space of the VNet created for private connectivity.')
@@ -125,27 +120,17 @@ param privateEndpointSubnetPrefix string = '10.61.0.64/26'
 var suffix = uniqueString(resourceGroup().id)
 
 var uamiApiName = '${namePrefix}-uami-api-${env}'
-var uamiWorkerName = '${namePrefix}-uami-wrk-${env}'
 var storageName = take(toLower('${namePrefix}host${suffix}'), 24)
 var lawName = '${namePrefix}-law-${env}'
 var aiName = '${namePrefix}-appi-${env}'
 var planName = '${namePrefix}-plan-${env}'
 var apiAppName = '${namePrefix}-func-api-${env}'
-var workerAppName = '${namePrefix}-func-wrk-${env}'
-var serviceBusName = '${namePrefix}-sb-${env}-${suffix}'
 var automationAccountName = '${namePrefix}-auto-${env}'
 var vnetName = '${namePrefix}-vnet-${env}'
 
 var integrationSubnetName = 'snet-integration'
 var privateEndpointSubnetName = 'snet-privateendpoints'
 var stateTableName = 'wiperequests'
-var topicName = 'asset-disposal'
-
-var platforms = [
-  'Windows'
-  'Apple'
-  'Android'
-]
 
 var privateStorageServices = [
   'blob'
@@ -163,21 +148,13 @@ var tags = {
 var storageBlobDataOwnerRoleId = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
 var storageQueueDataContributorRoleId = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
 var storageTableDataContributorRoleId = '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
-var serviceBusDataSenderRoleId = '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39'
-var serviceBusDataReceiverRoleId = '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0'
 var automationJobOperatorRoleId = '4fe576fe-1146-4730-92eb-48519fa6bf9f'
 
 // ---------------------------------------------------------------------------
-// Managed identities -- one per Function App (privilege separation)
+// Managed identity
 // ---------------------------------------------------------------------------
 resource uamiApi 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: uamiApiName
-  location: location
-  tags: tags
-}
-
-resource uamiWorker 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: uamiWorkerName
   location: location
   tags: tags
 }
@@ -207,7 +184,7 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 }
 
 // Ad-hoc workbook to monitor the disposal requests end-to-end from the audit
-// customEvents emitted by the API, worker and runbooks.
+// customEvents emitted by the Function App and runbooks.
 resource wipeWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
   name: guid(resourceGroup().id, 'asset-terminator-wipe-workbook')
   location: location
@@ -252,59 +229,6 @@ resource stateTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023
 var blobUri = storage.properties.primaryEndpoints.blob
 var queueUri = storage.properties.primaryEndpoints.queue
 var tableUri = storage.properties.primaryEndpoints.table
-
-// ---------------------------------------------------------------------------
-// Service Bus -- topic with one subscription per platform
-// ---------------------------------------------------------------------------
-resource serviceBus 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
-  name: serviceBusName
-  location: location
-  tags: tags
-  sku: {
-    name: 'Standard' // topics require Standard or higher
-    tier: 'Standard'
-  }
-  properties: {
-    disableLocalAuth: true
-    minimumTlsVersion: '1.2'
-  }
-}
-
-resource topic 'Microsoft.ServiceBus/namespaces/topics@2024-01-01' = {
-  parent: serviceBus
-  name: topicName
-  properties: {
-    // MessageId = requestId, so a ServiceNow retry never creates a second job.
-    requiresDuplicateDetection: true
-    duplicateDetectionHistoryTimeWindow: 'PT1H'
-    defaultMessageTimeToLive: 'P14D'
-    supportOrdering: true
-  }
-}
-
-resource subscriptions 'Microsoft.ServiceBus/namespaces/topics/subscriptions@2024-01-01' = [for platform in platforms: {
-  parent: topic
-  name: 'sub-${toLower(platform)}'
-  properties: {
-    // SessionId = serialNumber: two requests on the same device never run in parallel.
-    requiresSession: true
-    lockDuration: 'PT5M'
-    maxDeliveryCount: 5
-    deadLetteringOnMessageExpiration: true
-    defaultMessageTimeToLive: 'P14D'
-  }
-}]
-
-resource subscriptionRules 'Microsoft.ServiceBus/namespaces/topics/subscriptions/rules@2024-01-01' = [for (platform, i) in platforms: {
-  parent: subscriptions[i]
-  name: 'platform-filter'
-  properties: {
-    filterType: 'SqlFilter'
-    sqlFilter: {
-      sqlExpression: 'platform = \'${platform}\''
-    }
-  }
-}]
 
 // ---------------------------------------------------------------------------
 // Automation Account -- hosts the customer's platform runbooks
@@ -421,7 +345,7 @@ resource runbooks 'Microsoft.Automation/automationAccounts/runbooks@2024-10-23' 
     runtimeEnvironment: powerShellRuntime.name
     logProgress: false
     logVerbose: false
-    description: 'Asset disposal runbook dispatched by the worker function app (PowerShell ${powerShellVersion}).'
+    description: 'Asset disposal runbook dispatched by the Function App (PowerShell ${powerShellVersion}).'
   }
   dependsOn: [
     graphAuthenticationPackage
@@ -508,7 +432,7 @@ resource storagePrivateEndpointDns 'Microsoft.Network/privateEndpoints/privateDn
 }]
 
 // ---------------------------------------------------------------------------
-// App Service Plan -- shared by both Function Apps
+// App Service Plan
 // ---------------------------------------------------------------------------
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   name: planName
@@ -539,12 +463,10 @@ var hostStorageSettings = [
   { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsights.properties.ConnectionString }
   { name: 'STATE_TABLE_ENDPOINT', value: tableUri }
   { name: 'STATE_TABLE_NAME', value: stateTableName }
-  { name: 'SERVICEBUS_FQDN', value: '${serviceBus.name}.servicebus.windows.net' }
-  { name: 'SERVICEBUS_TOPIC', value: topicName }
 ]
 
 // ---------------------------------------------------------------------------
-// Function App -- api (internet facing, Graph read only)
+// Function App -- intake, direct runbook dispatch, status and job monitor
 // ---------------------------------------------------------------------------
 resource apiApp 'Microsoft.Web/sites@2023-12-01' = {
   name: apiAppName
@@ -580,44 +502,6 @@ resource apiApp 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'DEFAULT_DRY_RUN', value: toLower(string(defaultDryRun)) }
         { name: 'GUARDRAIL_REQUIRE_ENCRYPTION', value: toLower(string(guardrailRequireEncryption)) }
         { name: 'GUARDRAIL_REQUIRE_USER_CONFIRMATION', value: toLower(string(guardrailRequireUserConfirmation)) }
-      ])
-    }
-  }
-  dependsOn: usePrivateEndpoints ? [ storagePrivateEndpointDns ] : []
-}
-
-// ---------------------------------------------------------------------------
-// Function App -- worker (no public trigger, starts runbooks)
-// ---------------------------------------------------------------------------
-resource workerApp 'Microsoft.Web/sites@2023-12-01' = {
-  name: workerAppName
-  location: location
-  tags: tags
-  kind: 'functionapp,linux'
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${uamiWorker.id}': {}
-    }
-  }
-  properties: {
-    serverFarmId: plan.id
-    httpsOnly: true
-    virtualNetworkSubnetId: usePrivateEndpoints ? '${vnet.id}/subnets/${integrationSubnetName}' : null
-    vnetRouteAllEnabled: usePrivateEndpoints
-    siteConfig: {
-      linuxFxVersion: 'POWERSHELL|${powerShellVersion}'
-      alwaysOn: true
-      ftpsState: 'Disabled'
-      minTlsVersion: '1.2'
-      vnetRouteAllEnabled: usePrivateEndpoints
-      appSettings: concat(hostStorageSettings, [
-        { name: 'AzureWebJobsStorage__clientId', value: uamiWorker.properties.clientId }
-        { name: 'UAMI_CLIENT_ID', value: uamiWorker.properties.clientId }
-        // Service Bus trigger over managed identity (no connection string).
-        { name: 'ServiceBusConnection__fullyQualifiedNamespace', value: '${serviceBus.name}.servicebus.windows.net' }
-        { name: 'ServiceBusConnection__credential', value: 'managedidentity' }
-        { name: 'ServiceBusConnection__clientId', value: uamiWorker.properties.clientId }
         { name: 'AUTOMATION_SUBSCRIPTION_ID', value: subscription().subscriptionId }
         { name: 'AUTOMATION_RESOURCE_GROUP', value: resourceGroup().name }
         { name: 'AUTOMATION_ACCOUNT_NAME', value: automation.name }
@@ -649,44 +533,13 @@ resource apiStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
   }
 }]
 
-resource workerStorageRoles 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in hostStorageRoles: {
-  name: guid(storage.id, uamiWorker.id, roleId)
-  scope: storage
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
-    principalId: uamiWorker.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}]
-
-// The api can only send; the worker can only receive.
-resource apiServiceBusSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBus.id, uamiApi.id, serviceBusDataSenderRoleId)
-  scope: serviceBus
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataSenderRoleId)
-    principalId: uamiApi.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-resource workerServiceBusReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(serviceBus.id, uamiWorker.id, serviceBusDataReceiverRoleId)
-  scope: serviceBus
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', serviceBusDataReceiverRoleId)
-    principalId: uamiWorker.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Only the worker may start runbook jobs.
-resource workerAutomationOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(automation.id, uamiWorker.id, automationJobOperatorRoleId)
+// The Function App starts and monitors Automation jobs.
+resource apiAutomationOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(automation.id, uamiApi.id, automationJobOperatorRoleId)
   scope: automation
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', automationJobOperatorRoleId)
-    principalId: uamiWorker.properties.principalId
+    principalId: uamiApi.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -696,9 +549,6 @@ resource workerAutomationOperator 'Microsoft.Authorization/roleAssignments@2022-
 // ---------------------------------------------------------------------------
 output apiAppName string = apiApp.name
 output apiAppHostName string = apiApp.properties.defaultHostName
-output workerAppName string = workerApp.name
-output serviceBusNamespace string = serviceBus.name
 output automationAccountName string = automation.name
 output stateTableName string = stateTableName
 output apiIdentityClientId string = uamiApi.properties.clientId
-output workerIdentityClientId string = uamiWorker.properties.clientId

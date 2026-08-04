@@ -2,17 +2,15 @@
 
 <#
 .SYNOPSIS
-    Deploys the Asset-Terminator dispatch PoC (Service Bus + runbook dispatcher).
+    Deploys the Asset-Terminator direct runbook-dispatch PoC.
 
 .DESCRIPTION
     1. Provisions the infrastructure with main.bicep (or main-public.bicep when
-       -PublicEndpoints is specified): shared App Service plan,
-       two Function Apps (api + worker) with dedicated user-assigned identities,
-       a Service Bus namespace with the asset-disposal topic and one subscription
-       per platform, an Automation Account and the state table. The default
-       template includes private connectivity; the public variant omits it.
+       -PublicEndpoints is specified): App Service plan, one Function App with a
+       user-assigned identity, an Automation Account and the state table. The
+       default template includes private connectivity; the public variant omits it.
     2. Generates and verifies self-contained Function scripts (build.ps1).
-    3. Publishes both Function Apps.
+    3. Publishes the Function App.
 
     Microsoft Graph is only used by the intake for read-only device lookups
     (resolve serial -> managedDevice, disambiguate the "Mobile" operating
@@ -85,45 +83,41 @@ $outputs = az deployment group create `
 if (-not $outputs) { throw 'Infrastructure deployment did not return any output.' }
 
 $apiAppName = $outputs.apiAppName.value
-$workerAppName = $outputs.workerAppName.value
 $apiHostName = $outputs.apiAppHostName.value
 
-Write-Host "    API Function App    : $apiAppName" -ForegroundColor Green
-Write-Host "    Worker Function App : $workerAppName" -ForegroundColor Green
-Write-Host "    Service Bus         : $($outputs.serviceBusNamespace.value)" -ForegroundColor Green
+Write-Host "    Function App        : $apiAppName" -ForegroundColor Green
 Write-Host "    Automation Account  : $($outputs.automationAccountName.value)" -ForegroundColor Green
 
 Write-Host "==> Generating self-contained Function scripts" -ForegroundColor Cyan
 & (Join-Path $root 'build.ps1') -Clean
 
 $functionApps = @(
-    @{ Name = $apiAppName; Path = Join-Path $root 'api'; ExpectedFunctions = 2 },
-    @{ Name = $workerAppName; Path = Join-Path $root 'worker'; ExpectedFunctions = 4 }
+    @{ Name = $apiAppName; Path = Join-Path $root 'api'; ExpectedFunctions = 3 }
 )
 
 foreach ($app in $functionApps) {
-    $runScripts = @(Get-ChildItem -Path $app.Path -Filter 'run.ps1' -Recurse -File)
-    if ($runScripts.Count -ne $app.ExpectedFunctions) {
-        throw "Expected $($app.ExpectedFunctions) generated run.ps1 files under $($app.Path), found $($runScripts.Count)."
+    $handlerScripts = @(Get-ChildItem -Path $app.Path -Filter 'handler.ps1' -Recurse -File)
+    if ($handlerScripts.Count -ne $app.ExpectedFunctions) {
+        throw "Expected $($app.ExpectedFunctions) generated handler.ps1 files under $($app.Path), found $($handlerScripts.Count)."
     }
 
     $funcIgnore = Get-Content (Join-Path $app.Path '.funcignore') -Raw
-    if ($funcIgnore -notmatch '(?m)^\*\*/handler\.ps1\s*$') {
-        throw "The publish package for $($app.Name) does not exclude handler.ps1."
+    if ($funcIgnore -notmatch '(?m)^\*\*/source\.ps1\s*$') {
+        throw "The publish package for $($app.Name) does not exclude source.ps1."
     }
 
-    foreach ($runScript in $runScripts) {
-        $source = Get-Content $runScript.FullName -Raw
+    foreach ($handlerScript in $handlerScripts) {
+        $source = Get-Content $handlerScript.FullName -Raw
         if ($source -notmatch '(?m)^# GENERATED FILE - DO NOT EDIT DIRECTLY\.\r?$' -or
             $source -notmatch '(?m)^# region Inlined functions from: AT\.[A-Za-z]+\.psm1\r?$') {
-            throw "Function script does not contain directly inlined module functions: $($runScript.FullName)"
+            throw "Function script does not contain directly inlined module functions: $($handlerScript.FullName)"
         }
         if ($source -match '(?m)^[ \t]*Import-Module[^\r\n]*(?:\.\./)+Modules/AT\.[A-Za-z]+\.psm1') {
-            throw "Function script still imports an external AT module: $($runScript.FullName)"
+            throw "Function script still imports an external AT module: $($handlerScript.FullName)"
         }
         if ($source -match '(?m)^[ \t]*(?:Export-ModuleMember|New-Module)\b' -or
             $source -match '\$embeddedSource\b') {
-            throw "Function script still contains dynamic-module infrastructure: $($runScript.FullName)"
+            throw "Function script still contains dynamic-module infrastructure: $($handlerScript.FullName)"
         }
     }
 }
@@ -183,6 +177,65 @@ foreach ($app in $functionApps) {
     }
 }
 
+Write-Host "==> Removing legacy worker and Service Bus resources" -ForegroundColor Cyan
+
+$legacyWorkerName = "$NamePrefix-func-wrk-$Env"
+$legacyWorkerIdentityName = "$NamePrefix-uami-wrk-$Env"
+$legacyServiceBusPrefix = "$NamePrefix-sb-$Env-"
+$legacyWorkerPrincipalId = az identity show `
+    --subscription $subId `
+    --resource-group $ResourceGroup `
+    --name $legacyWorkerIdentityName `
+    --query principalId `
+    --output tsv 2>$null
+
+if (-not [string]::IsNullOrWhiteSpace($legacyWorkerPrincipalId)) {
+    $resourceGroupScope = "/subscriptions/$subId/resourceGroups/$ResourceGroup"
+    $legacyRoleAssignmentIds = @(
+        az role assignment list `
+            --subscription $subId `
+            --assignee-object-id $legacyWorkerPrincipalId `
+            --all `
+            --query "[?starts_with(scope, '$resourceGroupScope')].id" `
+            --output tsv
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    foreach ($roleAssignmentId in $legacyRoleAssignmentIds) {
+        Write-Host "    Removing role assignment $roleAssignmentId" -ForegroundColor Yellow
+        az role assignment delete --subscription $subId --ids $roleAssignmentId
+        if ($LASTEXITCODE -ne 0) { throw "Failed to remove legacy role assignment '$roleAssignmentId'." }
+    }
+}
+
+$legacyResourceIds = @(
+    az resource list `
+        --subscription $subId `
+        --resource-group $ResourceGroup `
+        --resource-type 'Microsoft.Web/sites' `
+        --query "[?name=='$legacyWorkerName'].id" `
+        --output tsv
+    az resource list `
+        --subscription $subId `
+        --resource-group $ResourceGroup `
+        --resource-type 'Microsoft.ManagedIdentity/userAssignedIdentities' `
+        --query "[?name=='$legacyWorkerIdentityName'].id" `
+        --output tsv
+    az resource list `
+        --subscription $subId `
+        --resource-group $ResourceGroup `
+        --resource-type 'Microsoft.ServiceBus/namespaces' `
+        --query "[?starts_with(name, '$legacyServiceBusPrefix')].id" `
+        --output tsv
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+foreach ($resourceId in $legacyResourceIds) {
+    Write-Host "    Removing $resourceId" -ForegroundColor Yellow
+    az resource delete --subscription $subId --ids $resourceId
+    if ($LASTEXITCODE -ne 0) { throw "Failed to remove legacy resource '$resourceId'." }
+}
+
+Write-Host "    Legacy resources removed: $($legacyResourceIds.Count)" -ForegroundColor Green
+
 Write-Host "==> Retrieving the default host key" -ForegroundColor Cyan
 $key = az functionapp keys list `
     --subscription $subId `
@@ -197,7 +250,5 @@ if ($key) {
     Write-Host "  Header: x-functions-key: $key" -ForegroundColor Yellow
 }
 Write-Host "  Body  : see ../samples/request-windows.json" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "Remember to import and publish the platform runbooks into '$($outputs.automationAccountName.value)'." -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green

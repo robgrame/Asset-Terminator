@@ -163,8 +163,9 @@ $accepted = $response.Content | ConvertFrom-Json
 if ([string]$accepted.requestId -ne $RequestId) {
     throw "WipeIntake returned requestId '$($accepted.requestId)' instead of '$RequestId'."
 }
-if ([string]$accepted.status -ne 'Queued') {
-    throw "WipeIntake returned status '$($accepted.status)' instead of 'Queued'."
+$expectedAcceptedStatuses = if ($expectedDryRun) { @('Completed') } else { @('Dispatching', 'Dispatched') }
+if ([string]$accepted.status -notin $expectedAcceptedStatuses) {
+    throw "WipeIntake returned status '$($accepted.status)' instead of one of: $($expectedAcceptedStatuses -join ', ')."
 }
 $acceptedDryRun = ConvertTo-TestBoolean -Value $accepted.dryRun -FieldName 'WipeIntake dryRun'
 if ($acceptedDryRun -ne $expectedDryRun) {
@@ -175,7 +176,7 @@ $terminalStates = @('Completed', 'PartiallyCompleted', 'Failed', 'Rejected', 'Di
 $deadline = (Get-Date).ToUniversalTime().AddSeconds($TimeoutSeconds)
 $encodedRequestId = [uri]::EscapeDataString($RequestId)
 $statusUri = "$baseUriValue/api/v1/wipe/status?requestId=$encodedRequestId"
-$lastStatus = 'Queued'
+$lastStatus = [string]$accepted.status
 $state = $null
 
 do {

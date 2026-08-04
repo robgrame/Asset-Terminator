@@ -10,19 +10,15 @@ dispositivi aziendali (Windows, Apple, Android) partendo da una richiesta di
 ServiceNow, delegando l'esecuzione del wipe ai runbook di piattaforma già in uso
 presso il cliente.
 
-Rispetto alla versione precedente, l'azione distruttiva **non è più eseguita
-direttamente dalla Function**: la richiesta viene instradata su una coda
-(Azure Service Bus) e un componente di backend fa il **dispatch** verso il
-runbook corretto. Questo disaccoppia l'accettazione dall'esecuzione e rende il
-sistema più resiliente e scalabile.
+L'azione distruttiva **non è eseguita direttamente dalla Function**: dopo i
+controlli, la stessa Function avvia il runbook corretto tramite Azure Resource
+Manager. Non sono presenti code o componenti worker separati.
 
 ## 2. Componenti
 
 | Componente                     | Ruolo                                                                       |
 |--------------------------------|-----------------------------------------------------------------------------|
-| **API Function** (`WipeIntake`)| Porta d'ingresso HTTP per ServiceNow. Valida, applica i guardrail, accoda.   |
-| **Azure Service Bus** (topic)  | Bus di messaggi. Disaccoppia ingresso ed esecuzione, garantisce ordinamento.|
-| **Worker Function** (dispatcher)| Legge dalla coda e avvia il runbook di piattaforma su Azure Automation.     |
+| **Function App**               | Ospita intake, stato e monitoraggio; valida e avvia direttamente il runbook.|
 | **Azure Automation** (runbook) | Esegue il wipe reale, uno script dedicato per piattaforma.                   |
 | **Monitor di stato** (`JobMonitor`) | Segue l'avanzamento del job e aggiorna lo stato della richiesta.       |
 | **API di stato** (`GetStatus`) | Permette a ServiceNow di consultare lo stato tramite `requestId`.           |
@@ -35,23 +31,18 @@ sequenceDiagram
     participant SN as ServiceNow
     participant API as API Function (WipeIntake)
     participant G as Microsoft Graph / Intune
-    participant SB as Service Bus (topic asset-disposal)
-    participant W as Worker (Dispatcher)
     participant AA as Azure Automation (Runbook piattaforma)
     participant ST as Tabella di stato
 
     SN->>API: POST /api/v1/wipe (device, scenario)
     API->>G: Risoluzione device + guardrail (managed, cifratura)
     API->>ST: Salva stato = Accepted (write-before-action)
-    API->>SB: Pubblica messaggio canonico (sessione = serial)
-    API->>ST: Stato = Queued
+    API->>AA: Avvia il runbook corretto (job = requestId)
+    API->>ST: Stato = Dispatched
     API-->>SN: 202 Accepted (requestId)
 
-    W->>SB: Consuma il messaggio (per piattaforma)
-    W->>AA: Avvia runbook (job = requestId)
-    W->>ST: Stato = Running (dispatchedAt)
-    AA-->>W: Job in esecuzione / esito (##RESULT##)
-    W->>ST: Stato = Completed / Failed (result)
+    API->>AA: JobMonitor legge stato/esito (##RESULT##)
+    API->>ST: Stato = Running / Completed / Failed
 
     SN->>API: GET /api/v1/wipe/status?requestId=...
     API->>ST: Legge stato
@@ -71,18 +62,14 @@ sequenceDiagram
    **respinta** e ServiceNow apre un task manuale.
 
 3. **Persistenza (write-before-action)** — lo stato viene scritto **prima** di
-   accodare: se qualcosa va storto a valle, la richiesta resta tracciata e
-   ripartibile.
+   avviare il runbook: se qualcosa va storto a valle, la richiesta resta
+   tracciata.
 
-4. **Accodamento** — viene pubblicato un **messaggio canonico** sul topic Service
-   Bus. La **sessione** del messaggio è il seriale del device: questo garantisce
-   che richieste sullo stesso device siano processate in ordine e senza
-   sovrapposizioni. L'API risponde **`202 Accepted`** con il `requestId`.
-
-5. **Dispatch** — il Worker consuma il messaggio dalla sottoscrizione della
-   piattaforma corretta (Windows / Apple / Android) e avvia il **runbook**
-   dedicato su Azure Automation. Il nome del job coincide con il `requestId`,
-   garantendo **idempotenza** (una richiesta = un solo job).
+4. **Dispatch diretto** — la Function seleziona il runbook della piattaforma
+   (Windows / Apple / Android) e lo avvia su Azure Automation tramite ARM. Il
+   nome del job coincide con il `requestId`, garantendo **idempotenza**. L'API
+   risponde **`202 Accepted`** quando il job è stato creato. Un lease atomico
+   per seriale impedisce due elaborazioni contemporanee sullo stesso device.
 
 6. **Esecuzione del wipe** — il runbook di piattaforma esegue la dismissione
    (retire/wipe su Intune, rimozione da Autopilot/ABM/Knox secondo lo scenario) e
@@ -96,18 +83,19 @@ sequenceDiagram
 
 ## 5. Stati di una richiesta
 
-`Accepted` → `Queued` → `Running` → **`Completed`** oppure **`Failed`**
+`Accepted` → `Dispatching` → `Dispatched` → `Running` →
+**`Completed`** oppure **`Failed`**
 (o **`Rejected`** se un guardrail blocca la richiesta all'ingresso).
 
 ## 6. Principi di progetto
 
-- **Disaccoppiamento**: l'ingresso è veloce e non blocca; l'esecuzione avviene in
-  modo asincrono tramite coda.
+- **Praticità**: intake, dispatch e monitoraggio sono visibili in una sola
+  Function App, senza infrastruttura di messaggistica.
 - **Idempotenza**: stesso `requestId` = stesso job, nessuna doppia dismissione.
+- **Serializzazione per device**: un lease in Table Storage consente una sola
+  richiesta attiva per seriale.
 - **Sicurezza**: guardrail read-only prima di ogni azione; i segreti risiedono
   nelle Automation Variables cifrate, non nel codice.
-- **Ordinamento per device**: le sessioni Service Bus serializzano le richieste
-  sullo stesso seriale.
 - **Tracciabilità**: ogni richiesta è persistita e consultabile end-to-end.
 - **Modalità dry-run**: consente di validare l'intero flusso senza eseguire wipe
   reali.
@@ -115,7 +103,7 @@ sequenceDiagram
 ## 7. Sicurezza e rete
 
 - L'API è esposta su HTTPS ed è protetta da **Function Key**.
-- Lo storage e il Service Bus sono raggiunti tramite **private endpoint**.
+- Lo storage è raggiunto tramite **private endpoint**.
 - L'autenticazione verso Microsoft Graph è **app-only con certificato**; le
   credenziali (client id, tenant, thumbprint, chiavi ABM/Knox) sono lette dalle
   **Automation Variables cifrate**.
@@ -132,7 +120,7 @@ occorre completare la configurazione dell'Automation Account:
    Knox/KME per Android), create cifrate e vuote dal deployment.
 
 > Nota di validazione: il dispatch è stato verificato in ambiente reale — la
-> Function worker crea correttamente il job di Automation (nome = `requestId`),
+> Function crea correttamente il job di Automation (nome = `requestId`),
 > passa i parametri attesi al runbook di piattaforma e il monitor aggiorna lo
 > stato della richiesta. Il job di test è terminato in `Failed` unicamente
 > perché i prerequisiti sopra (modulo Graph/certificato) non erano ancora

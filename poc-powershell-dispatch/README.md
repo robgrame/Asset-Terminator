@@ -1,10 +1,9 @@
-# PoC PowerShell — Dispatch su Service Bus + runbook di piattaforma
+# PoC PowerShell — Function unica + runbook di piattaforma
 
 Evoluzione di [`poc-powershell-mock`](../poc-powershell-mock/): la Function **non
-esegue più il wipe**. Riceve la richiesta da ServiceNow, la valida, la mette su
-un **topic Service Bus** e un **worker di backend** instrada la richiesta verso
-il **runbook Azure Automation specifico per piattaforma** già in uso presso il
-cliente.
+esegue il wipe direttamente**. Riceve la richiesta da ServiceNow, la valida,
+salva lo stato e avvia subito il **runbook Azure Automation specifico per
+piattaforma** già in uso presso il cliente.
 
 Il razionale, le alternative valutate e i gap dei runbook attuali sono
 documentati in [`docs/evoluzione-dispatch-runbook.md`](../docs/evoluzione-dispatch-runbook.md).
@@ -12,35 +11,29 @@ documentati in [`docs/evoluzione-dispatch-runbook.md`](../docs/evoluzione-dispat
 ## Architettura
 
 ```
-ServiceNow ──POST /api/v1/wipe──▶ Function App "api"  (WipeIntake, GetStatus)
-                                      │  validazione + guardrail + stato
-                                      ▼
-                            Service Bus topic  asset-disposal
-                              ├─ sub windows (platform='Windows')
-                              ├─ sub apple   (platform='Apple')
-                              └─ sub android (platform='Android')
-                                      ▼
-                             Function App "worker"
-                              ├─ DispatchWindows ─┐
-                              ├─ DispatchApple  ──┼─▶ Azure Automation runbook
-                              ├─ DispatchAndroid ─┘   (ARM job idempotente)
-                              └─ JobMonitor (timer) ─▶ callback ServiceNow
-                                      ▲
-                             Table Storage  wiperequests  (stato + evidenze)
+ServiceNow ──POST /api/v1/wipe──▶ Function App
+                                  ├─ WipeIntake
+                                  │   validazione + guardrail + persistenza
+                                  │   └─▶ Azure Automation runbook (ARM)
+                                  ├─ GetStatus (HTTP)
+                                  └─ JobMonitor (timer) ─▶ callback ServiceNow
+                                           ▲
+                                  Table Storage wiperequests
 ```
 
-### Perché due Function App
+### Una sola Function App
 
-`api` e `worker` girano sullo **stesso App Service Plan** (nessun costo
-aggiuntivo) ma hanno **identità gestite distinte**:
+La Function App usa una sola identità gestita:
 
-| App | Trigger | Permessi |
+| Trigger | Funzione | Permessi |
 |---|---|---|
-| `api` | HTTP (pubblico) | Graph *read-only*, Service Bus **Sender**, Table |
-| `worker` | Service Bus + timer (nessun endpoint pubblico) | Service Bus **Receiver**, Automation **Job Operator**, Table |
+| HTTP | `WipeIntake`, `GetStatus` | Graph *read-only*, Table, Automation **Job Operator** |
+| Timer | `JobMonitor` | Table, Automation **Job Operator** |
 
-L'app esposta su internet non ha quindi alcun permesso per far partire un wipe:
-può solo accodare una richiesta.
+Service Bus non è necessario: dopo il write-before-action, `WipeIntake` crea
+direttamente il job Automation con una chiamata ARM idempotente.
+Un lease atomico nella tabella di stato impedisce l'avvio concorrente di due
+richieste con `requestId` diversi sullo stesso seriale.
 
 ## Contratto REST
 
@@ -66,9 +59,10 @@ Risposte:
 
 | Codice | Significato |
 |---|---|
-| `202` | Richiesta accodata. Header `Location: /api/v1/wipe/status?requestId=...` |
+| `202` | Richiesta processata e runbook avviato (`Dispatched`, temporaneamente `Dispatching` durante il recovery), oppure dry-run completato (`Completed`). Header `Location: /api/v1/wipe/status?requestId=...` |
 | `200` | `requestId` già visto → stato corrente, `duplicate: true` |
 | `400` | Payload non valido |
+| `409` | Esiste già una richiesta attiva per lo stesso dispositivo |
 | `422` | `status: Rejected` + `reason` (`DeviceNotManagedByIntune`, `GuardrailFailed`, `AmbiguousPlatform`) → ServiceNow apre un task manuale |
 | `502` | Graph non raggiungibile |
 
@@ -80,9 +74,9 @@ interrogando `managedDevices.operatingSystem` in Intune prima di instradare.
 Restituisce lo stato dalla macchina a stati:
 
 ```
-Accepted → Queued → Dispatching → Dispatched → Running → Completed
-                                                       ↘ PartiallyCompleted
-                                                       ↘ Failed
+Accepted → Dispatching → Dispatched → Running → Completed
+                                      ↘ PartiallyCompleted
+                                      ↘ Failed
 Rejected (guardrail)   DispatchFailed (runbook non avviabile)
 ```
 
@@ -91,9 +85,9 @@ il processo deve poter distinguere da un successo pieno.
 
 ## Meccanismo di dispatch
 
-Il worker crea il job con
+`WipeIntake` crea il job con
 `PUT .../automationAccounts/{aa}/jobs/{jobName}?api-version=2023-11-01` usando la
-managed identity. Il `jobName` è il `requestId`, quindi **un replay del messaggio
+managed identity. Il `jobName` è il `requestId`, quindi **ripetere la richiesta
 non crea un secondo job**.
 
 I **webhook non sono supportati**: il token vive nell'URL (quindi finisce nei log
@@ -205,9 +199,8 @@ cd poc-powershell-dispatch/infra
 
 Se la subscription non richiede connettività privata, aggiungere
 `-PublicEndpoints`. Il deploy usa `infra/main-public.bicep` e non crea VNet,
-private endpoint o zone DNS private. Storage e Service Bus continuano a usare
-managed identity e RBAC, ma sono raggiungibili attraverso gli endpoint di rete
-pubblici:
+private endpoint o zone DNS private. Storage continua a usare managed identity
+e RBAC, ma è raggiungibile attraverso l'endpoint di rete pubblico:
 
 ```powershell
 cd poc-powershell-dispatch/infra
@@ -225,12 +218,17 @@ cd poc-powershell-dispatch/infra
 ```
 
 Questa variante non è compatibile con Azure Policy che impongono
-`publicNetworkAccess=Disabled` per Storage o Service Bus.
+`publicNetworkAccess=Disabled` per Storage.
 
-Lo script provisiona l'infrastruttura, genera i `run.ps1` autosufficienti
-(`build.ps1`) e pubblica **entrambe** le Function App.
+Durante la migrazione, dopo la pubblicazione riuscita, lo script rimuove
+automaticamente la Function App worker, la sua managed identity e il namespace
+Service Bus con lo stesso prefisso/ambiente. Nei nuovi ambienti non trova
+risorse e non esegue eliminazioni.
 
-Il deploy usa PowerShell 7.6 per entrambe le Function App e crea il Runtime
+Lo script provisiona l'infrastruttura, genera gli `handler.ps1` autosufficienti
+(`build.ps1`) e pubblica la singola Function App.
+
+Il deploy usa PowerShell 7.6 per la Function App e crea il Runtime
 Environment Automation `PowerShell-76`, nel quale installa
 `Microsoft.Graph.Authentication` prima di collegare e pubblicare i runbook. La
 versione predefinita del modulo è `2.39.0` e può essere modificata con
@@ -274,8 +272,8 @@ I permessi di wipe restano sull'app registration usata dai runbook, non su quest
 
 ### Connettività privata
 
-Come per il PoC mock, la subscription applica una policy che forza
-`publicNetworkAccess=Disabled` su storage e Service Bus. Il template crea quindi
+Come per il PoC mock, la subscription può applicare una policy che forza
+`publicNetworkAccess=Disabled` sullo storage. Il template crea quindi
 VNet, subnet delegata, private endpoint e private DNS zone. Per un ambiente senza
 quella policy si può disattivare con `usePrivateEndpoints=false`.
 
@@ -330,22 +328,21 @@ chiaro nell'URL**: vanno revocati e rigenerati, e non vanno versionati.
 
 ```
 poc-powershell-dispatch/
-├── build.ps1                 genera run.ps1 autosufficienti con function inline
-├── shared/Modules/           AT.Common, AT.Graph, AT.State, AT.Messaging,
+├── build.ps1                 genera handler.ps1 autosufficienti con function inline
+├── shared/Modules/           AT.Common, AT.Graph, AT.State,
 │                             AT.Automation, AT.Dispatch
-├── api/                      WipeIntake (POST), GetStatus (GET)
-├── worker/                   DispatchWindows/Apple/Android, JobMonitor
+├── api/                      WipeIntake (POST), GetStatus (GET), JobMonitor (timer)
 ├── runbooks/                 i tre runbook di piattaforma corretti
 ├── infra/main.bicep          infrastruttura completa
 ├── infra/deploy.ps1          provisioning + publish
 └── samples/                  payload di esempio
 ```
 
-Ogni Function mantiene il proprio handler in `handler.ps1`. `build.ps1` genera
-il relativo `run.ps1`, copiando direttamente nel file tutte le function e le
+Ogni Function mantiene la logica del trigger in `source.ps1`. `build.ps1` genera
+il relativo `handler.ps1`, copiando direttamente nel file tutte le function e le
 inizializzazioni richieste da `shared/Modules`. Il risultato non usa here-string,
 `New-Module`, `Export-ModuleMember` o import esterni: il cliente può leggere e
 cercare il codice come un unico script PowerShell. Le modifiche continuano ad
-avere un'unica sorgente nei PSM1; non modificare direttamente i `run.ps1`
-generati. Il deploy verifica la struttura flat e che gli `handler.ps1` siano
+avere un'unica sorgente nei PSM1; non modificare direttamente gli `handler.ps1`
+generati. Il deploy verifica la struttura flat e che i soli `source.ps1` siano
 esclusi dal pacchetto.
