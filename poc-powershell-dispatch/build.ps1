@@ -11,8 +11,9 @@
     module used by that Function, followed by its handler code.
 
     The maintainable sources remain handler.ps1 and shared/Modules/*.psm1.
-    Embedded modules are loaded as dynamic modules so their script-scoped state
-    remains isolated exactly as it is when loading separate .psm1 files.
+    Module-only directives are removed and the PowerShell functions are written
+    directly into run.ps1 so a reviewer can read and search the complete code
+    without decoding strings or following imports.
 
     Run this before `func azure functionapp publish`, or use infra/deploy.ps1
     which calls it automatically.
@@ -35,26 +36,62 @@ $functions = [ordered]@{
     'worker/JobMonitor'      = @('AT.Common', 'AT.State', 'AT.Automation')
 }
 
-function Get-EmbeddedModuleBlock {
+function Get-InlinedModuleBlock {
     param([Parameter(Mandatory)] [string[]] $ModuleNames)
 
+    $seenFunctions = @{}
+    $seenScriptVariables = @{}
     $blocks = foreach ($moduleName in $ModuleNames) {
         $modulePath = Join-Path $moduleRoot "$moduleName.psm1"
         if (-not (Test-Path $modulePath)) { throw "Shared module not found: $modulePath" }
 
         $moduleSource = Get-Content $modulePath -Raw
-        # Dependencies are already embedded and imported by the generated file.
-        $moduleSource = $moduleSource -replace '(?m)^[ \t]*Import-Module[^\r\n]*AT\.[A-Za-z]+\.psm1[^\r\n]*\r?\n?', ''
+        $cleanLines = [System.Collections.Generic.List[string]]::new()
+        $skippingExport = $false
+
+        foreach ($line in [regex]::Split($moduleSource, '\r?\n')) {
+            if ($skippingExport) {
+                $skippingExport = $line.TrimEnd().EndsWith('`')
+                continue
+            }
+            if ($line -match '^[ \t]*#Requires[ \t]+-Version\b') { continue }
+            if ($line -match '^[ \t]*Import-Module[^\r\n]*AT\.[A-Za-z]+\.psm1') { continue }
+            if ($line -match '^[ \t]*Export-ModuleMember\b') {
+                $skippingExport = $line.TrimEnd().EndsWith('`')
+                continue
+            }
+            $cleanLines.Add($line)
+        }
+
+        $moduleSource = ($cleanLines -join [Environment]::NewLine).Trim()
+        $moduleFunctions = [regex]::Matches(
+            $moduleSource,
+            '(?m)^[ \t]*function[ \t]+([A-Za-z0-9_-]+)[ \t]*\{'
+        ) | ForEach-Object { $_.Groups[1].Value }
+
+        foreach ($functionName in $moduleFunctions) {
+            if ($seenFunctions.ContainsKey($functionName)) {
+                throw "Function '$functionName' is defined by both $($seenFunctions[$functionName]) and $moduleName."
+            }
+            $seenFunctions[$functionName] = $moduleName
+        }
+
+        $scriptVariables = [regex]::Matches(
+            $moduleSource,
+            '\$script:([A-Za-z_][A-Za-z0-9_]*)'
+        ) | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+
+        foreach ($variableName in $scriptVariables) {
+            if ($seenScriptVariables.ContainsKey($variableName)) {
+                throw "Script variable '$variableName' is used by both $($seenScriptVariables[$variableName]) and $moduleName."
+            }
+            $seenScriptVariables[$variableName] = $moduleName
+        }
 
         @"
-# region Embedded module: $moduleName.psm1
-`$embeddedSource = @'
-$($moduleSource.TrimEnd())
-'@
-`$embeddedModule = New-Module -Name 'Embedded.$moduleName' -ScriptBlock ([scriptblock]::Create(`$embeddedSource))
-Import-Module `$embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: $moduleName.psm1
+# region Inlined functions from: $moduleName.psm1
+$moduleSource
+# endregion Inlined functions from: $moduleName.psm1
 "@
     }
 
@@ -80,7 +117,7 @@ foreach ($entry in $functions.GetEnumerator()) {
         throw "Function handler does not contain an AT module import: $handlerPath"
     }
 
-    $embeddedModules = Get-EmbeddedModuleBlock -ModuleNames $entry.Value
+    $inlinedModules = Get-InlinedModuleBlock -ModuleNames $entry.Value
     $generatedHeader = @"
 # -----------------------------------------------------------------------------
 # GENERATED FILE - DO NOT EDIT DIRECTLY.
@@ -89,7 +126,7 @@ foreach ($entry in $functions.GetEnumerator()) {
 # Regenerate with: ./build.ps1 -Clean
 # -----------------------------------------------------------------------------
 
-$embeddedModules
+$inlinedModules
 "@
 
     $runSource = [regex]::Replace($handlerSource, $importPattern, '')
@@ -102,7 +139,7 @@ $embeddedModules
 
     $tokens = $null
     $parseErrors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($runPath, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($runPath, [ref]$tokens, [ref]$parseErrors)
     if ($parseErrors.Count -gt 0) {
         throw "Generated script is invalid ($runPath): $($parseErrors -join '; ')"
     }
@@ -111,13 +148,29 @@ $embeddedModules
     if ($generatedSource -match $importPattern) {
         throw "Generated script still contains an external AT module import: $runPath"
     }
+    if ($generatedSource -match '(?m)^[ \t]*(?:Export-ModuleMember|New-Module)\b' -or
+        $generatedSource -match '\$embeddedSource\b') {
+        throw "Generated script still contains dynamic-module infrastructure: $runPath"
+    }
+
+    $duplicateFunctions = $ast.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },
+        $true
+    ) | Group-Object Name | Where-Object Count -gt 1
+    if ($duplicateFunctions) {
+        throw "Generated script contains duplicate functions ($runPath): $(($duplicateFunctions.Name) -join ', ')"
+    }
 
     foreach ($moduleName in $entry.Value) {
-        $regionPattern = "(?m)^# region Embedded module: $([regex]::Escape($moduleName))\.psm1\r?$"
+        $regionPattern = "(?m)^# region Inlined functions from: $([regex]::Escape($moduleName))\.psm1\r?$"
         if ([regex]::Matches($generatedSource, $regionPattern).Count -ne 1) {
-            throw "Generated script must embed $moduleName.psm1 exactly once: $runPath"
+            throw "Generated script must inline $moduleName.psm1 exactly once: $runPath"
         }
     }
 
-    Write-Host "==> $($entry.Key)/run.ps1 generated with $($entry.Value.Count) embedded module(s)" -ForegroundColor Green
+    $functionCount = @($ast.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },
+        $true
+    )).Count
+    Write-Host "==> $($entry.Key)/run.ps1 generated with $functionCount directly readable function(s)" -ForegroundColor Green
 }

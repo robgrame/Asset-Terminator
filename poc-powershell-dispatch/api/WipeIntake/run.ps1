@@ -25,10 +25,7 @@ param($Request, $TriggerMetadata)
 # Regenerate with: ./build.ps1 -Clean
 # -----------------------------------------------------------------------------
 
-# region Embedded module: AT.Common.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# region Inlined functions from: AT.Common.psm1
 # Shared helpers for the Asset-Terminator dispatch PoC:
 # app settings, structured logging, managed-identity tokens, platform mapping
 # and a minimal JSON path resolver used by the runbook parameter binding.
@@ -343,29 +340,16 @@ function ConvertFrom-JsonBody {
     }
     return $Body
 }
-
-Export-ModuleMember -Function Get-AppSetting, Get-AppSettingBool, Get-AppSettingInt, Write-AtLog, `
-    Get-AppInsightsConfig, Send-AppInsightsTelemetry, Write-AtAudit, `
-    Get-ManagedIdentityToken, ConvertTo-EnrollmentPlatform, ConvertTo-ValidScenario, `
-    Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.Common' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.Common.psm1
-# region Embedded module: AT.Graph.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
-# Graph.psm1
-# Self-contained Microsoft Graph helpers for the single-function wipe mock.
+# endregion Inlined functions from: AT.Common.psm1
+# region Inlined functions from: AT.Graph.psm1
+# Graph helpers for the dispatch intake Function.
 #
 # Authentication: OAuth2 *client credentials* using an app registration + client
 # secret (GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET). No managed
 # identity and no certificate are used. The token is cached in-process until a
 # minute before it expires.
 #
-# ALL configuration comes from the Function App Application Settings (environment
+# Configuration comes from the Function App Application Settings (environment
 # variables). Every knob has a safe default so the mock runs with only the three
 # GRAPH_* credential settings populated. Configurable settings:
 #   GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET   (credentials, required)
@@ -376,39 +360,8 @@ $embeddedSource = @'
 #   WIPE_KEEP_ENROLLMENT_DATA (default false)
 #   WIPE_KEEP_USER_DATA       (default false)
 
-$script:TokenCache = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
 
-function Get-AppSetting {
-    <#
-        .SYNOPSIS
-            Reads a Function Application Setting (environment variable), returning
-            $Default when it is unset or empty.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $Name,
-        [string] $Default
-    )
-    $value = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
-    return $value
-}
-
-function Get-AppSettingBool {
-    <#
-        .SYNOPSIS
-            Reads a boolean Function Application Setting, returning $Default when
-            unset or not parseable.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string] $Name,
-        [bool] $Default = $false
-    )
-    $value = [Environment]::GetEnvironmentVariable($Name)
-    if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
-    try { return [System.Convert]::ToBoolean($value) } catch { return $Default }
-}
+$script:GraphTokenCache = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
 
 function Write-MockLog {
     <#
@@ -470,8 +423,8 @@ function Get-GraphToken {
     [CmdletBinding()]
     param()
 
-    if ($script:TokenCache -and $script:TokenCache.ExpiresOn -gt (Get-Date).AddMinutes(1)) {
-        return $script:TokenCache.AccessToken
+    if ($script:GraphTokenCache -and $script:GraphTokenCache.ExpiresOn -gt (Get-Date).AddMinutes(1)) {
+        return $script:GraphTokenCache.AccessToken
     }
 
     $tenantId     = $env:GRAPH_TENANT_ID
@@ -494,11 +447,11 @@ function Get-GraphToken {
         -ContentType 'application/x-www-form-urlencoded' `
         -Body $body
 
-    $script:TokenCache = @{
+    $script:GraphTokenCache = @{
         AccessToken = $response.access_token
         ExpiresOn   = (Get-Date).AddSeconds([int]$response.expires_in)
     }
-    return $script:TokenCache.AccessToken
+    return $script:GraphTokenCache.AccessToken
 }
 
 function Invoke-GraphRequest {
@@ -787,19 +740,8 @@ function Get-AutopilotDeviceStatus {
     }
     return [pscustomobject]@{ Present = $false; AutopilotDeviceId = $null; SerialNumber = $SerialNumber }
 }
-
-Export-ModuleMember -Function Write-MockLog, ConvertTo-DeviceOs, Get-GraphToken, Invoke-GraphRequest, `
-    Get-IntuneManagedDevice, Remove-AutopilotDevice, Invoke-IntuneWipe, Get-DeviceWipeStatus, `
-    Get-AutopilotDeviceStatus, Get-AppSetting, Get-AppSettingBool
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.Graph' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.Graph.psm1
-# region Embedded module: AT.State.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# endregion Inlined functions from: AT.Graph.psm1
+# region Inlined functions from: AT.State.psm1
 # Durable request state on Azure Table Storage, accessed over REST with a
 # managed-identity bearer token (the storage account has shared key access
 # disabled). PartitionKey = platform, RowKey = requestId.
@@ -936,17 +878,8 @@ function Find-WipeRequestState {
     if ($null -eq $response -or -not ($response.PSObject.Properties.Name -contains 'value')) { return @() }
     return @($response.value)
 }
-
-Export-ModuleMember -Function Save-WipeRequestState, Update-WipeRequestState, Get-WipeRequestState, Find-WipeRequestState
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.State' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.State.psm1
-# region Embedded module: AT.Messaging.psm1
-$embeddedSource = @'
-#Requires -Version 7.6
-
+# endregion Inlined functions from: AT.State.psm1
+# region Inlined functions from: AT.Messaging.psm1
 # Service Bus publishing over the REST API with a managed-identity token.
 #
 # The REST API is used instead of an output binding because the pipeline needs
@@ -1007,13 +940,7 @@ function Send-ServiceBusMessage {
 
     return $MessageId
 }
-
-Export-ModuleMember -Function Send-ServiceBusMessage
-'@
-$embeddedModule = New-Module -Name 'Embedded.AT.Messaging' -ScriptBlock ([scriptblock]::Create($embeddedSource))
-Import-Module $embeddedModule -Global -Force
-Remove-Variable embeddedSource, embeddedModule -ErrorAction SilentlyContinue
-# endregion Embedded module: AT.Messaging.psm1
+# endregion Inlined functions from: AT.Messaging.psm1
 
 
 function Write-Json {
