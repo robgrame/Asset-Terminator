@@ -44,6 +44,17 @@ function Remove-CurrentDeviceLease {
     }
 }
 
+function Get-OptionalPayloadProperty {
+    param(
+        [Parameter(Mandatory)] $Payload,
+        [Parameter(Mandatory)] [string] $Name
+    )
+
+    $property = $Payload.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 $payload = ConvertFrom-JsonBody -Body $Request.Body
 
 # --- Validation -------------------------------------------------------------
@@ -52,35 +63,47 @@ if (-not $payload) {
     return
 }
 
-if (-not $payload.serialNumber -and -not $payload.imei -and -not $payload.managedDeviceId -and -not $payload.deviceName) {
+$inputSerialNumber = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'serialNumber')
+$inputImei = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'imei')
+$inputManagedDeviceId = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'managedDeviceId')
+$inputDeviceName = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'deviceName')
+$inputScenario = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'scenario')
+$inputOperatingSystem = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'operatingSystem')
+$inputRequestId = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'requestId')
+$inputDryRun = Get-OptionalPayloadProperty -Payload $payload -Name 'dryRun'
+$inputUserConfirmed = Get-OptionalPayloadProperty -Payload $payload -Name 'userConfirmed'
+$inputMdmServerId = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'mdmServerId')
+$inputCallbackUrl = [string](Get-OptionalPayloadProperty -Payload $payload -Name 'callbackUrl')
+
+if (-not $inputSerialNumber -and -not $inputImei -and -not $inputManagedDeviceId -and -not $inputDeviceName) {
     Write-Json -StatusCode 400 -Object @{ error = 'At least one of serialNumber, imei, managedDeviceId or deviceName is required.' }
     return
 }
 
-$scenario = ConvertTo-ValidScenario -Scenario ([string]$payload.scenario)
+$scenario = ConvertTo-ValidScenario -Scenario $inputScenario
 if (-not $scenario) {
     Write-Json -StatusCode 400 -Object @{ error = 'scenario must be one of: Retirement, Sale, Disposal, LostStolen.' }
     return
 }
 
-$platform = ConvertTo-EnrollmentPlatform -OperatingSystem ([string]$payload.operatingSystem)
+$platform = ConvertTo-EnrollmentPlatform -OperatingSystem $inputOperatingSystem
 if (-not $platform) {
     Write-Json -StatusCode 400 -Object @{ error = 'operatingSystem is required and must map to Windows, Apple or Android (aliases: win/macos/ios/ipados/android/mobile).' }
     return
 }
 
 $correlationId = [guid]::NewGuid().ToString()
-$requestId = if ($payload.requestId) { [string]$payload.requestId } else { $correlationId }
+$requestId = if ($inputRequestId) { $inputRequestId } else { $correlationId }
 
 $dryRun = Get-AppSettingBool -Name 'DEFAULT_DRY_RUN' -Default $false
-if ($null -ne $payload.dryRun) { $dryRun = [System.Convert]::ToBoolean($payload.dryRun) }
+if ($null -ne $inputDryRun) { $dryRun = [System.Convert]::ToBoolean($inputDryRun) }
 
 $logProps = @{
     correlationId = $correlationId
     requestId     = $requestId
     scenario      = $scenario
     platform      = $platform
-    serialNumber  = [string]$payload.serialNumber
+    serialNumber  = $inputSerialNumber
     dryRun        = $dryRun
 }
 
@@ -111,9 +134,9 @@ catch {
 $device = $null
 try {
     $device = Get-IntuneManagedDevice `
-        -ManagedDeviceId ([string]$payload.managedDeviceId) `
-        -DeviceName ([string]$payload.deviceName) `
-        -SerialNumber ([string]$payload.serialNumber) `
+        -ManagedDeviceId $inputManagedDeviceId `
+        -DeviceName $inputDeviceName `
+        -SerialNumber $inputSerialNumber `
         -LogProperties $logProps
 }
 catch {
@@ -172,7 +195,7 @@ if (Get-AppSettingBool -Name 'GUARDRAIL_REQUIRE_ENCRYPTION' -Default $true) {
 }
 
 if (Get-AppSettingBool -Name 'GUARDRAIL_REQUIRE_USER_CONFIRMATION' -Default $true) {
-    $confirmed = [bool]$payload.userConfirmed
+    $confirmed = [bool]$inputUserConfirmed
     $guardrails.Add([pscustomobject]@{ name = 'UserConfirmation'; passed = $confirmed; detail = "userConfirmed=$confirmed" })
 }
 
@@ -210,7 +233,7 @@ $message = [ordered]@{
     scenario      = $scenario
     device        = [ordered]@{
         serialNumber    = [string]$device.serialNumber
-        imei            = [string]$payload.imei
+        imei            = $inputImei
         deviceName      = [string]$device.deviceName
         managedDeviceId = [string]$device.id
         operatingSystem = [string]$device.operatingSystem
@@ -221,10 +244,10 @@ $message = [ordered]@{
         removeFromEnrollmentPlatform = $removeFromPlatform
         keepUserData                 = (Get-AppSettingBool -Name 'WIPE_KEEP_USER_DATA' -Default $false)
         keepEnrollmentData           = (Get-AppSettingBool -Name 'WIPE_KEEP_ENROLLMENT_DATA' -Default $false)
-        mdmServerId                  = [string]$payload.mdmServerId
+        mdmServerId                  = $inputMdmServerId
         dryRun                       = $dryRun
     }
-    callbackUrl   = [string]$payload.callbackUrl
+    callbackUrl   = $inputCallbackUrl
     acceptedAt    = (Get-Date).ToUniversalTime().ToString('o')
 }
 
@@ -264,11 +287,11 @@ try {
         status          = 'Accepted'
         scenario        = $scenario
         serialNumber    = [string]$device.serialNumber
-        imei            = [string]$payload.imei
+        imei            = $inputImei
         deviceName      = [string]$device.deviceName
         managedDeviceId = [string]$device.id
         operatingSystem = [string]$device.operatingSystem
-        callbackUrl     = [string]$payload.callbackUrl
+        callbackUrl     = $inputCallbackUrl
         dryRun          = $dryRun
         attempts        = 0
         acceptedAt      = (Get-Date).ToUniversalTime()
