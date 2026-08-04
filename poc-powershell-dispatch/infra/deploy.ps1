@@ -3,11 +3,12 @@
     Deploys the Asset-Terminator dispatch PoC (Service Bus + runbook dispatcher).
 
 .DESCRIPTION
-    1. Provisions the infrastructure with main.bicep: shared App Service plan,
+    1. Provisions the infrastructure with main.bicep (or main-public.bicep when
+       -PublicEndpoints is specified): shared App Service plan,
        two Function Apps (api + worker) with dedicated user-assigned identities,
        a Service Bus namespace with the asset-disposal topic and one subscription
-       per platform, an Automation Account, the state table and the private
-       endpoints required by the subscription policy.
+       per platform, an Automation Account and the state table. The default
+       template includes private connectivity; the public variant omits it.
     2. Synchronises the shared PowerShell modules into both apps (build.ps1).
     3. Publishes both Function Apps.
 
@@ -38,6 +39,7 @@ param(
     [Parameter(Mandatory)] [string] $GraphClientId,
     [Parameter(Mandatory)] [string] $GraphClientSecret,
 
+    [switch] $PublicEndpoints,
     [switch] $SkipPublish
 )
 
@@ -55,13 +57,15 @@ if (-not $subId) { throw 'Unable to resolve the current subscription. Run "az lo
 Write-Host "==> Ensuring resource group '$ResourceGroup' ($Location)" -ForegroundColor Cyan
 az group create --name $ResourceGroup --location $Location --subscription $subId --output none
 
-Write-Host "==> Deploying infrastructure (main.bicep)" -ForegroundColor Cyan
+$templateName = if ($PublicEndpoints) { 'main-public.bicep' } else { 'main.bicep' }
+$templatePath = Join-Path $infraDir $templateName
+Write-Host "==> Deploying infrastructure ($templateName)" -ForegroundColor Cyan
 $deployName = "attdisp-$(Get-Date -Format yyyyMMddHHmmss)"
 $outputs = az deployment group create `
     --name $deployName `
     --subscription $subId `
     --resource-group $ResourceGroup `
-    --template-file (Join-Path $infraDir 'main.bicep') `
+    --template-file $templatePath `
     --parameters `
         namePrefix=$NamePrefix `
         location=$Location `

@@ -201,6 +201,32 @@ cd poc-powershell-dispatch/infra
     -GraphClientSecret <secret>
 ```
 
+### Deploy semplificato con endpoint pubblici
+
+Se la subscription non richiede connettività privata, aggiungere
+`-PublicEndpoints`. Il deploy usa `infra/main-public.bicep` e non crea VNet,
+private endpoint o zone DNS private. Storage e Service Bus continuano a usare
+managed identity e RBAC, ma sono raggiungibili attraverso gli endpoint di rete
+pubblici:
+
+```powershell
+cd poc-powershell-dispatch/infra
+
+./deploy.ps1 `
+    -ResourceGroup DeviceLifecycleAction `
+    -Subscription <subscription-id> `
+    -Location westeurope `
+    -NamePrefix attdisp02 `
+    -Env dev `
+    -GraphTenantId <tenant-id> `
+    -GraphClientId <app-id> `
+    -GraphClientSecret <secret> `
+    -PublicEndpoints
+```
+
+Questa variante non è compatibile con Azure Policy che impongono
+`publicNetworkAccess=Disabled` per Storage o Service Bus.
+
 Lo script provisiona l'infrastruttura, sincronizza i moduli condivisi
 (`build.ps1`) e pubblica **entrambe** le Function App.
 
