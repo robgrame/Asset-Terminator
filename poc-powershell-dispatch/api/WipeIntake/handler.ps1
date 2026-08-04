@@ -1364,6 +1364,11 @@ function Get-OptionalPayloadProperty {
         [Parameter(Mandatory)] [string] $Name
     )
 
+    if ($Payload -is [System.Collections.IDictionary]) {
+        if ($Payload.Contains($Name)) { return $Payload[$Name] }
+        return $null
+    }
+
     $property = $Payload.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value
