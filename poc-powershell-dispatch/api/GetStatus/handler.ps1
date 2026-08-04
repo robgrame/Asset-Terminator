@@ -341,7 +341,9 @@ function Get-JsonPropertyValue {
     )
 
     if ($InputObject -is [System.Collections.IDictionary]) {
-        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        foreach ($key in $InputObject.Keys) {
+            if ([string]$key -ieq $Name) { return $InputObject[$key] }
+        }
         return $null
     }
 
