@@ -4,8 +4,8 @@
 #
 # Dispatch is always done through ARM:
 #   PUT .../automationAccounts/{aa}/jobs/{jobName} with a managed-identity token.
-# The client chooses jobName, so replaying the same Service Bus message never
-# starts a duplicate job, and the job status/output can be polled
+# The client chooses jobName, so replaying the same request never starts a
+# duplicate job, and the job status/output can be polled
 # deterministically. Webhooks are deliberately not supported: their token lives
 # in the URL, they cannot be made idempotent and they return no job status.
 

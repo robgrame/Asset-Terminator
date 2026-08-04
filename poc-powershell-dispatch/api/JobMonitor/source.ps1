@@ -11,16 +11,12 @@
 #   3. on a terminal status, fetch the job output and extract the structured
 #      '##RESULT## {json}' line;
 #   4. persist the outcome and the technical evidence;
-#   5. send the ServiceNow callback (with retry, then a dead-letter queue).
+#   5. send the ServiceNow callback and persist any delivery failure.
 #
 # Requests older than the platform timeout are failed explicitly so they never
 # stay in flight forever.
 
 param($Timer)
-
-Import-Module "$PSScriptRoot/../Modules/AT.Common.psm1" -Force
-Import-Module "$PSScriptRoot/../Modules/AT.State.psm1" -Force
-Import-Module "$PSScriptRoot/../Modules/AT.Automation.psm1" -Force
 
 function Send-ServiceNowCallback {
     param(
@@ -65,7 +61,7 @@ function Resolve-RequestStatus {
     return 'Completed'
 }
 
-$inFlight = @('Dispatched', 'Running')
+$inFlight = @('Dispatching', 'Dispatched', 'Running')
 $filter = ($inFlight | ForEach-Object { "status eq '$_'" }) -join ' or '
 
 try {
@@ -123,6 +119,12 @@ foreach ($request in $requests) {
                 status = 'Failed'; errorMessage = 'Automation job not found and request timed out.'
                 completedAt = (Get-Date).ToUniversalTime()
             }
+            try {
+                Unlock-WipeDevice -SerialNumber ([string]$request.serialNumber) -RequestId $requestId | Out-Null
+            }
+            catch {
+                Write-AtLog -Level 'Error' -Message "JobMonitor: failed to release the expired device lease: $($_.Exception.Message)" -Properties $logProps
+            }
         }
         continue
     }
@@ -135,9 +137,22 @@ foreach ($request in $requests) {
                 status = 'Failed'; errorMessage = "Runbook job timeout after $timeoutMinutes minutes (last status: $($job.Status))."
                 completedAt = (Get-Date).ToUniversalTime()
             }
+            try {
+                Unlock-WipeDevice -SerialNumber ([string]$request.serialNumber) -RequestId $requestId | Out-Null
+            }
+            catch {
+                Write-AtLog -Level 'Error' -Message "JobMonitor: failed to release the timed-out device lease: $($_.Exception.Message)" -Properties $logProps
+            }
         }
-        elseif ($request.status -ne 'Running' -and $job.Status -eq 'Running') {
-            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{ status = 'Running' }
+        else {
+            $progress = @{ automationJobId = [string]$job.JobId }
+            if ($job.Status -eq 'Running') {
+                $progress.status = 'Running'
+            }
+            elseif ($request.status -eq 'Dispatching') {
+                $progress.status = 'Dispatched'
+            }
+            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties $progress
         }
         continue
     }
@@ -156,6 +171,7 @@ foreach ($request in $requests) {
         status       = $status
         completedAt  = (Get-Date).ToUniversalTime()
         jobStatus    = [string]$job.Status
+        automationJobId = [string]$job.JobId
         errorMessage = $errorMessage
     }
     if ($result) { $updates['resultJson'] = $result }
@@ -163,6 +179,12 @@ foreach ($request in $requests) {
     elseif ($output) { $updates['rawOutput'] = ([string]$output).Substring(0, [Math]::Min(30000, ([string]$output).Length)) }
 
     Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties $updates
+    try {
+        Unlock-WipeDevice -SerialNumber ([string]$request.serialNumber) -RequestId $requestId | Out-Null
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "JobMonitor: failed to release the terminal device lease: $($_.Exception.Message)" -Properties $logProps
+    }
 
     $logProps.status = $status
     Write-AtLog -Level 'Information' -Message 'JobMonitor: request reached a terminal state.' -Properties $logProps
@@ -186,7 +208,7 @@ foreach ($request in $requests) {
             managedDeviceId = $request.managedDeviceId
         }
         automationJobName = $jobName
-        automationJobId   = $request.automationJobId
+        automationJobId   = [string]$job.JobId
         dispatchedAt      = $request.dispatchedAt
         completedAt       = $updates.completedAt.ToString('o')
         errorMessage      = $errorMessage

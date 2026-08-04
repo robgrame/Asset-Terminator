@@ -1,4 +1,4 @@
 local.settings.json
 *.md
 samples/
-**/handler.ps1
+**/source.ps1

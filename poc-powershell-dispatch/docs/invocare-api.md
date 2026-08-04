@@ -72,8 +72,10 @@ Base URL: `https://<fqdn>` (es. `https://attdisp-func-api-dev.azurewebsites.net`
 | `requestId`       | no           | Se omesso viene generato un GUID. Usato per **idempotenza**.                      |
 | `callbackUrl`     | no           | URL notificato a fine elaborazione (se configurato).                             |
 
-Risposta tipica: **`202 Accepted`** con `requestId`, `status: Queued`, l'esito dei
-guardrail e un header `Location` verso lo stato.
+Risposta tipica: **`202 Accepted`** con `requestId`, `status: Completed` per un
+dry-run oppure `status: Dispatched` per un job reale. In caso di recovery dello
+stato, il job già avviato può rispondere `Dispatching` ed essere riconciliato da
+`JobMonitor`. La risposta include anche i guardrail e l'header `Location`.
 
 ## 4. Invocazione interattiva con `iwr`
 
@@ -96,7 +98,7 @@ $resp = iwr -Uri "https://$fqdn/api/v1/wipe?code=$key" `
 $resp.StatusCode                 # 202
 $result = $resp.Content | ConvertFrom-Json
 $result.requestId
-$result.status                   # Queued
+$result.status                   # Completed (dry-run) | Dispatched (reale)
 ```
 
 In alternativa, con la chiave nell'header:
@@ -115,7 +117,7 @@ $resp = iwr -Uri "https://$fqdn/api/v1/wipe" `
 $reqId = $result.requestId
 $stResp = iwr -Uri "https://$fqdn/api/v1/wipe/status?requestId=$reqId&code=$key" -Method Get
 $state  = $stResp.Content | ConvertFrom-Json
-$state.status              # Queued | Running | Completed | Failed | Rejected
+$state.status              # Dispatched | Running | Completed | Failed | Rejected
 $state.automationJobName
 $state.errorMessage
 $state.result
@@ -181,16 +183,17 @@ Uso:
 
 | Codice | Significato                                                                 |
 |--------|----------------------------------------------------------------------------|
-| `202`  | Richiesta accettata e accodata su Service Bus.                             |
+| `202`  | Richiesta accettata: dry-run completato o runbook avviato.                 |
 | `200`  | `requestId` duplicato: ritorna lo stato esistente (idempotenza).           |
 | `400`  | Payload non valido (JSON, campi obbligatori o scenario/OS non riconosciuti).|
+| `409`  | Esiste già una richiesta attiva per lo stesso dispositivo.                 |
 | `422`  | Respinta: device non gestito da Intune, piattaforma ambigua o guardrail KO.|
-| `502`  | Errore nell'interrogazione di Microsoft Graph.                             |
-| `500`  | Errore interno (persistenza stato o pubblicazione messaggio).             |
+| `500`  | Errore interno (persistenza stato o configurazione dispatch).             |
+| `502`  | Errore Graph oppure mancato avvio del runbook tramite ARM.                 |
 
 ## 7. Note
 
-- In `dryRun=true` i guardrail vengono valutati ma non bloccano l'accodamento;
+- In `dryRun=true` i guardrail vengono valutati ma non bloccano la simulazione;
   in `dryRun=false` un guardrail fallito produce `422 Rejected`.
 - Lo stato è consultabile in qualsiasi momento tramite `requestId`.
 - Per l'esecuzione **reale** dei runbook servono i prerequisiti descritti nel

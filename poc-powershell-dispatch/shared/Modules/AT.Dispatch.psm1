@@ -1,11 +1,8 @@
 #Requires -Version 7.6
 
-# Shared dispatch handler used by the three platform-specific Service Bus
-# triggers (DispatchWindows / DispatchApple / DispatchAndroid).
-#
-# Responsibility: translate one canonical message into one Automation runbook
-# job. It deliberately does NOT wait for the runbook to finish - JobMonitor
-# reconciles the outcome over time.
+# Translates one canonical intake payload into one Automation runbook job.
+# It deliberately does not wait for the runbook to finish; JobMonitor
+# reconciles the outcome over time in the same Function App.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -21,14 +18,14 @@ function Invoke-DisposalDispatch {
     )
 
     $payload = ConvertFrom-JsonBody -Body $Message
-    if (-not $payload) { throw 'Service Bus message body is not valid JSON.' }
+    if (-not $payload) { throw 'Dispatch payload body is not valid JSON.' }
 
     $requestId = [string]$payload.requestId
     $platform = [string]$payload.platform
 
     if ([string]::IsNullOrWhiteSpace($requestId)) { throw 'Message is missing requestId.' }
     if ($platform -ne $ExpectedPlatform) {
-        throw "Message platform '$platform' does not match the subscription platform '$ExpectedPlatform'."
+        throw "Message platform '$platform' does not match the expected platform '$ExpectedPlatform'."
     }
 
     $dryRunValue = Resolve-JsonPath -InputObject $payload -Path '$.options.dryRun'
@@ -64,7 +61,12 @@ function Invoke-DisposalDispatch {
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
             status = 'DispatchFailed'; errorMessage = $reason
         }
-        return
+        return [pscustomobject]@{
+            Status = 'DispatchFailed'
+            ErrorMessage = $reason
+            AutomationJobName = $null
+            AutomationJobId = $null
+        }
     }
 
     $binding = Resolve-RunbookBinding -Platform $platform -Message $payload
@@ -73,9 +75,11 @@ function Invoke-DisposalDispatch {
     $jobName = $requestId
 
     Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
-        status  = 'Dispatching'
-        runbook = $binding.Runbook
+        status            = 'Dispatching'
+        runbook           = $binding.Runbook
         timeoutMinutes = $binding.TimeoutMinutes
+        automationJobName = $jobName
+        dispatchedAt      = (Get-Date).ToUniversalTime()
     }
 
     if ($isDryRun) {
@@ -86,7 +90,12 @@ function Invoke-DisposalDispatch {
             completedAt = (Get-Date).ToUniversalTime()
             resultJson = @{ dryRun = $true; runbook = $binding.Runbook; parameters = $binding.Parameters }
         }
-        return
+        return [pscustomobject]@{
+            Status = 'Completed'
+            ErrorMessage = ''
+            AutomationJobName = $null
+            AutomationJobId = $null
+        }
     }
 
     try {
@@ -97,7 +106,7 @@ function Invoke-DisposalDispatch {
             -RunOn $binding.RunOn
     }
     catch {
-        # Let Service Bus retry transient failures; persist the attempt either way.
+        # Persist the failure before returning it to the HTTP caller.
         Write-AtLog -Level 'Error' -Message "Runbook dispatch failed: $($_.Exception.Message)" -Properties $logProps
         Write-AtAudit -Action 'WipeDispatchFailed' -Level 'Error' -Properties ($logProps + @{ status = 'DispatchFailed'; error = $_.Exception.Message })
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
@@ -106,17 +115,36 @@ function Invoke-DisposalDispatch {
         throw
     }
 
-    Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
-        status            = 'Dispatched'
-        automationJobName = [string]$job.JobName
-        automationJobId   = [string]$job.JobId
-        dispatchedAt      = (Get-Date).ToUniversalTime()
-        errorMessage      = ''
+    try {
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            status            = 'Dispatched'
+            automationJobName = [string]$job.JobName
+            automationJobId   = [string]$job.JobId
+            dispatchedAt      = (Get-Date).ToUniversalTime()
+            errorMessage      = ''
+        }
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "Runbook started, but the Dispatched state could not be persisted: $($_.Exception.Message)" -Properties $logProps
+        Write-AtAudit -Action 'WipeDispatchStatePending' -Level 'Error' -Properties ($logProps + @{ status = 'Dispatching'; automationJobId = [string]$job.JobId })
+        return [pscustomobject]@{
+            Status = 'Dispatching'
+            ErrorMessage = 'The runbook started; JobMonitor will reconcile the pending dispatch state.'
+            AutomationJobName = [string]$job.JobName
+            AutomationJobId = [string]$job.JobId
+        }
     }
 
     $logProps.automationJobName = [string]$job.JobName
     Write-AtLog -Level 'Information' -Message 'Runbook job started.' -Properties $logProps
     Write-AtAudit -Action 'WipeJobStarted' -Properties ($logProps + @{ status = 'Dispatched'; runbook = $binding.Runbook; automationJobId = [string]$job.JobId })
+
+    return [pscustomobject]@{
+        Status = 'Dispatched'
+        ErrorMessage = ''
+        AutomationJobName = [string]$job.JobName
+        AutomationJobId = [string]$job.JobId
+    }
 }
 
 Export-ModuleMember -Function Invoke-DisposalDispatch
