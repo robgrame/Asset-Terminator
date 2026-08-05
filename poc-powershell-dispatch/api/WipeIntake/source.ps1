@@ -11,7 +11,13 @@ using namespace System.Net
 #      '__RequestId') so a retried/duplicated POST can never create two
 #      dispatch attempts: same id + same content replays the current state,
 #      same id + different content is rejected with 409 and never overwrites
-#      the original;
+#      the original. Every failure that can happen AFTER this registration but
+#      BEFORE a durable Accepted/Rejected state row exists (a Graph failure, a
+#      device-lease acquisition exception, an active-lease 409, the initial
+#      Save-WipeRequestState failing, or even the persist of a Rejected
+#      outcome itself failing) removes the index registration again, so a
+#      same-payload retry always gets a full new attempt instead of being
+#      trapped forever behind a hollow, never-finishing 202;
 #   3. normalises operatingSystem -> enrollment platform (resolving the
 #      ambiguous "Mobile" value against Intune) and rejects a payload whose
 #      declared platform disagrees with Intune's authoritative record;
@@ -61,12 +67,56 @@ function Remove-CurrentDeviceLease {
     }
 }
 
+function Clear-RequestIdIndex {
+    <#
+    .SYNOPSIS
+        Best-effort, idempotent cleanup of the global __RequestId index row
+        for THIS caller's own registration. Must be invoked on every failure
+        that happens strictly before a durable Accepted/Rejected state row
+        has been written (a Graph failure, a device-lease acquisition
+        exception, an active-lease 409, the initial Save-WipeRequestState
+        failing, or a Rejected-state persist failing).
+    .DESCRIPTION
+        Without this cleanup, the registration made earlier in the request
+        would remain permanently in place with no state row behind it: a
+        future retry of the exact same payload would match the "safe replay"
+        branch of Register-RequestIdIndex, find no state row, and hang
+        forever on a hollow 202 "in flight" response that nothing is actually
+        processing.
+
+        This is deliberately best-effort and never throws: the failure that
+        triggered this cleanup is what determines the HTTP response, and a
+        secondary failure while cleaning up must not mask it. Any failure
+        here is logged, never silently discarded.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $PayloadHash,
+        [hashtable] $LogProperties
+    )
+
+    try {
+        $removed = Remove-RequestIdIndex -RequestId $RequestId -PayloadHash $PayloadHash
+        if (-not $removed) {
+            Write-AtLog -Level 'Warning' -Message 'requestId index was left in place: a different registration (different payload) now owns it.' -Properties $LogProperties
+        }
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "Failed to clean up the requestId index after a pre-persistence failure: $($_.Exception.Message)" -Properties $LogProperties
+    }
+}
+
 function Save-RejectedRequest {
     <#
     .SYNOPSIS
         Persists every 'Rejected' outcome (reason/error/completedAt) so a
         requestId that reached domain-level validation never 404s on GetStatus,
         even though no dispatch was ever attempted for it.
+    .OUTPUTS
+        $true once the Rejected row is durably persisted. $false when the
+        persist itself failed: the caller MUST fail closed in that case (see
+        Complete-RejectedResponse) rather than answering 422 for a row that
+        does not actually exist.
     #>
     param(
         [Parameter(Mandatory)] [string] $Platform,
@@ -79,9 +129,49 @@ function Save-RejectedRequest {
         Save-WipeRequestState -Platform $Platform -RequestId $RequestId -Properties (
             @{ status = 'Rejected'; completedAt = (Get-Date).ToUniversalTime() } + $Properties
         ) | Out-Null
+        return $true
     }
     catch {
         Write-AtLog -Level 'Error' -Message "Failed to persist rejected state: $($_.Exception.Message)" -Properties $LogProperties
+        return $false
+    }
+}
+
+function Complete-RejectedResponse {
+    <#
+    .SYNOPSIS
+        Persists a 'Rejected' outcome and answers 422 - UNLESS the persist
+        itself fails, in which case this fails closed: it removes the
+        __RequestId index registration (so the requestId genuinely never
+        existed) and answers 502 instead.
+    .DESCRIPTION
+        Answering 422 when the durable Rejected row does not actually exist
+        would let a same-payload retry fall into the "duplicate, in-flight"
+        branch of the idempotency gate (Register-RequestIdIndex sees the same
+        hash, but GetWipeRequestState/Find-WipeRequestState finds nothing) and
+        hollow-202 forever, since nothing is ever going to finish "in flight".
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $PayloadHash,
+        [Parameter(Mandatory)] [string] $CorrelationId,
+        [Parameter(Mandatory)] [hashtable] $StateProperties,
+        [Parameter(Mandatory)] [hashtable] $ResponseBody,
+        [hashtable] $LogProperties
+    )
+
+    $saved = Save-RejectedRequest -Platform $Platform -RequestId $RequestId -LogProperties $LogProperties -Properties $StateProperties
+    if ($saved) {
+        Write-Json -StatusCode 422 -Object $ResponseBody
+        return
+    }
+
+    Clear-RequestIdIndex -RequestId $RequestId -PayloadHash $PayloadHash -LogProperties $LogProperties
+    Write-Json -StatusCode 502 -Object @{
+        error         = 'Failed to durably persist the rejected request outcome.'
+        requestId     = $RequestId
+        correlationId = $CorrelationId
     }
 }
 
@@ -234,7 +324,11 @@ try {
 catch {
     # A genuine Graph failure (auth, RBAC, throttling, 5xx, ...) is NEVER
     # reinterpreted as "device not managed": only an empty/404 result is.
+    # This happens before any durable state row exists, so the __RequestId
+    # registration made above must be undone: otherwise a retry of the exact
+    # same payload would be trapped forever behind a hollow 202.
     Write-AtLog -Level 'Error' -Message "Device lookup failed: $($_.Exception.Message)" -Properties $logProps
+    Clear-RequestIdIndex -RequestId $requestId -PayloadHash $payloadHash -LogProperties $logProps
     Write-Json -StatusCode 502 -Object @{ error = 'Failed to query Microsoft Graph for the device.'; detail = $_.Exception.Message; correlationId = $correlationId }
     return
 }
@@ -243,18 +337,19 @@ catch {
 if (-not $device) {
     Write-AtLog -Level 'Warning' -Message 'Managed device not found in Intune: routed to manual handling.' -Properties $logProps
     Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'DeviceNotManagedByIntune' })
-    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
-        correlationId = $correlationId; scenario = $scenario; serialNumber = $inputSerialNumber; imei = $inputImei
-        reason = 'DeviceNotManagedByIntune'
-        errorMessage = 'Managed device not found in Intune. ServiceNow must open a manual task.'
-    }
-    Write-Json -StatusCode 422 -Object @{
-        requestId     = $requestId
-        correlationId = $correlationId
-        status        = 'Rejected'
-        reason        = 'DeviceNotManagedByIntune'
-        error         = 'Managed device not found in Intune. ServiceNow must open a manual task.'
-    }
+    Complete-RejectedResponse -Platform $platform -RequestId $requestId -PayloadHash $payloadHash -CorrelationId $correlationId -LogProperties $logProps `
+        -StateProperties @{
+            correlationId = $correlationId; scenario = $scenario; serialNumber = $inputSerialNumber; imei = $inputImei
+            reason = 'DeviceNotManagedByIntune'
+            errorMessage = 'Managed device not found in Intune. ServiceNow must open a manual task.'
+        } `
+        -ResponseBody @{
+            requestId     = $requestId
+            correlationId = $correlationId
+            status        = 'Rejected'
+            reason        = 'DeviceNotManagedByIntune'
+            error         = 'Managed device not found in Intune. ServiceNow must open a manual task.'
+        }
     return
 }
 
@@ -262,17 +357,18 @@ if (-not $device) {
 if ($platform -eq 'Mobile') {
     $platform = ConvertTo-EnrollmentPlatform -OperatingSystem ([string]$device.operatingSystem)
     if (-not $platform -or $platform -eq 'Mobile') {
-        Save-RejectedRequest -Platform 'Mobile' -RequestId $requestId -LogProperties $logProps -Properties @{
-            correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
-            managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
-            reason = 'AmbiguousPlatform'
-            errorMessage = "Unable to resolve the enrollment platform from Intune operatingSystem '$($device.operatingSystem)'."
-        }
-        Write-Json -StatusCode 422 -Object @{
-            requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
-            reason = 'AmbiguousPlatform'
-            error  = "Unable to resolve the enrollment platform from Intune operatingSystem '$($device.operatingSystem)'."
-        }
+        Complete-RejectedResponse -Platform 'Mobile' -RequestId $requestId -PayloadHash $payloadHash -CorrelationId $correlationId -LogProperties $logProps `
+            -StateProperties @{
+                correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
+                managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
+                reason = 'AmbiguousPlatform'
+                errorMessage = "Unable to resolve the enrollment platform from Intune operatingSystem '$($device.operatingSystem)'."
+            } `
+            -ResponseBody @{
+                requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
+                reason = 'AmbiguousPlatform'
+                error  = "Unable to resolve the enrollment platform from Intune operatingSystem '$($device.operatingSystem)'."
+            }
         return
     }
     $logProps.platform = $platform
@@ -285,17 +381,18 @@ else {
     if ($intunePlatform -and $intunePlatform -ne 'Mobile' -and $intunePlatform -ne $platform) {
         Write-AtLog -Level 'Warning' -Message "Payload platform '$platform' does not match Intune's operatingSystem '$($device.operatingSystem)' (resolved '$intunePlatform')." -Properties $logProps
         Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'PlatformMismatch' })
-        Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
-            correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
-            managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
-            reason = 'PlatformMismatch'
-            errorMessage = "Requested platform '$platform' does not match the device's Intune platform '$intunePlatform'."
-        }
-        Write-Json -StatusCode 422 -Object @{
-            requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
-            reason = 'PlatformMismatch'
-            error  = "Requested platform '$platform' does not match the device's Intune platform '$intunePlatform' (operatingSystem='$($device.operatingSystem)')."
-        }
+        Complete-RejectedResponse -Platform $platform -RequestId $requestId -PayloadHash $payloadHash -CorrelationId $correlationId -LogProperties $logProps `
+            -StateProperties @{
+                correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
+                managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
+                reason = 'PlatformMismatch'
+                errorMessage = "Requested platform '$platform' does not match the device's Intune platform '$intunePlatform'."
+            } `
+            -ResponseBody @{
+                requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
+                reason = 'PlatformMismatch'
+                error  = "Requested platform '$platform' does not match the device's Intune platform '$intunePlatform' (operatingSystem='$($device.operatingSystem)')."
+            }
         return
     }
 }
@@ -307,35 +404,37 @@ if (-not [string]::IsNullOrWhiteSpace($inputImei) -and
     $inputImei -ne [string]$device.imei) {
     Write-AtLog -Level 'Warning' -Message 'Supplied imei does not match the resolved device record.' -Properties $logProps
     Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'DeviceIdentityMismatch' })
-    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
-        correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
-        managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName; imei = $inputImei
-        reason = 'DeviceIdentityMismatch'
-        errorMessage = "Supplied imei '$inputImei' does not match the resolved device's imei."
-    }
-    Write-Json -StatusCode 422 -Object @{
-        requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
-        reason = 'DeviceIdentityMismatch'
-        error  = "Supplied imei does not match the resolved device's imei."
-    }
+    Complete-RejectedResponse -Platform $platform -RequestId $requestId -PayloadHash $payloadHash -CorrelationId $correlationId -LogProperties $logProps `
+        -StateProperties @{
+            correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
+            managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName; imei = $inputImei
+            reason = 'DeviceIdentityMismatch'
+            errorMessage = "Supplied imei '$inputImei' does not match the resolved device's imei."
+        } `
+        -ResponseBody @{
+            requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
+            reason = 'DeviceIdentityMismatch'
+            error  = "Supplied imei does not match the resolved device's imei."
+        }
     return
 }
 
 $resolvedSerialNumber = [string]$device.serialNumber
 if ([string]::IsNullOrWhiteSpace($resolvedSerialNumber)) {
     Write-AtLog -Level 'Warning' -Message 'The managed device has no serial number and cannot be dispatched.' -Properties $logProps
-    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
-        correlationId = $correlationId; scenario = $scenario; managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
-        reason = 'MissingSerialNumber'
-        errorMessage = 'The managed device does not expose the serial number required by the platform runbook.'
-    }
-    Write-Json -StatusCode 422 -Object @{
-        requestId = $requestId
-        correlationId = $correlationId
-        status = 'Rejected'
-        reason = 'MissingSerialNumber'
-        error = 'The managed device does not expose the serial number required by the platform runbook.'
-    }
+    Complete-RejectedResponse -Platform $platform -RequestId $requestId -PayloadHash $payloadHash -CorrelationId $correlationId -LogProperties $logProps `
+        -StateProperties @{
+            correlationId = $correlationId; scenario = $scenario; managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
+            reason = 'MissingSerialNumber'
+            errorMessage = 'The managed device does not expose the serial number required by the platform runbook.'
+        } `
+        -ResponseBody @{
+            requestId = $requestId
+            correlationId = $correlationId
+            status = 'Rejected'
+            reason = 'MissingSerialNumber'
+            error = 'The managed device does not expose the serial number required by the platform runbook.'
+        }
     return
 }
 $logProps.serialNumber = $resolvedSerialNumber
@@ -357,18 +456,18 @@ if ($failed.Count -gt 0 -and -not $dryRun) {
     Write-AtLog -Level 'Warning' -Message 'Guardrails failed: routed to manual handling.' -Properties $logProps
     Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'GuardrailFailed'; guardrails = (($failed.name) -join ',') })
 
-    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
-        correlationId = $correlationId; scenario = $scenario
-        serialNumber  = [string]$device.serialNumber; deviceName = [string]$device.deviceName
-        managedDeviceId = [string]$device.id
-        reason        = 'GuardrailFailed'
-        errorMessage  = "Guardrails failed: $(($failed.name) -join ', ')"
-    }
-
-    Write-Json -StatusCode 422 -Object @{
-        requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
-        reason = 'GuardrailFailed'; guardrails = $guardrails
-    }
+    Complete-RejectedResponse -Platform $platform -RequestId $requestId -PayloadHash $payloadHash -CorrelationId $correlationId -LogProperties $logProps `
+        -StateProperties @{
+            correlationId = $correlationId; scenario = $scenario
+            serialNumber  = [string]$device.serialNumber; deviceName = [string]$device.deviceName
+            managedDeviceId = [string]$device.id
+            reason        = 'GuardrailFailed'
+            errorMessage  = "Guardrails failed: $(($failed.name) -join ', ')"
+        } `
+        -ResponseBody @{
+            requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
+            reason = 'GuardrailFailed'; guardrails = $guardrails
+        }
     return
 }
 
@@ -408,7 +507,11 @@ try {
         -Platform $platform
 }
 catch {
+    # No durable state row exists yet: undo the __RequestId registration so a
+    # retry of the exact same payload gets a full new attempt rather than a
+    # hollow 202 forever.
     Write-AtLog -Level 'Error' -Message "Failed to acquire the device lease: $($_.Exception.Message)" -Properties $logProps
+    Clear-RequestIdIndex -RequestId $requestId -PayloadHash $payloadHash -LogProperties $logProps
     Write-Json -StatusCode 500 -Object @{
         error = 'Failed to reserve the device for this request.'
         detail = $_.Exception.Message
@@ -418,7 +521,14 @@ catch {
 }
 
 if (-not $deviceLease.Acquired) {
+    # A transient/legitimate 409 (another disposal is genuinely in progress
+    # for the device), but still strictly before any durable state row for
+    # THIS requestId exists. Clean up the index instead of persisting a
+    # terminal outcome for what may resolve itself once the other lease
+    # expires: this keeps a same-payload retry re-evaluating from scratch
+    # (and getting another accurate 409, never a stranded hollow 202).
     Write-AtLog -Level 'Warning' -Message "Another disposal request is active for this device: $($deviceLease.ActiveRequestId)." -Properties $logProps
+    Clear-RequestIdIndex -RequestId $requestId -PayloadHash $payloadHash -LogProperties $logProps
     Write-Json -StatusCode 409 -Object @{
         error = 'Another disposal request is already active for this device.'
         requestId = $requestId
@@ -456,6 +566,7 @@ try {
 catch {
     Write-AtLog -Level 'Error' -Message "Failed to persist state: $($_.Exception.Message)" -Properties $logProps
     Remove-CurrentDeviceLease -SerialNumber $resolvedSerialNumber -RequestId $requestId -LogProperties $logProps
+    Clear-RequestIdIndex -RequestId $requestId -PayloadHash $payloadHash -LogProperties $logProps
     Write-Json -StatusCode 500 -Object @{ error = 'Failed to persist the request state.'; detail = $_.Exception.Message; correlationId = $correlationId }
     return
 }

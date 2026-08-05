@@ -275,6 +275,83 @@ function Get-RequestIdIndex {
     }
 }
 
+function Remove-RequestIdIndex {
+    <#
+    .SYNOPSIS
+        Idempotent, conditional cleanup of a __RequestId index row: used ONLY
+        to undo a registration this same caller just made, when a failure
+        happens strictly before any durable Accepted/Rejected state row could
+        be written for that requestId.
+    .DESCRIPTION
+        Without this, a pre-persistence infrastructure failure (Graph down,
+        the device lease store unreachable, the initial state PUT itself
+        failing, a Rejected-state persist failing, ...) would leave the index
+        permanently registered with no state row behind it: every future
+        retry of the exact same payload would then match the "safe replay"
+        branch of Register-RequestIdIndex, find no state row, and hang
+        forever on a hollow 202 "in flight" response that nothing is actually
+        processing.
+
+        Conditional on PayloadHash so it can never remove a genuinely
+        different registration that raced in for the same requestId (that is
+        a real conflict, not this caller's own row, and must be left alone).
+        Uses an ETag-conditional DELETE (optimistic concurrency) so a
+        concurrent change to the row between the read and the delete is never
+        blindly overwritten.
+
+        Idempotent: already-gone (404 on read) and already-changed-since-our-
+        read (412 on delete) both count as "nothing left for this caller to
+        clean up" and return $true, so this is always safe to call more than
+        once (e.g. a retry of the failure path itself).
+    .OUTPUTS
+        $true when the row is gone (removed by this call, already absent, or
+        raced away from under us); $false only when a row still exists and it
+        belongs to a different payload hash (never removed in that case).
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $PayloadHash
+    )
+
+    $uri = "{0}(PartitionKey='__RequestId',RowKey='{1}')" -f (Get-StateTableUri), $RequestId
+
+    $existing = $null
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method GET -Headers (Get-TableHeaders)
+        $existing = [pscustomobject]@{
+            Entity = $response.Content | ConvertFrom-Json
+            ETag   = [string]$response.Headers.ETag
+        }
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $true }
+        throw
+    }
+
+    if ([string]$existing.Entity.payloadHash -ne $PayloadHash) {
+        # A different request (different content) owns this requestId now:
+        # never remove someone else's legitimate registration on this caller's
+        # behalf.
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($existing.ETag)) {
+        throw "requestId index row for '$RequestId' did not include an ETag."
+    }
+
+    $headers = Get-TableHeaders
+    $headers['If-Match'] = $existing.ETag
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method DELETE -Headers $headers | Out-Null
+        return $true
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -in @(404, 412)) { return $true }
+        throw
+    }
+}
+
 function Get-WipeDeviceLeaseKey {
     param([Parameter(Mandatory)] [string] $SerialNumber)
 
@@ -422,5 +499,5 @@ function Find-WipeRequestState {
 
 Export-ModuleMember -Function Save-WipeRequestState, Update-WipeRequestState, Get-WipeRequestState, `
     Get-WipeRequestStateWithETag, Set-WipeRequestStateClaim, `
-    Register-RequestIdIndex, Get-RequestIdIndex, `
+    Register-RequestIdIndex, Get-RequestIdIndex, Remove-RequestIdIndex, `
     Lock-WipeDevice, Unlock-WipeDevice, Find-WipeRequestState
