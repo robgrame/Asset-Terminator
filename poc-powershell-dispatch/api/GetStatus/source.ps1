@@ -20,6 +20,57 @@ function Write-Json {
     })
 }
 
+function Get-IntuneWipeView {
+    param($Entity)
+
+    $dryRun = Get-JsonPropertyValue -InputObject $Entity -Name 'dryRun'
+    if ($dryRun -is [bool] -and $dryRun) { return $null }
+    if ([string]$dryRun -match '^(?i:true)$') { return $null }
+
+    $managedDeviceId = [string](Get-JsonPropertyValue -InputObject $Entity -Name 'managedDeviceId')
+    if ([string]::IsNullOrWhiteSpace($managedDeviceId)) { return $null }
+
+    $parameters = @{
+        ManagedDeviceId = $managedDeviceId
+        LogProperties = @{ requestId = $Entity.RowKey; managedDeviceId = $managedDeviceId }
+    }
+    $notBefore = [datetime]::MinValue
+    $dispatchedAt = [string](Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchedAt')
+    if ([datetime]::TryParse($dispatchedAt, [ref]$notBefore)) {
+        $parameters.NotBefore = $notBefore
+    }
+
+    try {
+        $wipe = Get-DeviceWipeStatus @parameters
+        if (-not $wipe.Found) {
+            return [ordered]@{
+                found = $false
+                managedDeviceId = $managedDeviceId
+                wipeState = 'deviceRemoved'
+            }
+        }
+        return [ordered]@{
+            found = $true
+            managedDeviceId = $wipe.ManagedDeviceId
+            deviceName = $wipe.DeviceName
+            managementState = $wipe.ManagementState
+            lastSyncDateTime = $wipe.LastSyncDateTime
+            wipeState = $wipe.WipeState
+            startDateTime = $wipe.WipeStartDateTime
+            lastUpdatedDateTime = $wipe.WipeLastUpdatedDateTime
+        }
+    }
+    catch {
+        Write-AtLog -Level 'Warning' -Message "Unable to query the live Intune wipe state: $($_.Exception.Message)" -Properties $parameters.LogProperties
+        return [ordered]@{
+            found = $null
+            managedDeviceId = $managedDeviceId
+            wipeState = 'unavailable'
+            error = $_.Exception.Message
+        }
+    }
+}
+
 function ConvertTo-StatusView {
     param($Entity)
 
@@ -65,6 +116,7 @@ function ConvertTo-StatusView {
         callbackAttempts  = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackAttempts'
         callbackNextAttemptAt = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackNextAttemptAt'
         callbackError     = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackError'
+        intuneWipe        = Get-IntuneWipeView -Entity $Entity
         result            = $result
     }
 }

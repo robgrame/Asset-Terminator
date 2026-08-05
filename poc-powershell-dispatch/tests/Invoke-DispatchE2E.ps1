@@ -7,9 +7,10 @@
 .DESCRIPTION
     Resolves the Function App host name and default host key with Azure CLI,
     submits a unique wipe request, then polls the status endpoint until the
-    request reaches a terminal state. The test is a dry run unless -Real is
-    explicitly specified. BaseUri and FunctionKey can be supplied directly
-    instead of resolving the deployment through Azure CLI.
+    request reaches a terminal state. The intake may return Accepted while the
+    JobMonitor completes the durable dispatch asynchronously. The test is a dry
+    run unless -Real is explicitly specified. BaseUri and FunctionKey can be
+    supplied directly instead of resolving the deployment through Azure CLI.
 
 .EXAMPLE
     ./tests/Invoke-DispatchE2E.ps1 `
@@ -153,34 +154,63 @@ $response = Invoke-WebRequest `
     -Method Post `
     -Headers $headers `
     -ContentType 'application/json' `
-    -Body ($payload | ConvertTo-Json -Depth 8)
+    -Body ($payload | ConvertTo-Json -Depth 8) `
+    -SkipHttpErrorCheck
 
-if ([int]$response.StatusCode -ne 202) {
-    throw "Expected HTTP 202 from WipeIntake, received $($response.StatusCode): $($response.Content)"
+if ([int]$response.StatusCode -notin @(200, 202, 422)) {
+    throw "Expected HTTP 200, 202 or 422 from WipeIntake, received $($response.StatusCode): $($response.Content)"
 }
 
 $accepted = $response.Content | ConvertFrom-Json
 if ([string]$accepted.requestId -ne $RequestId) {
     throw "WipeIntake returned requestId '$($accepted.requestId)' instead of '$RequestId'."
 }
-$expectedAcceptedStatuses = if ($expectedDryRun) { @('Completed') } else { @('Dispatching', 'Dispatched') }
-if ([string]$accepted.status -notin $expectedAcceptedStatuses) {
-    throw "WipeIntake returned status '$($accepted.status)' instead of one of: $($expectedAcceptedStatuses -join ', ')."
+
+$knownStatuses = @(
+    'Accepted', 'Dispatching', 'Dispatched', 'Running', 'EvidencePending',
+    'Completed', 'PartiallyCompleted', 'Failed', 'Rejected', 'DispatchFailed'
+)
+if ([string]$accepted.status -notin $knownStatuses) {
+    throw "WipeIntake returned unknown status '$($accepted.status)'."
 }
-$acceptedDryRun = ConvertTo-TestBoolean -Value $accepted.dryRun -FieldName 'WipeIntake dryRun'
-if ($acceptedDryRun -ne $expectedDryRun) {
-    throw "WipeIntake returned dryRun='$acceptedDryRun', expected '$expectedDryRun'."
+
+if ([int]$response.StatusCode -eq 422 -and 'Rejected' -notin $ExpectedTerminalStatus) {
+    throw "WipeIntake rejected the request: $($response.Content)"
+}
+
+if ($accepted.PSObject.Properties.Name -contains 'dryRun') {
+    $acceptedDryRun = ConvertTo-TestBoolean -Value $accepted.dryRun -FieldName 'WipeIntake dryRun'
+    if ($acceptedDryRun -ne $expectedDryRun) {
+        throw "WipeIntake returned dryRun='$acceptedDryRun', expected '$expectedDryRun'."
+    }
 }
 
 $terminalStates = @('Completed', 'PartiallyCompleted', 'Failed', 'Rejected', 'DispatchFailed')
 $deadline = (Get-Date).ToUniversalTime().AddSeconds($TimeoutSeconds)
-$encodedRequestId = [uri]::EscapeDataString($RequestId)
-$statusUri = "$baseUriValue/api/v1/wipe/status?requestId=$encodedRequestId"
+$statusLocation = [string]$response.Headers['Location']
+if ([string]::IsNullOrWhiteSpace($statusLocation)) {
+    if ($accepted.PSObject.Properties.Name -contains 'statusUrl') {
+        $statusLocation = [string]$accepted.statusUrl
+    }
+}
+if ([string]::IsNullOrWhiteSpace($statusLocation)) {
+    $encodedRequestId = [uri]::EscapeDataString($RequestId)
+    $statusLocation = "/api/v1/wipe/status?requestId=$encodedRequestId"
+}
+
+$statusUri = if ([uri]::IsWellFormedUriString($statusLocation, [UriKind]::Absolute)) {
+    $statusLocation
+}
+else {
+    [uri]::new([uri]"$baseUriValue/", $statusLocation).AbsoluteUri
+}
+
 $lastStatus = [string]$accepted.status
 $state = $null
+$lastWipeState = ''
+$wipeTerminalStates = @('done', 'failed', 'canceled', 'notSupported', 'deviceRemoved')
 
 do {
-    Start-Sleep -Seconds $PollIntervalSeconds
     $state = Invoke-RestMethod -Uri $statusUri -Method Get -Headers $headers
 
     if ([string]$state.requestId -ne $RequestId) {
@@ -188,13 +218,26 @@ do {
     }
 
     $lastStatus = [string]$state.status
-    Write-Host ("[{0:HH:mm:ss}] status={1}" -f (Get-Date), $lastStatus)
+    $lastWipeState = if ($state.intuneWipe) { [string]$state.intuneWipe.wipeState } else { '' }
+    $wipeSuffix = if ([string]::IsNullOrWhiteSpace($lastWipeState)) { '' } else { ", intuneWipe=$lastWipeState" }
+    Write-Host ("[{0:HH:mm:ss}] status={1}{2}" -f (Get-Date), $lastStatus, $wipeSuffix)
 
-    if ($terminalStates -contains $lastStatus) { break }
+    $backendTerminal = $terminalStates -contains $lastStatus
+    $waitForWipe = $Real.IsPresent -and $lastStatus -in @('Completed', 'PartiallyCompleted')
+    if ($backendTerminal -and (-not $waitForWipe -or $wipeTerminalStates -contains $lastWipeState)) { break }
+    if ((Get-Date).ToUniversalTime() -ge $deadline) { break }
+
+    Start-Sleep -Seconds $PollIntervalSeconds
 } while ((Get-Date).ToUniversalTime() -lt $deadline)
 
 if ($terminalStates -notcontains $lastStatus) {
     throw "E2E test timed out after $TimeoutSeconds seconds (last status: $lastStatus)."
+}
+
+if ($Real.IsPresent -and
+    $lastStatus -in @('Completed', 'PartiallyCompleted') -and
+    $wipeTerminalStates -notcontains $lastWipeState) {
+    throw "E2E test timed out waiting for Intune to complete the wipe (last wipe state: '$lastWipeState')."
 }
 
 Write-Host ($state | ConvertTo-Json -Depth 12)
@@ -212,6 +255,11 @@ if ($lastStatus -in @('Completed', 'PartiallyCompleted')) {
     if ($resultDryRun -ne $expectedDryRun) {
         throw "Terminal result reports dryRun='$resultDryRun', but the request specified '$expectedDryRun'."
     }
+
+    if ($Real.IsPresent -and $lastWipeState -notin @('done', 'deviceRemoved')) {
+        throw "Intune wipe reached '$lastWipeState'; expected: done."
+    }
 }
 
-Write-Host "E2E test passed: request '$RequestId' reached '$lastStatus'." -ForegroundColor Green
+$wipeSummary = if ($Real.IsPresent) { " and Intune wipe reached '$lastWipeState'" } else { '' }
+Write-Host "E2E test passed: request '$RequestId' reached '$lastStatus'$wipeSummary." -ForegroundColor Green

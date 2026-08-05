@@ -493,6 +493,19 @@ function Get-TableHeaders {
     }
 }
 
+function ConvertTo-TablePropertyValue {
+    param([Parameter(Mandatory)] $Value)
+
+    # Azure Table entities only support scalar property values.
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [pscustomobject] -or $Value -is [array]) {
+        return ($Value | ConvertTo-Json -Depth 10 -Compress)
+    }
+    if ($Value -is [datetime]) {
+        return $Value.ToUniversalTime().ToString('o')
+    }
+    return $Value
+}
+
 function Save-WipeRequestState {
     <#
     .SYNOPSIS
@@ -511,23 +524,23 @@ function Save-WipeRequestState {
     foreach ($key in $Properties.Keys) {
         $value = $Properties[$key]
         if ($null -eq $value) { continue }
-        # Table Storage has no object type: complex values are stored as JSON.
-        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
-            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
-        }
-        elseif ($value -is [datetime]) {
-            $entity[$key] = $value.ToUniversalTime().ToString('o')
-        }
-        else {
-            $entity[$key] = $value
-        }
+        $entity[$key] = ConvertTo-TablePropertyValue -Value $value
     }
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
     $headers = Get-TableHeaders
     $headers['Content-Type'] = 'application/json'
 
-    Invoke-RestMethod -Uri $uri -Method PUT -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+    try {
+        Invoke-RestMethod -Uri $uri -Method PUT -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+    }
+    catch {
+        $serviceError = [string]$_.ErrorDetails.Message
+        if (-not [string]::IsNullOrWhiteSpace($serviceError)) {
+            throw "Azure Table rejected the state entity: $serviceError"
+        }
+        throw
+    }
     return $entity
 }
 
@@ -546,15 +559,7 @@ function Update-WipeRequestState {
     foreach ($key in $Properties.Keys) {
         $value = $Properties[$key]
         if ($null -eq $value) { continue }
-        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
-            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
-        }
-        elseif ($value -is [datetime]) {
-            $entity[$key] = $value.ToUniversalTime().ToString('o')
-        }
-        else {
-            $entity[$key] = $value
-        }
+        $entity[$key] = ConvertTo-TablePropertyValue -Value $value
     }
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
@@ -630,15 +635,7 @@ function Set-WipeRequestStateClaim {
     foreach ($key in $Properties.Keys) {
         $value = $Properties[$key]
         if ($null -eq $value) { continue }
-        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
-            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
-        }
-        elseif ($value -is [datetime]) {
-            $entity[$key] = $value.ToUniversalTime().ToString('o')
-        }
-        else {
-            $entity[$key] = $value
-        }
+        $entity[$key] = ConvertTo-TablePropertyValue -Value $value
     }
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
@@ -961,6 +958,453 @@ function Find-WipeRequestState {
     return @($response.value)
 }
 # endregion Inlined functions from: AT.State.psm1
+# region Inlined functions from: AT.Graph.psm1
+# Graph helpers for the dispatch intake Function.
+#
+# Authentication: OAuth2 *client credentials* using an app registration + client
+# secret (GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET). No managed
+# identity and no certificate are used. The token is cached in-process until a
+# minute before it expires.
+#
+# Configuration comes from the Function App Application Settings (environment
+# variables). Every knob has a safe default so the mock runs with only the three
+# GRAPH_* credential settings populated. Configurable settings:
+#   GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET   (credentials, required)
+#   GRAPH_BASE_URI            (default https://graph.microsoft.com/beta)
+#   GRAPH_AUTHORITY_HOST      (default https://login.microsoftonline.com)
+#   GRAPH_SCOPE              (default https://graph.microsoft.com/.default)
+#   GRAPH_MAX_RETRIES         (default 4)
+#   WIPE_KEEP_ENROLLMENT_DATA (default false)
+#   WIPE_KEEP_USER_DATA       (default false)
+
+
+$script:GraphTokenCache = $null   # @{ AccessToken = ...; ExpiresOn = [datetime] }
+
+function Write-MockLog {
+    <#
+        .SYNOPSIS
+            Emits a single-line structured log entry (flows to Application Insights).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Message,
+        [ValidateSet('Information', 'Warning', 'Error')][string] $Level = 'Information',
+        [hashtable] $Properties
+    )
+
+    $correlationId = if ($Properties -and $Properties.ContainsKey('correlationId')) {
+        $Properties.correlationId
+    }
+    else {
+        $null
+    }
+
+    $payload = [ordered]@{
+        timestamp     = (Get-Date).ToUniversalTime().ToString('o')
+        level         = $Level
+        message       = $Message
+        correlationId = $correlationId
+    }
+    if ($Properties) {
+        foreach ($key in $Properties.Keys) { $payload[$key] = $Properties[$key] }
+    }
+
+    $line = ($payload | ConvertTo-Json -Compress -Depth 6)
+    switch ($Level) {
+        'Error'   { Write-Error   $line }
+        'Warning' { Write-Warning $line }
+        default   { Write-Information $line -InformationAction Continue }
+    }
+}
+
+function ConvertTo-DeviceOs {
+    <#
+        .SYNOPSIS
+            Normalises the operatingSystem value sent by ServiceNow to one of
+            'Windows', 'Mac' or 'Mobile'. Only 'Windows' triggers the Autopilot
+            deletion downstream.
+        .OUTPUTS
+            'Windows' | 'Mac' | 'Mobile' | $null (when unrecognised).
+    #>
+    [CmdletBinding()]
+    param([string] $OperatingSystem)
+
+    if (-not $OperatingSystem) { return $null }
+    switch -Regex ($OperatingSystem.Trim().ToLowerInvariant()) {
+        '^(windows|win)$'                       { return 'Windows' }
+        '^(mac|macos|osx|os x)$'                { return 'Mac' }
+        '^(mobile|ios|ipados|android)$'         { return 'Mobile' }
+        default                                 { return $null }
+    }
+}
+
+function Get-GraphToken {
+    <#
+        .SYNOPSIS
+            Returns a Microsoft Graph access token using the app registration +
+            client secret (client credentials grant). Cached in-process.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:GraphTokenCache -and $script:GraphTokenCache.ExpiresOn -gt (Get-Date).AddMinutes(1)) {
+        return $script:GraphTokenCache.AccessToken
+    }
+
+    $tenantId     = $env:GRAPH_TENANT_ID
+    $clientId     = $env:GRAPH_CLIENT_ID
+    $clientSecret = $env:GRAPH_CLIENT_SECRET
+    if (-not $tenantId -or -not $clientId -or -not $clientSecret) {
+        throw 'Graph app-registration settings are missing: set GRAPH_TENANT_ID, GRAPH_CLIENT_ID and GRAPH_CLIENT_SECRET.'
+    }
+
+    $body = @{
+        client_id     = $clientId
+        client_secret = $clientSecret
+        scope         = (Get-AppSetting -Name 'GRAPH_SCOPE' -Default 'https://graph.microsoft.com/.default')
+        grant_type    = 'client_credentials'
+    }
+
+    $authorityHost = (Get-AppSetting -Name 'GRAPH_AUTHORITY_HOST' -Default 'https://login.microsoftonline.com').TrimEnd('/')
+    $response = Invoke-RestMethod -Method POST `
+        -Uri "$authorityHost/$tenantId/oauth2/v2.0/token" `
+        -ContentType 'application/x-www-form-urlencoded' `
+        -Body $body
+
+    $script:GraphTokenCache = @{
+        AccessToken = $response.access_token
+        ExpiresOn   = (Get-Date).AddSeconds([int]$response.expires_in)
+    }
+    return $script:GraphTokenCache.AccessToken
+}
+
+function Invoke-GraphRequest {
+    <#
+        .SYNOPSIS
+            Resilient Microsoft Graph REST call with retry/backoff on transient errors.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PATCH', 'DELETE')][string] $Method,
+        [Parameter(Mandatory)][string] $Path,
+        [object] $Body,
+        [int] $MaxRetries = -1
+    )
+
+    if ($MaxRetries -lt 0) { $MaxRetries = [int](Get-AppSetting -Name 'GRAPH_MAX_RETRIES' -Default '4') }
+    $baseUri = (Get-AppSetting -Name 'GRAPH_BASE_URI' -Default 'https://graph.microsoft.com/beta').TrimEnd('/')
+    $uri = if ($Path -match '^https?://') { $Path } else { "$baseUri/$($Path.TrimStart('/'))" }
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $headers = @{ Authorization = "Bearer $(Get-GraphToken)"; 'Content-Type' = 'application/json' }
+            $params  = @{ Method = $Method; Uri = $uri; Headers = $headers; ErrorAction = 'Stop' }
+            if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+                $params.Body = ($Body | ConvertTo-Json -Depth 8)
+            }
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $status = $null
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+
+            $isTransient = $status -in @(429, 500, 502, 503, 504)
+            if (-not $isTransient -or $attempt -gt $MaxRetries) {
+                throw
+            }
+
+            $delay = [math]::Min([math]::Pow(2, $attempt), 30)
+            Write-MockLog -Level 'Warning' -Message "Graph $Method $uri failed (status $status), retry $attempt/$MaxRetries in ${delay}s"
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+function Get-IntuneManagedDevice {
+    <#
+        .SYNOPSIS
+            Resolves an Intune managed device by managedDeviceId, or by deviceName,
+            serialNumber and/or imei. When several stale objects match, the freshest
+            one (by enrolledDateTime, then lastSyncDateTime) is returned.
+        .DESCRIPTION
+            A device is reported "not managed" ($null return) ONLY when Graph
+            genuinely has no matching object (an empty result set, or a 404 on a
+            direct id lookup). Any other Graph failure - authentication, RBAC,
+            throttling, a 5xx - is rethrown so the caller can tell "this device is
+            not enrolled" apart from "we could not ask Intune right now"; conflating
+            the two would route real outages to the manual-task guardrail instead
+            of surfacing them as the transient error they are.
+        .OUTPUTS
+            The managedDevice Graph object, or $null when not found.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ManagedDeviceId,
+        [string] $DeviceName,
+        [string] $SerialNumber,
+        [string] $Imei,
+        [hashtable] $LogProperties = @{}
+    )
+
+    $select = 'id,deviceName,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,manufacturer,imei'
+
+    if ($ManagedDeviceId) {
+        try {
+            return Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices/$ManagedDeviceId`?`$select=$select"
+        }
+        catch {
+            $status = Get-HttpErrorStatusCode -ErrorRecord $_
+            if ($status -eq 404) { return $null }
+            throw
+        }
+    }
+
+    if (-not $DeviceName -and -not $SerialNumber -and -not $Imei) {
+        throw 'Get-IntuneManagedDevice requires -ManagedDeviceId, -DeviceName, -SerialNumber or -Imei.'
+    }
+
+    $clauses = @()
+    if ($DeviceName)   { $clauses += "deviceName eq '$($DeviceName.Replace("'", "''"))'" }
+    if ($SerialNumber) { $clauses += "serialNumber eq '$($SerialNumber.Replace("'", "''"))'" }
+    if ($Imei)         { $clauses += "imei eq '$($Imei.Replace("'", "''"))'" }
+    $filter = [Uri]::EscapeDataString($clauses -join ' and ')
+
+    $candidates = @()
+    try {
+        $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$filter&`$select=$select"
+        $candidates = @($result.value)
+    }
+    catch {
+        # Some combined $filter clauses (e.g. imei together with deviceName) are
+        # rejected by Graph as an unsupported query (400): fall back to a single
+        # supported clause and match the remaining criteria client-side. Any
+        # other status (401/403/429/5xx) is a real failure and must propagate.
+        $status = Get-HttpErrorStatusCode -ErrorRecord $_
+        if ($status -ne 400) { throw }
+
+        Write-MockLog -Level 'Warning' -Message "Server-side filter failed (status $status); falling back to client-side matching." -Properties $LogProperties
+        if ($DeviceName) {
+            $nameFilter = [Uri]::EscapeDataString("deviceName eq '$($DeviceName.Replace("'", "''"))'")
+            $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$nameFilter&`$select=$select"
+        }
+        elseif ($SerialNumber) {
+            $serialFilter = [Uri]::EscapeDataString("serialNumber eq '$($SerialNumber.Replace("'", "''"))'")
+            $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$serialFilter&`$select=$select"
+        }
+        else {
+            $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$select=$select"
+        }
+        $candidates = @($result.value)
+    }
+
+    if ($DeviceName)   { $candidates = @($candidates | Where-Object { $_.deviceName   -eq $DeviceName }) }
+    if ($SerialNumber) { $candidates = @($candidates | Where-Object { $_.serialNumber -eq $SerialNumber }) }
+    if ($Imei)         { $candidates = @($candidates | Where-Object { $_.imei -eq $Imei }) }
+
+    if ($candidates.Count -eq 0) { return $null }
+
+    if ($candidates.Count -gt 1) {
+        Write-MockLog -Level 'Warning' `
+            -Message "Found $($candidates.Count) managed devices matching the criteria; selecting the freshest by enrolledDateTime/lastSyncDateTime." `
+            -Properties $LogProperties
+        $min = [datetime]::MinValue
+        return $candidates |
+            Sort-Object `
+                @{ Expression = { if ($_.enrolledDateTime) { [datetime]$_.enrolledDateTime } else { $min } }; Descending = $true }, `
+                @{ Expression = { if ($_.lastSyncDateTime) { [datetime]$_.lastSyncDateTime } else { $min } }; Descending = $true } |
+            Select-Object -First 1
+    }
+
+    return $candidates[0]
+}
+
+function Remove-AutopilotDevice {
+    <#
+        .SYNOPSIS
+            Deletes a device from Windows Autopilot by serial number (Windows only).
+        .DESCRIPTION
+            Resolves the windowsAutopilotDeviceIdentities object by serialNumber and
+            deletes it, so a re-imaged / re-purposed device is no longer bound to the
+            tenant's Autopilot profile. Requires DeviceManagementServiceConfig.ReadWrite.All.
+        .OUTPUTS
+            PSCustomObject: Action, Outcome (DryRun|Deleted|NotFound|Skipped), Detail.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $SerialNumber,
+        [switch] $DryRun,
+        [hashtable] $LogProperties = @{}
+    )
+
+    if (-not $SerialNumber) {
+        Write-MockLog -Level 'Warning' -Message 'Autopilot delete skipped: no serialNumber supplied.' -Properties $LogProperties
+        return [pscustomobject]@{ Action = 'AutopilotDelete'; Outcome = 'Skipped'; Detail = 'No serialNumber.' }
+    }
+
+    if ($DryRun) {
+        Write-MockLog -Level 'Information' -Message "DRY-RUN: Autopilot delete skipped for serial $SerialNumber." -Properties $LogProperties
+        return [pscustomobject]@{ Action = 'AutopilotDelete'; Outcome = 'DryRun'; Detail = "Would delete Autopilot identity for serial $SerialNumber." }
+    }
+
+    $escaped = $SerialNumber.Replace("'", "''")
+    $filter  = [Uri]::EscapeDataString("contains(serialNumber,'$escaped')")
+    $result  = Invoke-GraphRequest -Method GET -Path "deviceManagement/windowsAutopilotDeviceIdentities?`$filter=$filter"
+    $identity = @($result.value) | Where-Object { $_.serialNumber -eq $SerialNumber } | Select-Object -First 1
+    if (-not $identity) { $identity = @($result.value) | Select-Object -First 1 }
+
+    if (-not $identity) {
+        Write-MockLog -Level 'Information' -Message "No Autopilot identity found for serial $SerialNumber; nothing to delete." -Properties $LogProperties
+        return [pscustomobject]@{ Action = 'AutopilotDelete'; Outcome = 'NotFound'; Detail = "No Autopilot identity for serial $SerialNumber." }
+    }
+
+    Invoke-GraphRequest -Method DELETE -Path "deviceManagement/windowsAutopilotDeviceIdentities/$($identity.id)" | Out-Null
+    Write-MockLog -Level 'Information' -Message "Deleted Autopilot identity $($identity.id) for serial $SerialNumber." -Properties $LogProperties
+    return [pscustomobject]@{ Action = 'AutopilotDelete'; Outcome = 'Deleted'; Detail = "Deleted Autopilot identity $($identity.id)." }
+}
+
+function Invoke-IntuneWipe {
+    <#
+        .SYNOPSIS
+            Issues the Intune managedDevice wipe action (or simulates it in DryRun).
+        .DESCRIPTION
+            POST /deviceManagement/managedDevices/{id}/wipe. Requires
+            DeviceManagementManagedDevices.PrivilegedOperations.All.
+        .OUTPUTS
+            PSCustomObject: Action, Outcome (DryRun|Issued), ExecutedAt.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ManagedDeviceId,
+        [switch] $DryRun,
+        [Nullable[bool]] $KeepEnrollmentData,
+        [Nullable[bool]] $KeepUserData,
+        [hashtable] $LogProperties = @{}
+    )
+
+    if ($null -eq $KeepEnrollmentData) { $KeepEnrollmentData = Get-AppSettingBool -Name 'WIPE_KEEP_ENROLLMENT_DATA' -Default $false }
+    if ($null -eq $KeepUserData)       { $KeepUserData       = Get-AppSettingBool -Name 'WIPE_KEEP_USER_DATA' -Default $false }
+
+    if ($DryRun) {
+        Write-MockLog -Level 'Information' -Message "DRY-RUN: wipe skipped for managedDevice $ManagedDeviceId." -Properties $LogProperties
+        return [pscustomobject]@{ Action = 'Wipe'; Outcome = 'DryRun'; ManagedDeviceId = $ManagedDeviceId; ExecutedAt = (Get-Date).ToUniversalTime().ToString('o') }
+    }
+
+    $body = @{ keepEnrollmentData = [bool]$KeepEnrollmentData; keepUserData = [bool]$KeepUserData }
+    Invoke-GraphRequest -Method POST -Path "deviceManagement/managedDevices/$ManagedDeviceId/wipe" -Body $body | Out-Null
+    Write-MockLog -Level 'Information' -Message "Wipe command issued for managedDevice $ManagedDeviceId." -Properties $LogProperties
+    return [pscustomobject]@{ Action = 'Wipe'; Outcome = 'Issued'; ManagedDeviceId = $ManagedDeviceId; ExecutedAt = (Get-Date).ToUniversalTime().ToString('o') }
+}
+
+function Get-DeviceWipeStatus {
+    <#
+        .SYNOPSIS
+            Reads the LIVE state of a previously issued Intune wipe for a managed
+            device, straight from Microsoft Graph (no local persistence).
+        .DESCRIPTION
+            GET /deviceManagement/managedDevices/{id} selecting managementState and
+            deviceActionResults, then extracts the 'wipe' entry. Intune wipes are
+            asynchronous: the command is only carried out when the device next checks
+            in, so this reports the real progress after the wipe was issued.
+
+            actionState values (Graph): none | pending | canceled | active | done |
+            failed | notSupported | retryPending. 'active' is surfaced as 'inProgress'.
+            Requires DeviceManagementManagedDevices.Read.All.
+        .OUTPUTS
+            PSCustomObject: Found (bool), plus device fields and the wipe action
+            result (WipeState, WipeStartDateTime, WipeLastUpdatedDateTime), or
+            Found=$false when the managed device no longer exists (already wiped /
+            retired objects are removed from Intune).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $ManagedDeviceId,
+        [datetime] $NotBefore,
+        [hashtable] $LogProperties = @{}
+    )
+
+    $select = 'id,deviceName,serialNumber,operatingSystem,managementState,lastSyncDateTime'
+    $device = $null
+    try {
+        $device = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices/$ManagedDeviceId`?`$select=$select,deviceActionResults"
+    }
+    catch {
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($status -eq 404) {
+            Write-MockLog -Level 'Information' -Message "Managed device $ManagedDeviceId not found (likely already wiped/removed)." -Properties $LogProperties
+            return [pscustomobject]@{ Found = $false; ManagedDeviceId = $ManagedDeviceId }
+        }
+        throw
+    }
+
+    $wipeActions = @($device.deviceActionResults) | Where-Object { [string]$_.actionName -ieq 'wipe' }
+    if ($PSBoundParameters.ContainsKey('NotBefore')) {
+        $threshold = $NotBefore.ToUniversalTime().AddMinutes(-2)
+        $wipeActions = @($wipeActions | Where-Object {
+            $_.startDateTime -and ([datetime]$_.startDateTime).ToUniversalTime() -ge $threshold
+        })
+    }
+    $wipe = $wipeActions |
+        Sort-Object @{ Expression = {
+            if ($_.lastUpdatedDateTime) { [datetime]$_.lastUpdatedDateTime }
+            elseif ($_.startDateTime) { [datetime]$_.startDateTime }
+            else { [datetime]::MinValue }
+        }; Descending = $true } |
+        Select-Object -First 1
+
+    $wipeState = if ($wipe) {
+        switch ($wipe.actionState) {
+            'active' { 'inProgress' }
+            default  { [string]$wipe.actionState }
+        }
+    }
+    else { 'notIssued' }
+
+    return [pscustomobject]@{
+        Found                   = $true
+        ManagedDeviceId         = $device.id
+        DeviceName              = $device.deviceName
+        SerialNumber            = $device.serialNumber
+        OperatingSystem         = $device.operatingSystem
+        ManagementState         = $device.managementState
+        LastSyncDateTime        = $device.lastSyncDateTime
+        WipeState               = $wipeState
+        WipeStartDateTime       = if ($wipe) { $wipe.startDateTime } else { $null }
+        WipeLastUpdatedDateTime = if ($wipe) { $wipe.lastUpdatedDateTime } else { $null }
+    }
+}
+
+function Get-AutopilotDeviceStatus {
+    <#
+        .SYNOPSIS
+            Reports whether a Windows Autopilot identity still exists for a serial
+            number (used to confirm the Autopilot deletion took effect).
+        .OUTPUTS
+            PSCustomObject: Present (bool), AutopilotDeviceId, SerialNumber.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $SerialNumber,
+        [hashtable] $LogProperties = @{}
+    )
+
+    if (-not $SerialNumber) {
+        return [pscustomobject]@{ Present = $null; AutopilotDeviceId = $null; SerialNumber = $SerialNumber; Detail = 'No serialNumber to check.' }
+    }
+
+    $escaped = $SerialNumber.Replace("'", "''")
+    $filter  = [Uri]::EscapeDataString("contains(serialNumber,'$escaped')")
+    $result  = Invoke-GraphRequest -Method GET -Path "deviceManagement/windowsAutopilotDeviceIdentities?`$filter=$filter"
+    $identity = @($result.value) | Where-Object { $_.serialNumber -eq $SerialNumber } | Select-Object -First 1
+
+    if ($identity) {
+        return [pscustomobject]@{ Present = $true; AutopilotDeviceId = $identity.id; SerialNumber = $SerialNumber }
+    }
+    return [pscustomobject]@{ Present = $false; AutopilotDeviceId = $null; SerialNumber = $SerialNumber }
+}
+# endregion Inlined functions from: AT.Graph.psm1
 
 function Write-Json {
     param([int] $StatusCode, $Object)
@@ -969,6 +1413,57 @@ function Write-Json {
         Headers    = @{ 'Content-Type' = 'application/json' }
         Body       = ($Object | ConvertTo-Json -Depth 12)
     })
+}
+
+function Get-IntuneWipeView {
+    param($Entity)
+
+    $dryRun = Get-JsonPropertyValue -InputObject $Entity -Name 'dryRun'
+    if ($dryRun -is [bool] -and $dryRun) { return $null }
+    if ([string]$dryRun -match '^(?i:true)$') { return $null }
+
+    $managedDeviceId = [string](Get-JsonPropertyValue -InputObject $Entity -Name 'managedDeviceId')
+    if ([string]::IsNullOrWhiteSpace($managedDeviceId)) { return $null }
+
+    $parameters = @{
+        ManagedDeviceId = $managedDeviceId
+        LogProperties = @{ requestId = $Entity.RowKey; managedDeviceId = $managedDeviceId }
+    }
+    $notBefore = [datetime]::MinValue
+    $dispatchedAt = [string](Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchedAt')
+    if ([datetime]::TryParse($dispatchedAt, [ref]$notBefore)) {
+        $parameters.NotBefore = $notBefore
+    }
+
+    try {
+        $wipe = Get-DeviceWipeStatus @parameters
+        if (-not $wipe.Found) {
+            return [ordered]@{
+                found = $false
+                managedDeviceId = $managedDeviceId
+                wipeState = 'deviceRemoved'
+            }
+        }
+        return [ordered]@{
+            found = $true
+            managedDeviceId = $wipe.ManagedDeviceId
+            deviceName = $wipe.DeviceName
+            managementState = $wipe.ManagementState
+            lastSyncDateTime = $wipe.LastSyncDateTime
+            wipeState = $wipe.WipeState
+            startDateTime = $wipe.WipeStartDateTime
+            lastUpdatedDateTime = $wipe.WipeLastUpdatedDateTime
+        }
+    }
+    catch {
+        Write-AtLog -Level 'Warning' -Message "Unable to query the live Intune wipe state: $($_.Exception.Message)" -Properties $parameters.LogProperties
+        return [ordered]@{
+            found = $null
+            managedDeviceId = $managedDeviceId
+            wipeState = 'unavailable'
+            error = $_.Exception.Message
+        }
+    }
 }
 
 function ConvertTo-StatusView {
@@ -1016,6 +1511,7 @@ function ConvertTo-StatusView {
         callbackAttempts  = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackAttempts'
         callbackNextAttemptAt = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackNextAttemptAt'
         callbackError     = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackError'
+        intuneWipe        = Get-IntuneWipeView -Entity $Entity
         result            = $result
     }
 }

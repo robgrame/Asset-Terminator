@@ -76,3 +76,80 @@ Describe 'Get-IntuneManagedDevice: IMEI lookup' {
         { Get-IntuneManagedDevice } | Should -Throw
     }
 }
+
+Describe 'Get-DeviceWipeStatus' {
+    It 'returns the latest wipe action from the current request window' {
+        Mock Invoke-GraphRequest {
+            [pscustomobject]@{
+                id = 'dev-3'
+                deviceName = 'DEVICE-3'
+                lastSyncDateTime = '2026-08-05T10:40:00Z'
+                deviceActionResults = @(
+                    [pscustomobject]@{
+                        actionName = 'wipe'
+                        actionState = 'done'
+                        startDateTime = '2026-07-01T08:00:00Z'
+                        lastUpdatedDateTime = '2026-07-01T08:05:00Z'
+                    },
+                    [pscustomobject]@{
+                        actionName = 'wipe'
+                        actionState = 'pending'
+                        startDateTime = '2026-08-05T10:35:00Z'
+                        lastUpdatedDateTime = '2026-08-05T10:36:00Z'
+                    }
+                )
+            }
+        } -ModuleName AT.Graph
+
+        $status = Get-DeviceWipeStatus `
+            -ManagedDeviceId 'dev-3' `
+            -NotBefore ([datetime]'2026-08-05T10:34:00Z')
+
+        $status.WipeState | Should -Be 'pending'
+        $status.LastSyncDateTime | Should -Be '2026-08-05T10:40:00Z'
+    }
+
+    It 'does not report an old completed wipe as the current request result' {
+        Mock Invoke-GraphRequest {
+            [pscustomobject]@{
+                id = 'dev-4'
+                deviceActionResults = @(
+                    [pscustomobject]@{
+                        actionName = 'wipe'
+                        actionState = 'done'
+                        startDateTime = '2026-07-01T08:00:00Z'
+                    }
+                )
+            }
+        } -ModuleName AT.Graph
+
+        $status = Get-DeviceWipeStatus `
+            -ManagedDeviceId 'dev-4' `
+            -NotBefore ([datetime]'2026-08-05T10:34:00Z')
+
+        $status.WipeState | Should -Be 'notIssued'
+    }
+
+    It 'reports a removed managed device instead of masking the 404 as unavailable' {
+        Mock Invoke-GraphRequest {
+            throw (New-GraphHttpError -StatusCode 404)
+        } -ModuleName AT.Graph
+
+        $status = Get-DeviceWipeStatus `
+            -ManagedDeviceId 'removed-device' `
+            -LogProperties @{ requestId = 'REQUEST-REMOVED' }
+
+        $status.Found | Should -BeFalse
+        $status.ManagedDeviceId | Should -Be 'removed-device'
+    }
+}
+
+Describe 'Write-MockLog' {
+    It 'accepts log properties without a correlationId' {
+        {
+            Write-MockLog `
+                -Message 'Managed device removed.' `
+                -Properties @{ requestId = 'REQUEST-REMOVED' }
+        } | Should -Not -Throw
+    }
+}

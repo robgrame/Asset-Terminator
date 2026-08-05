@@ -297,8 +297,9 @@ del deploy.
 
 ### Test end-to-end
 
-Il test E2E invia una richiesta con `dryRun=true`, verifica la risposta `202` e
-interroga lo stato fino a `Completed`:
+Il test E2E invia una richiesta con `dryRun=true`, accetta la risposta durevole
+`Accepted` (o l'esito già avanzato dal dispatch inline), segue il `Location`
+restituito dall'API e interroga lo stato fino a `Completed`:
 
 ```powershell
 cd poc-powershell-dispatch
@@ -314,6 +315,33 @@ Il seriale deve identificare un dispositivo gestito da Intune. Usare `-Real`
 solo per eseguire intenzionalmente un wipe effettivo. Il test restituisce un
 exit code non zero se l'intake non accetta la richiesta, il polling scade o lo
 stato terminale è diverso da quello atteso.
+
+Con `-Real`, dopo il completamento del job Automation il test continua a
+interrogare lo stesso endpoint di status finché `intuneWipe.wipeState` non
+diventa `done` (oppure il managed device viene rimosso), oppure finché
+`-TimeoutSeconds` scade. Gli stati `pending` e `inProgress` non sono considerati
+un completamento del wipe sul dispositivo.
+
+Se chi esegue il test non ha accesso alle risorse Azure, usare l'entry point
+diretto passando soltanto FQDN, Function key e seriale:
+
+```powershell
+./tests/Invoke-DispatchE2EDirect.ps1 -Fqdn attdisp-func-api-dev.azurewebsites.net -FunctionKey '<function-key>' -SerialNumber '<serial-number>'
+```
+
+Lo script non usa Azure CLI né Azure PowerShell. Aggiungere `-Real` solo per
+impostare `dryRun=false` e attendere anche il completamento effettivo del wipe
+esposto da Intune.
+
+Per i dispositivi Windows, dopo che Graph accetta il wipe il runbook esegue
+anche due nudges best-effort, come fallback per accelerare il check-in MDM:
+attende 60 secondi e invia `syncDevice`, quindi attende altri 60 secondi e invia
+`rebootNow`. Ogni nudge ritenta fino a tre volte sugli errori transitori
+(`408`, `429`, `5xx`) e non trasforma in errore un wipe già accettato. I ritardi
+si configurano con `SyncFallbackDelaySeconds` e
+`RestartFallbackDelaySeconds` (`0` disabilita il relativo nudge); il numero di
+tentativi si configura con `NudgeMaxAttempts` (1-5). In dry-run i nudges non
+vengono eseguiti.
 
 L'app registration Graph serve solo per le letture dell'intake:
 

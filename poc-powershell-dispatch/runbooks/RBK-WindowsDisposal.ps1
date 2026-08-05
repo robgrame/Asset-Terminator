@@ -58,6 +58,12 @@
 .PARAMETER WipeWaitSeconds
     Delay between the Autopilot delete and the wipe, to let the deletion settle.
 
+.PARAMETER SyncFallbackDelaySeconds
+    Delay after issuing the wipe before requesting an Intune sync. Set to 0 to disable.
+
+.PARAMETER RestartFallbackDelaySeconds
+    Delay after the sync nudge before requesting a remote restart. Set to 0 to disable.
+
 .EXAMPLE
     .\RBK-WindowsDisposal.ps1 -SerialNumbers "ABC123,DEF456" -Scenario Disposal
 #>
@@ -79,7 +85,20 @@ param(
     [string] $DryRun = "false",
 
     [Parameter(Mandatory = $false)]
-    [int] $WipeWaitSeconds = 60
+    [ValidateRange(0, 3600)]
+    [int] $WipeWaitSeconds = 60,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 3600)]
+    [int] $SyncFallbackDelaySeconds = 60,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 3600)]
+    [int] $RestartFallbackDelaySeconds = 60,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 5)]
+    [int] $NudgeMaxAttempts = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -267,6 +286,63 @@ function Invoke-GraphRequestSafe {
 
     Write-Verbose "[Graph] $Method $Uri"
     return Invoke-MgGraphRequest @params
+}
+
+function Get-GraphErrorStatusCode {
+    param([Parameter(Mandatory = $true)] $ErrorRecord)
+
+    try { return [int]$ErrorRecord.Exception.Response.StatusCode } catch { return $null }
+}
+
+function Invoke-ManagedDeviceNudge {
+    param(
+        [Parameter(Mandatory = $true)] [string] $ManagedDeviceId,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('syncDevice', 'rebootNow')]
+        [string] $Action,
+        [ValidateRange(1, 5)]
+        [int] $MaxAttempts = 3
+    )
+
+    $uri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$ManagedDeviceId/$Action"
+    $backoffSeconds = @(1, 3, 10, 30, 60)
+    $lastError = $null
+    $attemptsUsed = 0
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $attemptsUsed = $attempt
+        try {
+            Invoke-GraphRequestSafe -Uri $uri -Method 'POST' | Out-Null
+            Write-Warning "[Nudge] $Action accepted for managedDevice $ManagedDeviceId (attempt $attempt/$MaxAttempts)"
+            return [pscustomobject]@{
+                Action = $Action
+                Issued = $true
+                Attempts = $attempt
+                Error = $null
+            }
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            $status = Get-GraphErrorStatusCode -ErrorRecord $_
+            $transient = $status -in @(408, 429, 500, 502, 503, 504)
+
+            if (-not $transient -or $attempt -eq $MaxAttempts) {
+                Write-Warning "[Nudge] $Action failed for managedDevice $ManagedDeviceId after $attempt attempt(s): $lastError"
+                break
+            }
+
+            $delay = $backoffSeconds[[Math]::Min($attempt - 1, $backoffSeconds.Count - 1)]
+            Write-Warning "[Nudge] $Action transient failure (HTTP $status); retrying in $delay second(s)"
+            Start-Sleep -Seconds $delay
+        }
+    }
+
+    return [pscustomobject]@{
+        Action = $Action
+        Issued = $false
+        Attempts = $attemptsUsed
+        Error = $lastError
+    }
 }
 
 function Get-GraphPagedResult {
@@ -476,8 +552,9 @@ catch {
 
 try {
     $deviceResults = [ordered]@{}
-    foreach ($serial in $serials) {
-        $deviceResults[$serial] = [ordered]@{
+$nudgeTargets = [System.Collections.Generic.List[object]]::new()
+foreach ($serial in $serials) {
+    $deviceResults[$serial] = [ordered]@{
             serialNumber     = $serial
             autopilotFound   = $false
             autopilotDeleted = $false
@@ -485,6 +562,9 @@ try {
             managedDeviceId  = $null
             deviceName       = $null
             wipeIssued       = $false
+            syncIssued       = $false
+            restartIssued    = $false
+            nudgeErrors      = @()
             message          = ''
         }
     }
@@ -554,12 +634,67 @@ try {
                 $result.wipeIssued = $true
                 $deviceResults[$serial].message = 'Wipe command sent'
                 Send-RunbookAudit -Action 'DeviceWipeIssued' -Properties @{ serialNumber = $serial; deviceName = $managedDevice.deviceName; managedDeviceId = $managedDevice.id; dryRun = $isDryRun }
+                if (-not $isDryRun) {
+                    $nudgeTargets.Add([pscustomobject]@{
+                        SerialNumber = $serial
+                        ManagedDeviceId = [string]$managedDevice.id
+                        DeviceName = [string]$managedDevice.deviceName
+                    })
+                }
             }
             else {
                 $result.errors += "Wipe failed for serial '$serial' (device $($managedDevice.deviceName))."
                 $deviceResults[$serial].message = 'Wipe failed'
                 Send-RunbookAudit -Action 'DeviceWipeFailed' -Level 'Error' -Properties @{ serialNumber = $serial; deviceName = $managedDevice.deviceName; managedDeviceId = $managedDevice.id }
             }
+        }
+    }
+
+    # --- Step 4: post-wipe nudges ------------------------------------------
+    # Intune actions are asynchronous. These best-effort nudges increase the
+    # chance that an online device checks in promptly and applies the queued
+    # wipe. A nudge failure never reverses a wipe already accepted by Graph.
+    $uniqueNudgeTargets = @($nudgeTargets | Sort-Object ManagedDeviceId -Unique)
+
+    if ($uniqueNudgeTargets.Count -gt 0 -and $SyncFallbackDelaySeconds -gt 0) {
+        Write-Warning "[Main] Step 4: waiting $SyncFallbackDelaySeconds seconds before syncDevice"
+        Start-Sleep -Seconds $SyncFallbackDelaySeconds
+
+        foreach ($target in $uniqueNudgeTargets) {
+            $sync = Invoke-ManagedDeviceNudge `
+                -ManagedDeviceId $target.ManagedDeviceId `
+                -Action 'syncDevice' `
+                -MaxAttempts $NudgeMaxAttempts
+
+            $deviceResults[$target.SerialNumber].syncIssued = $sync.Issued
+            if (-not $sync.Issued) {
+                $message = "syncDevice failed after $($sync.Attempts) attempt(s): $($sync.Error)"
+                $deviceResults[$target.SerialNumber].nudgeErrors += $message
+            }
+            Send-RunbookAudit -Action ($(if ($sync.Issued) { 'DeviceSyncIssued' } else { 'DeviceSyncFailed' })) `
+                -Level ($(if ($sync.Issued) { 'Information' } else { 'Warning' })) `
+                -Properties @{ serialNumber = $target.SerialNumber; deviceName = $target.DeviceName; managedDeviceId = $target.ManagedDeviceId; attempts = $sync.Attempts; error = $sync.Error }
+        }
+    }
+
+    if ($uniqueNudgeTargets.Count -gt 0 -and $RestartFallbackDelaySeconds -gt 0) {
+        Write-Warning "[Main] Step 5: waiting $RestartFallbackDelaySeconds seconds before rebootNow"
+        Start-Sleep -Seconds $RestartFallbackDelaySeconds
+
+        foreach ($target in $uniqueNudgeTargets) {
+            $restart = Invoke-ManagedDeviceNudge `
+                -ManagedDeviceId $target.ManagedDeviceId `
+                -Action 'rebootNow' `
+                -MaxAttempts $NudgeMaxAttempts
+
+            $deviceResults[$target.SerialNumber].restartIssued = $restart.Issued
+            if (-not $restart.Issued) {
+                $message = "rebootNow failed after $($restart.Attempts) attempt(s): $($restart.Error)"
+                $deviceResults[$target.SerialNumber].nudgeErrors += $message
+            }
+            Send-RunbookAudit -Action ($(if ($restart.Issued) { 'DeviceRestartIssued' } else { 'DeviceRestartFailed' })) `
+                -Level ($(if ($restart.Issued) { 'Information' } else { 'Warning' })) `
+                -Properties @{ serialNumber = $target.SerialNumber; deviceName = $target.DeviceName; managedDeviceId = $target.ManagedDeviceId; attempts = $restart.Attempts; error = $restart.Error }
         }
     }
 
@@ -579,7 +714,7 @@ Write-Warning "=========================================="
 Write-Warning "[Main] Summary"
 Write-Warning "=========================================="
 foreach ($item in $result.devices) {
-    Write-Warning "[Summary] Serial=$($item.serialNumber) AutopilotFound=$($item.autopilotFound) AutopilotDeleted=$($item.autopilotDeleted) Device=$($item.deviceName) WipeIssued=$($item.wipeIssued) - $($item.message)"
+    Write-Warning "[Summary] Serial=$($item.serialNumber) AutopilotFound=$($item.autopilotFound) AutopilotDeleted=$($item.autopilotDeleted) Device=$($item.deviceName) WipeIssued=$($item.wipeIssued) SyncIssued=$($item.syncIssued) RestartIssued=$($item.restartIssued) - $($item.message)"
 }
 
 Write-RunbookResult -Result $result

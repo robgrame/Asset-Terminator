@@ -34,11 +34,18 @@ function Write-MockLog {
         [hashtable] $Properties
     )
 
+    $correlationId = if ($Properties -and $Properties.ContainsKey('correlationId')) {
+        $Properties.correlationId
+    }
+    else {
+        $null
+    }
+
     $payload = [ordered]@{
         timestamp     = (Get-Date).ToUniversalTime().ToString('o')
         level         = $Level
         message       = $Message
-        correlationId = $Properties.correlationId
+        correlationId = $correlationId
     }
     if ($Properties) {
         foreach ($key in $Properties.Keys) { $payload[$key] = $Properties[$key] }
@@ -355,6 +362,7 @@ function Get-DeviceWipeStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $ManagedDeviceId,
+        [datetime] $NotBefore,
         [hashtable] $LogProperties = @{}
     )
 
@@ -373,7 +381,20 @@ function Get-DeviceWipeStatus {
         throw
     }
 
-    $wipe = @($device.deviceActionResults) | Where-Object { $_.actionName -eq 'wipe' } | Select-Object -First 1
+    $wipeActions = @($device.deviceActionResults) | Where-Object { [string]$_.actionName -ieq 'wipe' }
+    if ($PSBoundParameters.ContainsKey('NotBefore')) {
+        $threshold = $NotBefore.ToUniversalTime().AddMinutes(-2)
+        $wipeActions = @($wipeActions | Where-Object {
+            $_.startDateTime -and ([datetime]$_.startDateTime).ToUniversalTime() -ge $threshold
+        })
+    }
+    $wipe = $wipeActions |
+        Sort-Object @{ Expression = {
+            if ($_.lastUpdatedDateTime) { [datetime]$_.lastUpdatedDateTime }
+            elseif ($_.startDateTime) { [datetime]$_.startDateTime }
+            else { [datetime]::MinValue }
+        }; Descending = $true } |
+        Select-Object -First 1
 
     $wipeState = if ($wipe) {
         switch ($wipe.actionState) {

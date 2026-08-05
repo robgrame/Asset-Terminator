@@ -526,11 +526,18 @@ function Write-MockLog {
         [hashtable] $Properties
     )
 
+    $correlationId = if ($Properties -and $Properties.ContainsKey('correlationId')) {
+        $Properties.correlationId
+    }
+    else {
+        $null
+    }
+
     $payload = [ordered]@{
         timestamp     = (Get-Date).ToUniversalTime().ToString('o')
         level         = $Level
         message       = $Message
-        correlationId = $Properties.correlationId
+        correlationId = $correlationId
     }
     if ($Properties) {
         foreach ($key in $Properties.Keys) { $payload[$key] = $Properties[$key] }
@@ -847,6 +854,7 @@ function Get-DeviceWipeStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string] $ManagedDeviceId,
+        [datetime] $NotBefore,
         [hashtable] $LogProperties = @{}
     )
 
@@ -865,7 +873,20 @@ function Get-DeviceWipeStatus {
         throw
     }
 
-    $wipe = @($device.deviceActionResults) | Where-Object { $_.actionName -eq 'wipe' } | Select-Object -First 1
+    $wipeActions = @($device.deviceActionResults) | Where-Object { [string]$_.actionName -ieq 'wipe' }
+    if ($PSBoundParameters.ContainsKey('NotBefore')) {
+        $threshold = $NotBefore.ToUniversalTime().AddMinutes(-2)
+        $wipeActions = @($wipeActions | Where-Object {
+            $_.startDateTime -and ([datetime]$_.startDateTime).ToUniversalTime() -ge $threshold
+        })
+    }
+    $wipe = $wipeActions |
+        Sort-Object @{ Expression = {
+            if ($_.lastUpdatedDateTime) { [datetime]$_.lastUpdatedDateTime }
+            elseif ($_.startDateTime) { [datetime]$_.startDateTime }
+            else { [datetime]::MinValue }
+        }; Descending = $true } |
+        Select-Object -First 1
 
     $wipeState = if ($wipe) {
         switch ($wipe.actionState) {
@@ -947,6 +968,19 @@ function Get-TableHeaders {
     }
 }
 
+function ConvertTo-TablePropertyValue {
+    param([Parameter(Mandatory)] $Value)
+
+    # Azure Table entities only support scalar property values.
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [pscustomobject] -or $Value -is [array]) {
+        return ($Value | ConvertTo-Json -Depth 10 -Compress)
+    }
+    if ($Value -is [datetime]) {
+        return $Value.ToUniversalTime().ToString('o')
+    }
+    return $Value
+}
+
 function Save-WipeRequestState {
     <#
     .SYNOPSIS
@@ -965,23 +999,23 @@ function Save-WipeRequestState {
     foreach ($key in $Properties.Keys) {
         $value = $Properties[$key]
         if ($null -eq $value) { continue }
-        # Table Storage has no object type: complex values are stored as JSON.
-        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
-            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
-        }
-        elseif ($value -is [datetime]) {
-            $entity[$key] = $value.ToUniversalTime().ToString('o')
-        }
-        else {
-            $entity[$key] = $value
-        }
+        $entity[$key] = ConvertTo-TablePropertyValue -Value $value
     }
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
     $headers = Get-TableHeaders
     $headers['Content-Type'] = 'application/json'
 
-    Invoke-RestMethod -Uri $uri -Method PUT -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+    try {
+        Invoke-RestMethod -Uri $uri -Method PUT -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+    }
+    catch {
+        $serviceError = [string]$_.ErrorDetails.Message
+        if (-not [string]::IsNullOrWhiteSpace($serviceError)) {
+            throw "Azure Table rejected the state entity: $serviceError"
+        }
+        throw
+    }
     return $entity
 }
 
@@ -1000,15 +1034,7 @@ function Update-WipeRequestState {
     foreach ($key in $Properties.Keys) {
         $value = $Properties[$key]
         if ($null -eq $value) { continue }
-        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
-            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
-        }
-        elseif ($value -is [datetime]) {
-            $entity[$key] = $value.ToUniversalTime().ToString('o')
-        }
-        else {
-            $entity[$key] = $value
-        }
+        $entity[$key] = ConvertTo-TablePropertyValue -Value $value
     }
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
@@ -1084,15 +1110,7 @@ function Set-WipeRequestStateClaim {
     foreach ($key in $Properties.Keys) {
         $value = $Properties[$key]
         if ($null -eq $value) { continue }
-        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
-            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
-        }
-        elseif ($value -is [datetime]) {
-            $entity[$key] = $value.ToUniversalTime().ToString('o')
-        }
-        else {
-            $entity[$key] = $value
-        }
+        $entity[$key] = ConvertTo-TablePropertyValue -Value $value
     }
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId

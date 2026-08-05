@@ -4,6 +4,34 @@ BeforeAll {
     Import-Module "$PSScriptRoot/../shared/Modules/AT.State.psm1" -Force
 }
 
+Describe 'Azure Table property serialization' {
+    BeforeEach {
+        Mock Get-StateTableUri { 'https://example.table.core.windows.net/wiperequests' } -ModuleName AT.State
+        Mock Get-TableHeaders { @{} } -ModuleName AT.State
+        Mock Invoke-RestMethod {} -ModuleName AT.State
+    }
+
+    It 'stores ordered dictionaries as JSON strings instead of unsupported nested entity properties' {
+        $payload = [ordered]@{
+            requestId = 'REQUEST-ORDERED'
+            device = [ordered]@{ serialNumber = 'SERIAL-ORDERED' }
+        }
+
+        Save-WipeRequestState -Platform 'Windows' -RequestId 'REQUEST-ORDERED' -Properties @{
+            status = 'Accepted'
+            payloadJson = $payload
+        } | Out-Null
+
+        Should -Invoke Invoke-RestMethod -ModuleName AT.State -Times 1 -Exactly -ParameterFilter {
+            $entity = $Body | ConvertFrom-Json
+            $storedPayload = $entity.payloadJson | ConvertFrom-Json
+            $entity.payloadJson -is [string] -and
+            $storedPayload.requestId -eq 'REQUEST-ORDERED' -and
+            $storedPayload.device.serialNumber -eq 'SERIAL-ORDERED'
+        }
+    }
+}
+
 Describe 'Device disposal lease' {
     BeforeEach {
         Mock Get-StateTableUri { 'https://example.table.core.windows.net/wiperequests' } -ModuleName AT.State
@@ -251,4 +279,3 @@ Describe 'Set-WipeRequestStateClaim (atomic ETag claim)' {
         $claimed | Should -BeFalse
     }
 }
-

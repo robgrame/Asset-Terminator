@@ -28,7 +28,7 @@ $moduleRoot = Join-Path $root 'shared/Modules'
 
 $functions = [ordered]@{
     'api/WipeIntake'         = @('AT.Common', 'AT.Graph', 'AT.State', 'AT.Automation', 'AT.Dispatch')
-    'api/GetStatus'          = @('AT.Common', 'AT.State')
+    'api/GetStatus'          = @('AT.Common', 'AT.State', 'AT.Graph')
     'api/JobMonitor'         = @('AT.Common', 'AT.State', 'AT.Automation', 'AT.Dispatch')
 }
 
