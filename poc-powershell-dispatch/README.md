@@ -59,36 +59,60 @@ Risposte:
 
 | Codice | Significato |
 |---|---|
-| `202` | Richiesta processata e runbook avviato (`Dispatched`, temporaneamente `Dispatching` durante il recovery), oppure dry-run completato (`Completed`). Header `Location: /api/v1/wipe/status?requestId=...` |
-| `200` | `requestId` già visto → stato corrente, `duplicate: true` |
+| `202` | Richiesta accettata in modo durevole (`Accepted`), o runbook avviato/confermato (`Dispatched`, temporaneamente `Dispatching` durante retry/recovery), oppure dry-run completato (`Completed`). Header `Location: /api/v1/wipe/status?requestId=...` |
+| `200` | `requestId` già visto con lo **stesso** contenuto → stato corrente, `duplicate: true` |
 | `400` | Payload non valido |
-| `409` | Esiste già una richiesta attiva per lo stesso dispositivo |
-| `422` | `status: Rejected` + `reason` (`DeviceNotManagedByIntune`, `GuardrailFailed`, `AmbiguousPlatform`) → ServiceNow apre un task manuale |
-| `502` | Graph non raggiungibile |
+| `409` | `requestId` già usato con contenuto **diverso** (nessun overwrite), oppure esiste già una richiesta attiva per lo stesso dispositivo |
+| `422` | `status: Rejected` + `reason` (`DeviceNotManagedByIntune`, `GuardrailFailed`, `AmbiguousPlatform`, `PlatformMismatch`, `DeviceIdentityMismatch`, `MissingSerialNumber`) → ServiceNow apre un task manuale. Ogni `Rejected` è persistito: `GetStatus` non risponde mai `404` per un `requestId` che ha raggiunto questa fase |
+| `502` | Graph non raggiungibile (solo errori genuini, es. throttling/RBAC: un device realmente non gestito resta `422`) |
 
 `operatingSystem: "Mobile"` è ambiguo: l'intake risolve iOS vs Android
-interrogando `managedDevices.operatingSystem` in Intune prima di instradare.
+interrogando `managedDevices.operatingSystem` in Intune prima di instradare, e
+rifiuta (`PlatformMismatch`) una piattaforma dichiarata esplicitamente che non
+corrisponde al valore autorevole in Intune.
+
+L'attempt di dispatch immediato eseguito da `WipeIntake` è **best-effort**: la
+riga durevole (`Accepted`, con il payload canonico completo) viene scritta
+*prima* di qualunque chiamata ad Automation, quindi un riavvio del Function
+App, un timeout ARM o un 429/5xx non perdono mai la richiesta. `JobMonitor`
+riconcilia (claim atomico via ETag, backoff esponenziale, tentativi limitati)
+tutto ciò che non è stato confermato inline.
 
 ### `GET /api/v1/wipe/status?requestId=...`
 
 Restituisce lo stato dalla macchina a stati:
 
 ```
-Accepted → Dispatching → Dispatched → Running → Completed
-                                      ↘ PartiallyCompleted
-                                      ↘ Failed
-Rejected (guardrail)   DispatchFailed (runbook non avviabile)
+Accepted → Dispatching → Dispatched → Running → EvidencePending → Completed
+                                                                  ↘ PartiallyCompleted
+                                                                  ↘ Failed (evidenceState=EvidenceMissing)
+Rejected (guardrail/validazione)   DispatchFailed (tentativi esauriti)
 ```
 
 `PartiallyCompleted` copre il caso "unenrollment riuscito ma wipe fallito", che
-il processo deve poter distinguere da un successo pieno.
+il processo deve poter distinguere da un successo pieno. `EvidencePending`
+copre il caso in cui il job Automation è già terminale ma l'output con la riga
+`##RESULT##` non è ancora leggibile: viene ritentato un numero limitato di
+volte prima di fallire come `Failed`/`evidenceState=EvidenceMissing`.
+
+La risposta include anche, quando disponibili: `attempts`, `nextAttemptAt`,
+`dispatchOutcome`, `payloadHash`, `evidenceState`, `eventId`,
+`callbackStatus`/`callbackAttempts`/`callbackNextAttemptAt`/`callbackError` e,
+per compatibilità con la precedente architettura basata su coda Service Bus,
+`queuedAt` (sempre uguale ad `acceptedAt`).
 
 ## Meccanismo di dispatch
 
 `WipeIntake` crea il job con
 `PUT .../automationAccounts/{aa}/jobs/{jobName}?api-version=2023-11-01` usando la
 managed identity. Il `jobName` è il `requestId`, quindi **ripetere la richiesta
-non crea un secondo job**.
+non crea un secondo job**. Se la risposta della PUT è ambigua (timeout, `429`,
+`5xx`), il dispatcher esegue una GET di conferma prima e dopo il tentativo:
+solo una GET che conferma l'assenza del job autorizza un nuovo tentativo di
+PUT; se anche la GET di conferma fallisce, lo stato resta "sconosciuto" (mai
+`DispatchFailed`, mai rilascio del lease) fino al tentativo successivo. Dopo
+`DISPATCH_MAX_ATTEMPTS` tentativi la richiesta fallisce definitivamente come
+`DispatchFailed`.
 
 I **webhook non sono supportati**: il token vive nell'URL (quindi finisce nei log
 e negli script client), non sono idempotenti e non restituiscono lo stato del
@@ -136,6 +160,32 @@ nominali, eliminando il ramo `$WebhookData` dell'originale.
 I valori `$.a.b` sono percorsi JSON valutati sul messaggio canonico: aggiungere
 una piattaforma (es. Android Zero-Touch) è una modifica di configurazione, non di
 codice.
+
+## Identità e RBAC
+
+Una singola **user-assigned managed identity** (`uami-api`) è condivisa da
+`WipeIntake`, `GetStatus` e `JobMonitor`, perché sono la stessa Function App
+(vincolo architetturale: nessuna identità separata per i "worker"). I ruoli
+assegnati sono i minimi necessari e scoperti a livello di singola risorsa, non
+di subscription o resource group:
+
+| Ruolo | Scope | Perché |
+|---|---|---|
+| Storage Blob/Queue/Table Data Contributor (+ Blob Data Owner) | il solo storage account del deploy | host storage delle Function + tabella `wiperequests` (accesso a chiave condivisa disabilitato: solo Entra ID) |
+| **Automation Job Operator** | il solo Automation Account del deploy | avviare job (`PUT .../jobs/{jobName}`), leggerne stato/output. Non concede la modifica dei runbook né l'accesso alle Automation Variables cifrate |
+
+**Rischio residuo accettato**: poiché l'identità è condivisa, un'eventuale
+compromissione del processo Function App concede *sia* lettura/scrittura sullo
+stato di *ogni* richiesta di dismissione (inclusi seriali, IMEI, callback URL)
+*sia* la possibilità di avviare/leggere qualunque job sui tre runbook
+dell'Automation Account — non esiste, per design, un'identità "worker"
+separata con un perimetro più stretto (es. una sola piattaforma). Questo è un
+compromesso deliberato del PoC per mantenere una singola Function App
+auditabile; per un ambiente di produzione con requisiti di isolamento più
+stringenti, valutare il monitoraggio degli accessi di `uami-api` (Entra sign-in
+logs / Automation job audit) e, se necessario, l'introduzione di un confine di
+autorizzazione aggiuntivo (es. runbook separati per Automation Account, o
+Conditional Access sulla risorsa).
 
 ## Segreti: Automation Variables
 
@@ -223,7 +273,12 @@ Questa variante non è compatibile con Azure Policy che impongono
 Durante la migrazione, dopo la pubblicazione riuscita, lo script rimuove
 automaticamente la Function App worker, la sua managed identity e il namespace
 Service Bus con lo stesso prefisso/ambiente. Nei nuovi ambienti non trova
-risorse e non esegue eliminazioni.
+risorse e non esegue eliminazioni. **Prima di rimuovere un namespace Service
+Bus legacy**, lo script verifica (per ogni coda e ogni sottoscrizione di ogni
+topic) che il conteggio messaggi attivi e dead-letter sia zero; se trova un
+backlog residuo, l'intero step di pulizia viene interrotto (`throw`) senza
+eliminare nulla, per non perdere silenziosamente richieste di dismissione mai
+processate dal vecchio percorso a coda.
 
 Lo script provisiona l'infrastruttura, genera gli `handler.ps1` autosufficienti
 (`build.ps1`) e pubblica la singola Function App.

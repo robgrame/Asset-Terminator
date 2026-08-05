@@ -202,9 +202,33 @@ Write-Host "    Function handlers indexed: $($availableFunctionNames -join ', ')
 
 Write-Host "==> Removing legacy worker and Service Bus resources" -ForegroundColor Cyan
 
+# Test-ServiceBusBacklog lives in its own file so it can be unit tested
+# (tests/DeployCutover.Tests.ps1) without requiring a live Azure CLI session.
+. (Join-Path $infraDir 'ServiceBusBacklog.ps1')
+
 $legacyWorkerName = "$NamePrefix-func-wrk-$Env"
 $legacyWorkerIdentityName = "$NamePrefix-uami-wrk-$Env"
 $legacyServiceBusPrefix = "$NamePrefix-sb-$Env-"
+
+# --- Cutover safety gate: never delete a Service Bus namespace with a backlog ---
+$legacyServiceBusNamespaces = @(
+    az resource list `
+        --subscription $subId `
+        --resource-group $ResourceGroup `
+        --resource-type 'Microsoft.ServiceBus/namespaces' `
+        --query "[?starts_with(name, '$legacyServiceBusPrefix')].name" `
+        --output tsv
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+foreach ($namespaceName in $legacyServiceBusNamespaces) {
+    Write-Host "    Checking for an unprocessed backlog in Service Bus namespace '$namespaceName'" -ForegroundColor Cyan
+    $backlog = Test-ServiceBusBacklog -SubscriptionId $subId -ResourceGroupName $ResourceGroup -NamespaceName $namespaceName
+    if ($backlog.Count -gt 0) {
+        throw "Aborting legacy resource cleanup: Service Bus namespace '$namespaceName' still has an unprocessed backlog and must NOT be deleted until every message has been drained or migrated:`n  - $($backlog -join "`n  - ")"
+    }
+    Write-Host "    No backlog in '$namespaceName': every queue and topic subscription has zero active and dead-letter messages." -ForegroundColor Green
+}
+
 $legacyWorkerPrincipalId = az identity show `
     --subscription $subId `
     --resource-group $ResourceGroup `
@@ -258,6 +282,7 @@ foreach ($resourceId in $legacyResourceIds) {
 }
 
 Write-Host "    Legacy resources removed: $($legacyResourceIds.Count)" -ForegroundColor Green
+
 
 Write-Host "==> Retrieving the default host key" -ForegroundColor Cyan
 $key = az functionapp keys list `

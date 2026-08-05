@@ -117,6 +117,164 @@ function Get-WipeRequestState {
     }
 }
 
+function Get-WipeRequestStateWithETag {
+    <#
+    .SYNOPSIS
+        Reads a state entity together with its ETag, so a caller can later apply
+        an optimistic-concurrency (If-Match) update: this is the read half of the
+        atomic "claim" used by JobMonitor to pick up a request without racing
+        another instance.
+    .OUTPUTS
+        PSCustomObject with Entity and ETag, or $null when the row does not exist.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId
+    )
+
+    $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+
+    return [pscustomobject]@{
+        Entity = $response.Content | ConvertFrom-Json
+        ETag   = [string]$response.Headers.ETag
+    }
+}
+
+function Set-WipeRequestStateClaim {
+    <#
+    .SYNOPSIS
+        Atomically claims a request row: merges Properties only if the row's
+        ETag still matches (If-Match). Returns $false instead of throwing when
+        another instance already claimed/modified the row first (HTTP 412), so
+        the caller can simply skip the row on this pass.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $ETag,
+        [Parameter(Mandatory)] [hashtable] $Properties
+    )
+
+    $entity = @{ PartitionKey = $Platform; RowKey = $RequestId }
+    foreach ($key in $Properties.Keys) {
+        $value = $Properties[$key]
+        if ($null -eq $value) { continue }
+        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
+            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
+        }
+        elseif ($value -is [datetime]) {
+            $entity[$key] = $value.ToUniversalTime().ToString('o')
+        }
+        else {
+            $entity[$key] = $value
+        }
+    }
+
+    $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    $headers = Get-TableHeaders
+    $headers['Content-Type'] = 'application/json'
+    $headers['If-Match'] = $ETag
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method MERGE -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+        return $true
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 412) { return $false }
+        throw
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Global requestId index (PartitionKey = '__RequestId')
+# ---------------------------------------------------------------------------
+# A dedicated partition maps requestId -> {platform, payloadHash} using a plain
+# Table Storage INSERT (POST), which the service itself makes conditional: two
+# concurrent inserts for the same RowKey can never both succeed, so this row is
+# a safe, race-free idempotency gate independent of the per-platform partition
+# used for the request state itself.
+function Register-RequestIdIndex {
+    <#
+    .SYNOPSIS
+        Atomically registers a requestId exactly once. A second registration
+        with the *same* payload hash is treated as a safe replay (returns the
+        first registration, Registered=$false, Conflict=$false). A second
+        registration with a *different* hash is a genuine collision and never
+        overwrites the original (Conflict=$true).
+    .OUTPUTS
+        PSCustomObject: Registered (bool, true only the first time), Conflict
+        (bool), Platform (string, the platform the requestId was first seen
+        with) and PayloadHash (string, the first-seen hash).
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $PayloadHash
+    )
+
+    $entity = @{
+        PartitionKey = '__RequestId'
+        RowKey       = $RequestId
+        platform     = $Platform
+        payloadHash  = $PayloadHash
+        registeredAt = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $uri = Get-StateTableUri
+    $headers = Get-TableHeaders
+    $headers['Content-Type'] = 'application/json'
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -Body ($entity | ConvertTo-Json) | Out-Null
+        return [pscustomobject]@{
+            Registered  = $true
+            Conflict    = $false
+            Platform    = $Platform
+            PayloadHash = $PayloadHash
+        }
+    }
+    catch {
+        if (-not $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 409) { throw }
+    }
+
+    # Someone (possibly this same caller, replaying) already registered this
+    # requestId: read it back and let the caller decide same-payload vs conflict.
+    $existing = Get-RequestIdIndex -RequestId $RequestId
+    if (-not $existing) {
+        # Extremely unlikely race (registered then deleted): surface as a conflict
+        # so the caller does not silently proceed as if it owned the requestId.
+        return [pscustomobject]@{ Registered = $false; Conflict = $true; Platform = $null; PayloadHash = $null }
+    }
+
+    $isConflict = [string]$existing.payloadHash -ne $PayloadHash
+    return [pscustomobject]@{
+        Registered  = $false
+        Conflict    = $isConflict
+        Platform    = [string]$existing.platform
+        PayloadHash = [string]$existing.payloadHash
+    }
+}
+
+function Get-RequestIdIndex {
+    param([Parameter(Mandatory)] [string] $RequestId)
+
+    $uri = "{0}(PartitionKey='__RequestId',RowKey='{1}')" -f (Get-StateTableUri), $RequestId
+    try {
+        return Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+}
+
 function Get-WipeDeviceLeaseKey {
     param([Parameter(Mandatory)] [string] $SerialNumber)
 
@@ -263,4 +421,6 @@ function Find-WipeRequestState {
 }
 
 Export-ModuleMember -Function Save-WipeRequestState, Update-WipeRequestState, Get-WipeRequestState, `
+    Get-WipeRequestStateWithETag, Set-WipeRequestStateClaim, `
+    Register-RequestIdIndex, Get-RequestIdIndex, `
     Lock-WipeDevice, Unlock-WipeDevice, Find-WipeRequestState

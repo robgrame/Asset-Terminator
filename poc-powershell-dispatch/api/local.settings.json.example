@@ -26,6 +26,16 @@
     "AUTOMATION_ACCOUNT_NAME": "attdisp-auto-dev",
     "RUNBOOK_MAP": "{\"Apple\":{\"runbook\":\"RBK-AppleDisposal\",\"parameters\":{\"SerialNumbers\":\"$.device.serialNumber\",\"MdmServerId\":\"$.options.mdmServerId\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":45},\"Android\":{\"runbook\":\"RBK-AndroidDisposal\",\"parameters\":{\"Serials\":\"$.device.serialNumber\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":20},\"Windows\":{\"runbook\":\"RBK-WindowsDisposal\",\"parameters\":{\"SerialNumbers\":\"$.device.serialNumber\",\"RequestId\":\"$.requestId\",\"Scenario\":\"$.scenario\",\"DryRun\":\"$.options.dryRun\"},\"timeoutMinutes\":20}}",
     "RUNBOOKS_SUPPORT_SCENARIO": "true",
-    "JOBMONITOR_SCHEDULE": "0 */2 * * * *"
+    "JOBMONITOR_SCHEDULE": "0 */2 * * * *",
+
+    "DISPATCH_MAX_ATTEMPTS": "8",
+    "DISPATCH_BACKOFF_BASE_SECONDS": "20",
+    "DISPATCH_BACKOFF_MAX_SECONDS": "1800",
+    "DISPATCH_MAX_CONCURRENCY": "10",
+    "EVIDENCE_MAX_ATTEMPTS": "5",
+    "CALLBACK_MAX_ATTEMPTS": "6",
+    "CALLBACK_BACKOFF_BASE_SECONDS": "15",
+    "CALLBACK_BACKOFF_MAX_SECONDS": "900",
+    "CALLBACK_MAX_CONCURRENCY": "20"
   }
 }

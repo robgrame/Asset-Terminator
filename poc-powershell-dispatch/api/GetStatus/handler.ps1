@@ -320,6 +320,110 @@ function Resolve-JsonPath {
     return $current
 }
 
+function ConvertTo-CanonicalJson {
+    <#
+    .SYNOPSIS
+        Serialises an object to JSON with object keys sorted, so two logically
+        equal payloads always produce the same text regardless of property order.
+    #>
+    param([Parameter(Mandatory)] $InputObject)
+
+    if ($null -eq $InputObject) { return 'null' }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $names = @($InputObject.Keys) | Sort-Object
+        $parts = foreach ($name in $names) {
+            '"{0}":{1}' -f $name, (ConvertTo-CanonicalJson -InputObject $InputObject[$name])
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    if ($InputObject -is [string]) {
+        return ($InputObject | ConvertTo-Json -Compress)
+    }
+
+    if ($InputObject -is [bool]) {
+        return $InputObject.ToString().ToLowerInvariant()
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        $parts = foreach ($item in $InputObject) { ConvertTo-CanonicalJson -InputObject $item }
+        return '[' + ($parts -join ',') + ']'
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $names = @($InputObject.PSObject.Properties.Name) | Sort-Object
+        $parts = foreach ($name in $names) {
+            '"{0}":{1}' -f $name, (ConvertTo-CanonicalJson -InputObject $InputObject.PSObject.Properties[$name].Value)
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    # Numbers and other primitives.
+    return ($InputObject | ConvertTo-Json -Compress)
+}
+
+function Get-PayloadHash {
+    <#
+    .SYNOPSIS
+        Deterministic SHA-256 hex digest of the parts of a request that define
+        "the same request": used to tell a safe replay (same requestId, same
+        content) from a requestId collision with different content.
+    #>
+    param([Parameter(Mandatory)] $InputObject)
+
+    $canonical = ConvertTo-CanonicalJson -InputObject $InputObject
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical))
+        return [System.Convert]::ToHexString($hash).ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Retry backoff
+# ---------------------------------------------------------------------------
+function Get-BackoffDelaySeconds {
+    <#
+    .SYNOPSIS
+        Exponential backoff with a cap, used for both dispatch retries and
+        callback retries: BaseSeconds * 2^(Attempt-1), capped at MaxSeconds.
+    #>
+    param(
+        [Parameter(Mandatory)] [int] $Attempt,
+        [int] $BaseSeconds = 15,
+        [int] $MaxSeconds = 1800
+    )
+
+    if ($Attempt -lt 1) { $Attempt = 1 }
+    $delay = $BaseSeconds * [Math]::Pow(2, ($Attempt - 1))
+    if ($delay -gt $MaxSeconds -or [double]::IsInfinity($delay)) { $delay = $MaxSeconds }
+    return [int]$delay
+}
+
+function Get-HttpErrorStatusCode {
+    <#
+    .SYNOPSIS
+        Best-effort extraction of the HTTP status code from a terminating error
+        raised by Invoke-RestMethod/Invoke-WebRequest. Returns $null when the
+        error has no HTTP response at all (e.g. a network timeout or DNS
+        failure), which callers must treat as "unknown", not as any specific
+        status.
+    #>
+    param($ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch { }
+    return $null
+}
+
 function ConvertFrom-JsonBody {
     param($Body)
 
@@ -468,6 +572,164 @@ function Get-WipeRequestState {
     )
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    try {
+        return Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+}
+
+function Get-WipeRequestStateWithETag {
+    <#
+    .SYNOPSIS
+        Reads a state entity together with its ETag, so a caller can later apply
+        an optimistic-concurrency (If-Match) update: this is the read half of the
+        atomic "claim" used by JobMonitor to pick up a request without racing
+        another instance.
+    .OUTPUTS
+        PSCustomObject with Entity and ETag, or $null when the row does not exist.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId
+    )
+
+    $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+
+    return [pscustomobject]@{
+        Entity = $response.Content | ConvertFrom-Json
+        ETag   = [string]$response.Headers.ETag
+    }
+}
+
+function Set-WipeRequestStateClaim {
+    <#
+    .SYNOPSIS
+        Atomically claims a request row: merges Properties only if the row's
+        ETag still matches (If-Match). Returns $false instead of throwing when
+        another instance already claimed/modified the row first (HTTP 412), so
+        the caller can simply skip the row on this pass.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $ETag,
+        [Parameter(Mandatory)] [hashtable] $Properties
+    )
+
+    $entity = @{ PartitionKey = $Platform; RowKey = $RequestId }
+    foreach ($key in $Properties.Keys) {
+        $value = $Properties[$key]
+        if ($null -eq $value) { continue }
+        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
+            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
+        }
+        elseif ($value -is [datetime]) {
+            $entity[$key] = $value.ToUniversalTime().ToString('o')
+        }
+        else {
+            $entity[$key] = $value
+        }
+    }
+
+    $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    $headers = Get-TableHeaders
+    $headers['Content-Type'] = 'application/json'
+    $headers['If-Match'] = $ETag
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method MERGE -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+        return $true
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 412) { return $false }
+        throw
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Global requestId index (PartitionKey = '__RequestId')
+# ---------------------------------------------------------------------------
+# A dedicated partition maps requestId -> {platform, payloadHash} using a plain
+# Table Storage INSERT (POST), which the service itself makes conditional: two
+# concurrent inserts for the same RowKey can never both succeed, so this row is
+# a safe, race-free idempotency gate independent of the per-platform partition
+# used for the request state itself.
+function Register-RequestIdIndex {
+    <#
+    .SYNOPSIS
+        Atomically registers a requestId exactly once. A second registration
+        with the *same* payload hash is treated as a safe replay (returns the
+        first registration, Registered=$false, Conflict=$false). A second
+        registration with a *different* hash is a genuine collision and never
+        overwrites the original (Conflict=$true).
+    .OUTPUTS
+        PSCustomObject: Registered (bool, true only the first time), Conflict
+        (bool), Platform (string, the platform the requestId was first seen
+        with) and PayloadHash (string, the first-seen hash).
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $PayloadHash
+    )
+
+    $entity = @{
+        PartitionKey = '__RequestId'
+        RowKey       = $RequestId
+        platform     = $Platform
+        payloadHash  = $PayloadHash
+        registeredAt = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $uri = Get-StateTableUri
+    $headers = Get-TableHeaders
+    $headers['Content-Type'] = 'application/json'
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -Body ($entity | ConvertTo-Json) | Out-Null
+        return [pscustomobject]@{
+            Registered  = $true
+            Conflict    = $false
+            Platform    = $Platform
+            PayloadHash = $PayloadHash
+        }
+    }
+    catch {
+        if (-not $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 409) { throw }
+    }
+
+    # Someone (possibly this same caller, replaying) already registered this
+    # requestId: read it back and let the caller decide same-payload vs conflict.
+    $existing = Get-RequestIdIndex -RequestId $RequestId
+    if (-not $existing) {
+        # Extremely unlikely race (registered then deleted): surface as a conflict
+        # so the caller does not silently proceed as if it owned the requestId.
+        return [pscustomobject]@{ Registered = $false; Conflict = $true; Platform = $null; PayloadHash = $null }
+    }
+
+    $isConflict = [string]$existing.payloadHash -ne $PayloadHash
+    return [pscustomobject]@{
+        Registered  = $false
+        Conflict    = $isConflict
+        Platform    = [string]$existing.platform
+        PayloadHash = [string]$existing.payloadHash
+    }
+}
+
+function Get-RequestIdIndex {
+    param([Parameter(Mandatory)] [string] $RequestId)
+
+    $uri = "{0}(PartitionKey='__RequestId',RowKey='{1}')" -f (Get-StateTableUri), $RequestId
     try {
         return Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders)
     }
@@ -646,7 +908,9 @@ function ConvertTo-StatusView {
         platform          = $Entity.PartitionKey
         correlationId     = Get-JsonPropertyValue -InputObject $Entity -Name 'correlationId'
         status            = Get-JsonPropertyValue -InputObject $Entity -Name 'status'
+        reason            = Get-JsonPropertyValue -InputObject $Entity -Name 'reason'
         scenario          = Get-JsonPropertyValue -InputObject $Entity -Name 'scenario'
+        payloadHash       = Get-JsonPropertyValue -InputObject $Entity -Name 'payloadHash'
         device            = [ordered]@{
             serialNumber    = Get-JsonPropertyValue -InputObject $Entity -Name 'serialNumber'
             imei            = Get-JsonPropertyValue -InputObject $Entity -Name 'imei'
@@ -654,15 +918,27 @@ function ConvertTo-StatusView {
             managedDeviceId = Get-JsonPropertyValue -InputObject $Entity -Name 'managedDeviceId'
             operatingSystem = Get-JsonPropertyValue -InputObject $Entity -Name 'operatingSystem'
         }
+        runbook           = Get-JsonPropertyValue -InputObject $Entity -Name 'runbook'
         automationJobName = Get-JsonPropertyValue -InputObject $Entity -Name 'automationJobName'
         automationJobId   = Get-JsonPropertyValue -InputObject $Entity -Name 'automationJobId'
-        runbook           = Get-JsonPropertyValue -InputObject $Entity -Name 'runbook'
+        dispatchOutcome   = Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchOutcome'
         attempts          = Get-JsonPropertyValue -InputObject $Entity -Name 'attempts'
+        nextAttemptAt     = Get-JsonPropertyValue -InputObject $Entity -Name 'nextAttemptAt'
+        evidenceState     = Get-JsonPropertyValue -InputObject $Entity -Name 'evidenceState'
+        evidenceAttempts  = Get-JsonPropertyValue -InputObject $Entity -Name 'evidenceAttempts'
+        # 'queuedAt' is kept alongside 'acceptedAt' for compatibility with the
+        # earlier Service-Bus-queue based architecture, whose consumers expect
+        # a 'queuedAt' timestamp: both fields always carry the same value.
         acceptedAt        = Get-JsonPropertyValue -InputObject $Entity -Name 'acceptedAt'
+        queuedAt          = Get-JsonPropertyValue -InputObject $Entity -Name 'acceptedAt'
         dispatchedAt      = Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchedAt'
         completedAt       = Get-JsonPropertyValue -InputObject $Entity -Name 'completedAt'
         errorMessage      = Get-JsonPropertyValue -InputObject $Entity -Name 'errorMessage'
+        eventId           = Get-JsonPropertyValue -InputObject $Entity -Name 'eventId'
         callbackStatus    = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackStatus'
+        callbackAttempts  = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackAttempts'
+        callbackNextAttemptAt = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackNextAttemptAt'
+        callbackError     = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackError'
         result            = $result
     }
 }
@@ -676,10 +952,12 @@ if ([string]::IsNullOrWhiteSpace($requestId) -and [string]::IsNullOrWhiteSpace($
 }
 
 $filter = if (-not [string]::IsNullOrWhiteSpace($requestId)) {
-    "RowKey eq '$($requestId.Replace("'", "''"))'"
+    # The '__RequestId' partition also uses requestId as its RowKey (the atomic
+    # idempotency index written by WipeIntake): it must never be returned here.
+    "PartitionKey ne '__RequestId' and RowKey eq '$($requestId.Replace("'", "''"))'"
 }
 else {
-    "PartitionKey ne '__DeviceLease' and serialNumber eq '$($serialNumber.Replace("'", "''"))'"
+    "PartitionKey ne '__DeviceLease' and PartitionKey ne '__RequestId' and serialNumber eq '$($serialNumber.Replace("'", "''"))'"
 }
 
 try {

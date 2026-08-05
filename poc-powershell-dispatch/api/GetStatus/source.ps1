@@ -34,7 +34,9 @@ function ConvertTo-StatusView {
         platform          = $Entity.PartitionKey
         correlationId     = Get-JsonPropertyValue -InputObject $Entity -Name 'correlationId'
         status            = Get-JsonPropertyValue -InputObject $Entity -Name 'status'
+        reason            = Get-JsonPropertyValue -InputObject $Entity -Name 'reason'
         scenario          = Get-JsonPropertyValue -InputObject $Entity -Name 'scenario'
+        payloadHash       = Get-JsonPropertyValue -InputObject $Entity -Name 'payloadHash'
         device            = [ordered]@{
             serialNumber    = Get-JsonPropertyValue -InputObject $Entity -Name 'serialNumber'
             imei            = Get-JsonPropertyValue -InputObject $Entity -Name 'imei'
@@ -42,15 +44,27 @@ function ConvertTo-StatusView {
             managedDeviceId = Get-JsonPropertyValue -InputObject $Entity -Name 'managedDeviceId'
             operatingSystem = Get-JsonPropertyValue -InputObject $Entity -Name 'operatingSystem'
         }
+        runbook           = Get-JsonPropertyValue -InputObject $Entity -Name 'runbook'
         automationJobName = Get-JsonPropertyValue -InputObject $Entity -Name 'automationJobName'
         automationJobId   = Get-JsonPropertyValue -InputObject $Entity -Name 'automationJobId'
-        runbook           = Get-JsonPropertyValue -InputObject $Entity -Name 'runbook'
+        dispatchOutcome   = Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchOutcome'
         attempts          = Get-JsonPropertyValue -InputObject $Entity -Name 'attempts'
+        nextAttemptAt     = Get-JsonPropertyValue -InputObject $Entity -Name 'nextAttemptAt'
+        evidenceState     = Get-JsonPropertyValue -InputObject $Entity -Name 'evidenceState'
+        evidenceAttempts  = Get-JsonPropertyValue -InputObject $Entity -Name 'evidenceAttempts'
+        # 'queuedAt' is kept alongside 'acceptedAt' for compatibility with the
+        # earlier Service-Bus-queue based architecture, whose consumers expect
+        # a 'queuedAt' timestamp: both fields always carry the same value.
         acceptedAt        = Get-JsonPropertyValue -InputObject $Entity -Name 'acceptedAt'
+        queuedAt          = Get-JsonPropertyValue -InputObject $Entity -Name 'acceptedAt'
         dispatchedAt      = Get-JsonPropertyValue -InputObject $Entity -Name 'dispatchedAt'
         completedAt       = Get-JsonPropertyValue -InputObject $Entity -Name 'completedAt'
         errorMessage      = Get-JsonPropertyValue -InputObject $Entity -Name 'errorMessage'
+        eventId           = Get-JsonPropertyValue -InputObject $Entity -Name 'eventId'
         callbackStatus    = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackStatus'
+        callbackAttempts  = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackAttempts'
+        callbackNextAttemptAt = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackNextAttemptAt'
+        callbackError     = Get-JsonPropertyValue -InputObject $Entity -Name 'callbackError'
         result            = $result
     }
 }
@@ -64,10 +78,12 @@ if ([string]::IsNullOrWhiteSpace($requestId) -and [string]::IsNullOrWhiteSpace($
 }
 
 $filter = if (-not [string]::IsNullOrWhiteSpace($requestId)) {
-    "RowKey eq '$($requestId.Replace("'", "''"))'"
+    # The '__RequestId' partition also uses requestId as its RowKey (the atomic
+    # idempotency index written by WipeIntake): it must never be returned here.
+    "PartitionKey ne '__RequestId' and RowKey eq '$($requestId.Replace("'", "''"))'"
 }
 else {
-    "PartitionKey ne '__DeviceLease' and serialNumber eq '$($serialNumber.Replace("'", "''"))'"
+    "PartitionKey ne '__DeviceLease' and PartitionKey ne '__RequestId' and serialNumber eq '$($serialNumber.Replace("'", "''"))'"
 }
 
 try {

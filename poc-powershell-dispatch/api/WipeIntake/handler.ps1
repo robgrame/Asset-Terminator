@@ -4,15 +4,32 @@ using namespace System.Net
 
 # WipeIntake handler - HTTP front door for ServiceNow.
 #
-# This function never wipes the device itself. It:
+# This function never wipes the device itself, and it never blocks on the
+# runbook finishing. It:
 #   1. validates the request;
-#   2. normalises operatingSystem -> enrollment platform (resolving the ambiguous
-#      "Mobile" value against Intune);
-#   3. runs the fast, read-only guardrails (device managed by Intune, encryption,
-#      user confirmation);
-#   4. persists the request state (write-before-action);
-#   5. starts the platform runbook directly through Azure Resource Manager;
-#   6. answers 202 Accepted with the requestId and a Location header.
+#   2. atomically registers the requestId in a global index (PartitionKey
+#      '__RequestId') so a retried/duplicated POST can never create two
+#      dispatch attempts: same id + same content replays the current state,
+#      same id + different content is rejected with 409 and never overwrites
+#      the original;
+#   3. normalises operatingSystem -> enrollment platform (resolving the
+#      ambiguous "Mobile" value against Intune) and rejects a payload whose
+#      declared platform disagrees with Intune's authoritative record;
+#   4. runs the fast, read-only guardrails (device managed by Intune,
+#      encryption, user confirmation) and persists every Rejected outcome so
+#      GetStatus can always answer for a requestId that was ever accepted for
+#      processing;
+#   5. persists the full canonical payload with status=Accepted BEFORE any
+#      dispatch attempt is made (write-before-action / durable handoff): if
+#      the Function App crashes or restarts right here, JobMonitor's
+#      reconciliation pass still has everything it needs to dispatch the
+#      runbook, because it reads this same persisted payload;
+#   6. makes one optional, best-effort immediate dispatch attempt through
+#      Azure Resource Manager. Success or failure of this attempt never
+#      changes the durability guarantee from step 5: an ambiguous or
+#      transient failure here is left for JobMonitor to retry with backoff,
+#      never surfaced to the caller as a hard failure;
+#   7. answers 202 Accepted with the requestId and a Location header.
 
 param($Request, $TriggerMetadata)
 
@@ -325,6 +342,110 @@ function Resolve-JsonPath {
     return $current
 }
 
+function ConvertTo-CanonicalJson {
+    <#
+    .SYNOPSIS
+        Serialises an object to JSON with object keys sorted, so two logically
+        equal payloads always produce the same text regardless of property order.
+    #>
+    param([Parameter(Mandatory)] $InputObject)
+
+    if ($null -eq $InputObject) { return 'null' }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $names = @($InputObject.Keys) | Sort-Object
+        $parts = foreach ($name in $names) {
+            '"{0}":{1}' -f $name, (ConvertTo-CanonicalJson -InputObject $InputObject[$name])
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    if ($InputObject -is [string]) {
+        return ($InputObject | ConvertTo-Json -Compress)
+    }
+
+    if ($InputObject -is [bool]) {
+        return $InputObject.ToString().ToLowerInvariant()
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        $parts = foreach ($item in $InputObject) { ConvertTo-CanonicalJson -InputObject $item }
+        return '[' + ($parts -join ',') + ']'
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $names = @($InputObject.PSObject.Properties.Name) | Sort-Object
+        $parts = foreach ($name in $names) {
+            '"{0}":{1}' -f $name, (ConvertTo-CanonicalJson -InputObject $InputObject.PSObject.Properties[$name].Value)
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    # Numbers and other primitives.
+    return ($InputObject | ConvertTo-Json -Compress)
+}
+
+function Get-PayloadHash {
+    <#
+    .SYNOPSIS
+        Deterministic SHA-256 hex digest of the parts of a request that define
+        "the same request": used to tell a safe replay (same requestId, same
+        content) from a requestId collision with different content.
+    #>
+    param([Parameter(Mandatory)] $InputObject)
+
+    $canonical = ConvertTo-CanonicalJson -InputObject $InputObject
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical))
+        return [System.Convert]::ToHexString($hash).ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Retry backoff
+# ---------------------------------------------------------------------------
+function Get-BackoffDelaySeconds {
+    <#
+    .SYNOPSIS
+        Exponential backoff with a cap, used for both dispatch retries and
+        callback retries: BaseSeconds * 2^(Attempt-1), capped at MaxSeconds.
+    #>
+    param(
+        [Parameter(Mandatory)] [int] $Attempt,
+        [int] $BaseSeconds = 15,
+        [int] $MaxSeconds = 1800
+    )
+
+    if ($Attempt -lt 1) { $Attempt = 1 }
+    $delay = $BaseSeconds * [Math]::Pow(2, ($Attempt - 1))
+    if ($delay -gt $MaxSeconds -or [double]::IsInfinity($delay)) { $delay = $MaxSeconds }
+    return [int]$delay
+}
+
+function Get-HttpErrorStatusCode {
+    <#
+    .SYNOPSIS
+        Best-effort extraction of the HTTP status code from a terminating error
+        raised by Invoke-RestMethod/Invoke-WebRequest. Returns $null when the
+        error has no HTTP response at all (e.g. a network timeout or DNS
+        failure), which callers must treat as "unknown", not as any specific
+        status.
+    #>
+    param($ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch { }
+    return $null
+}
+
 function ConvertFrom-JsonBody {
     param($Body)
 
@@ -525,9 +646,17 @@ function Invoke-GraphRequest {
 function Get-IntuneManagedDevice {
     <#
         .SYNOPSIS
-            Resolves an Intune managed device by managedDeviceId, or by deviceName
-            and/or serialNumber. When several stale objects match, the freshest one
-            (by enrolledDateTime, then lastSyncDateTime) is returned.
+            Resolves an Intune managed device by managedDeviceId, or by deviceName,
+            serialNumber and/or imei. When several stale objects match, the freshest
+            one (by enrolledDateTime, then lastSyncDateTime) is returned.
+        .DESCRIPTION
+            A device is reported "not managed" ($null return) ONLY when Graph
+            genuinely has no matching object (an empty result set, or a 404 on a
+            direct id lookup). Any other Graph failure - authentication, RBAC,
+            throttling, a 5xx - is rethrown so the caller can tell "this device is
+            not enrolled" apart from "we could not ask Intune right now"; conflating
+            the two would route real outages to the manual-task guardrail instead
+            of surfacing them as the transient error they are.
         .OUTPUTS
             The managedDevice Graph object, or $null when not found.
     #>
@@ -536,25 +665,31 @@ function Get-IntuneManagedDevice {
         [string] $ManagedDeviceId,
         [string] $DeviceName,
         [string] $SerialNumber,
+        [string] $Imei,
         [hashtable] $LogProperties = @{}
     )
 
-    $select = 'id,deviceName,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,manufacturer'
+    $select = 'id,deviceName,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,manufacturer,imei'
 
     if ($ManagedDeviceId) {
         try {
             return Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices/$ManagedDeviceId`?`$select=$select"
         }
-        catch { return $null }
+        catch {
+            $status = Get-HttpErrorStatusCode -ErrorRecord $_
+            if ($status -eq 404) { return $null }
+            throw
+        }
     }
 
-    if (-not $DeviceName -and -not $SerialNumber) {
-        throw 'Get-IntuneManagedDevice requires -ManagedDeviceId, -DeviceName or -SerialNumber.'
+    if (-not $DeviceName -and -not $SerialNumber -and -not $Imei) {
+        throw 'Get-IntuneManagedDevice requires -ManagedDeviceId, -DeviceName, -SerialNumber or -Imei.'
     }
 
     $clauses = @()
     if ($DeviceName)   { $clauses += "deviceName eq '$($DeviceName.Replace("'", "''"))'" }
     if ($SerialNumber) { $clauses += "serialNumber eq '$($SerialNumber.Replace("'", "''"))'" }
+    if ($Imei)         { $clauses += "imei eq '$($Imei.Replace("'", "''"))'" }
     $filter = [Uri]::EscapeDataString($clauses -join ' and ')
 
     $candidates = @()
@@ -563,10 +698,21 @@ function Get-IntuneManagedDevice {
         $candidates = @($result.value)
     }
     catch {
-        Write-MockLog -Level 'Warning' -Message "Server-side filter failed ($($_.Exception.Message)); falling back to client-side matching." -Properties $LogProperties
+        # Some combined $filter clauses (e.g. imei together with deviceName) are
+        # rejected by Graph as an unsupported query (400): fall back to a single
+        # supported clause and match the remaining criteria client-side. Any
+        # other status (401/403/429/5xx) is a real failure and must propagate.
+        $status = Get-HttpErrorStatusCode -ErrorRecord $_
+        if ($status -ne 400) { throw }
+
+        Write-MockLog -Level 'Warning' -Message "Server-side filter failed (status $status); falling back to client-side matching." -Properties $LogProperties
         if ($DeviceName) {
             $nameFilter = [Uri]::EscapeDataString("deviceName eq '$($DeviceName.Replace("'", "''"))'")
             $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$nameFilter&`$select=$select"
+        }
+        elseif ($SerialNumber) {
+            $serialFilter = [Uri]::EscapeDataString("serialNumber eq '$($SerialNumber.Replace("'", "''"))'")
+            $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$serialFilter&`$select=$select"
         }
         else {
             $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$select=$select"
@@ -576,6 +722,7 @@ function Get-IntuneManagedDevice {
 
     if ($DeviceName)   { $candidates = @($candidates | Where-Object { $_.deviceName   -eq $DeviceName }) }
     if ($SerialNumber) { $candidates = @($candidates | Where-Object { $_.serialNumber -eq $SerialNumber }) }
+    if ($Imei)         { $candidates = @($candidates | Where-Object { $_.imei -eq $Imei }) }
 
     if ($candidates.Count -eq 0) { return $null }
 
@@ -873,6 +1020,164 @@ function Get-WipeRequestState {
     )
 
     $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    try {
+        return Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+}
+
+function Get-WipeRequestStateWithETag {
+    <#
+    .SYNOPSIS
+        Reads a state entity together with its ETag, so a caller can later apply
+        an optimistic-concurrency (If-Match) update: this is the read half of the
+        atomic "claim" used by JobMonitor to pick up a request without racing
+        another instance.
+    .OUTPUTS
+        PSCustomObject with Entity and ETag, or $null when the row does not exist.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId
+    )
+
+    $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method GET -Headers (Get-TableHeaders)
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { return $null }
+        throw
+    }
+
+    return [pscustomobject]@{
+        Entity = $response.Content | ConvertFrom-Json
+        ETag   = [string]$response.Headers.ETag
+    }
+}
+
+function Set-WipeRequestStateClaim {
+    <#
+    .SYNOPSIS
+        Atomically claims a request row: merges Properties only if the row's
+        ETag still matches (If-Match). Returns $false instead of throwing when
+        another instance already claimed/modified the row first (HTTP 412), so
+        the caller can simply skip the row on this pass.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $ETag,
+        [Parameter(Mandatory)] [hashtable] $Properties
+    )
+
+    $entity = @{ PartitionKey = $Platform; RowKey = $RequestId }
+    foreach ($key in $Properties.Keys) {
+        $value = $Properties[$key]
+        if ($null -eq $value) { continue }
+        if ($value -is [hashtable] -or $value -is [pscustomobject] -or $value -is [array]) {
+            $entity[$key] = ($value | ConvertTo-Json -Depth 10 -Compress)
+        }
+        elseif ($value -is [datetime]) {
+            $entity[$key] = $value.ToUniversalTime().ToString('o')
+        }
+        else {
+            $entity[$key] = $value
+        }
+    }
+
+    $uri = "{0}(PartitionKey='{1}',RowKey='{2}')" -f (Get-StateTableUri), $Platform, $RequestId
+    $headers = Get-TableHeaders
+    $headers['Content-Type'] = 'application/json'
+    $headers['If-Match'] = $ETag
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method MERGE -Headers $headers -Body ($entity | ConvertTo-Json -Depth 10) | Out-Null
+        return $true
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 412) { return $false }
+        throw
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Global requestId index (PartitionKey = '__RequestId')
+# ---------------------------------------------------------------------------
+# A dedicated partition maps requestId -> {platform, payloadHash} using a plain
+# Table Storage INSERT (POST), which the service itself makes conditional: two
+# concurrent inserts for the same RowKey can never both succeed, so this row is
+# a safe, race-free idempotency gate independent of the per-platform partition
+# used for the request state itself.
+function Register-RequestIdIndex {
+    <#
+    .SYNOPSIS
+        Atomically registers a requestId exactly once. A second registration
+        with the *same* payload hash is treated as a safe replay (returns the
+        first registration, Registered=$false, Conflict=$false). A second
+        registration with a *different* hash is a genuine collision and never
+        overwrites the original (Conflict=$true).
+    .OUTPUTS
+        PSCustomObject: Registered (bool, true only the first time), Conflict
+        (bool), Platform (string, the platform the requestId was first seen
+        with) and PayloadHash (string, the first-seen hash).
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $PayloadHash
+    )
+
+    $entity = @{
+        PartitionKey = '__RequestId'
+        RowKey       = $RequestId
+        platform     = $Platform
+        payloadHash  = $PayloadHash
+        registeredAt = (Get-Date).ToUniversalTime().ToString('o')
+    }
+
+    $uri = Get-StateTableUri
+    $headers = Get-TableHeaders
+    $headers['Content-Type'] = 'application/json'
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method POST -Headers $headers -Body ($entity | ConvertTo-Json) | Out-Null
+        return [pscustomobject]@{
+            Registered  = $true
+            Conflict    = $false
+            Platform    = $Platform
+            PayloadHash = $PayloadHash
+        }
+    }
+    catch {
+        if (-not $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 409) { throw }
+    }
+
+    # Someone (possibly this same caller, replaying) already registered this
+    # requestId: read it back and let the caller decide same-payload vs conflict.
+    $existing = Get-RequestIdIndex -RequestId $RequestId
+    if (-not $existing) {
+        # Extremely unlikely race (registered then deleted): surface as a conflict
+        # so the caller does not silently proceed as if it owned the requestId.
+        return [pscustomobject]@{ Registered = $false; Conflict = $true; Platform = $null; PayloadHash = $null }
+    }
+
+    $isConflict = [string]$existing.payloadHash -ne $PayloadHash
+    return [pscustomobject]@{
+        Registered  = $false
+        Conflict    = $isConflict
+        Platform    = [string]$existing.platform
+        PayloadHash = [string]$existing.payloadHash
+    }
+}
+
+function Get-RequestIdIndex {
+    param([Parameter(Mandatory)] [string] $RequestId)
+
+    $uri = "{0}(PartitionKey='__RequestId',RowKey='{1}')" -f (Get-StateTableUri), $RequestId
     try {
         return Invoke-RestMethod -Uri $uri -Method GET -Headers (Get-TableHeaders)
     }
@@ -1190,11 +1495,121 @@ function Test-AutomationJobTerminal {
     return $Status -in @('Completed', 'Failed', 'Stopped', 'Suspended')
 }
 
+function Test-TransientArmStatusCode {
+    <#
+    .SYNOPSIS
+        True for the status codes where ARM's outcome is genuinely ambiguous:
+        a timeout or 5xx can mean "the request never reached the service" or
+        "it succeeded but the response was lost"; 429 means the request may or
+        may not have been throttled before or after taking effect.
+    #>
+    param([Nullable[int]] $StatusCode)
+
+    if ($null -eq $StatusCode) { return $true } # no response at all: network/timeout
+    return $StatusCode -eq 429 -or $StatusCode -ge 500
+}
+
+function Get-ArmErrorStatusCode {
+    param($ErrorRecord)
+    return Get-HttpErrorStatusCode -ErrorRecord $ErrorRecord
+}
+
+function Invoke-IdempotentRunbookDispatch {
+    <#
+    .SYNOPSIS
+        Starts a runbook job through ARM with a deterministic job name, without
+        ever risking a duplicate job when the PUT's outcome is ambiguous.
+    .DESCRIPTION
+        ARM PUT .../jobs/{jobName} is idempotent *if it reaches the service*,
+        but a client-side timeout, a 429 or a 5xx leaves the true outcome
+        unknown: the job may have started anyway. The dispatcher must never
+        guess in that situation, because guessing wrong either starts a
+        duplicate wipe or reports failure for a job that is actually running.
+
+        Sequence:
+          1. GET the job first. If it already exists, the PUT is unnecessary
+             (a previous attempt succeeded, or is genuinely known now).
+          2. Otherwise PUT. A clean success or a clean permanent failure (4xx
+             other than 429) is unambiguous.
+          3. On a transient failure (timeout / 429 / 5xx) GET the job again:
+             - found  -> the PUT actually took effect: Confirmed/Started.
+             - 404    -> confirmed absent: safe for the *next* attempt to PUT
+               again; this attempt reports Outcome='ConfirmedAbsent' (not a
+               permanent failure) so the caller can retry with backoff.
+             - the confirming GET itself fails -> Outcome='Unknown': the
+               caller must not retry the PUT this attempt (that could create a
+               duplicate job) and must not treat this as a terminal failure or
+               release any lease; it simply tries again later.
+    .OUTPUTS
+        PSCustomObject: Outcome ('Started'|'ConfirmedAbsent'|'Unknown'|'PermanentFailure'),
+        Job (the job object when known), ErrorMessage.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $JobName,
+        [Parameter(Mandatory)] [string] $Runbook,
+        [hashtable] $Parameters,
+        [string] $RunOn = ''
+    )
+
+    # Step 1: a job with this deterministic name may already exist from a prior
+    # attempt whose PUT response never reached us.
+    try {
+        $existing = Get-AutomationRunbookJob -JobName $JobName
+        if ($existing) {
+            return [pscustomobject]@{ Outcome = 'Started'; Job = $existing; ErrorMessage = '' }
+        }
+    }
+    catch {
+        # The pre-check itself is best-effort: fall through to the PUT. If the
+        # PUT also fails ambiguously, the post-check below still applies.
+        Write-Warning "Pre-dispatch job lookup failed for '$JobName': $($_.Exception.Message)"
+    }
+
+    try {
+        $job = Start-AutomationRunbookJob -JobName $JobName -Runbook $Runbook -Parameters $Parameters -RunOn $RunOn
+        return [pscustomobject]@{ Outcome = 'Started'; Job = $job; ErrorMessage = '' }
+    }
+    catch {
+        $statusCode = Get-ArmErrorStatusCode -ErrorRecord $_
+        if (-not (Test-TransientArmStatusCode -StatusCode $statusCode)) {
+            # A clean permanent failure (bad runbook name, RBAC denied, malformed
+            # parameters, ...): retrying the same PUT would only fail again.
+            return [pscustomobject]@{ Outcome = 'PermanentFailure'; Job = $null; ErrorMessage = $_.Exception.Message }
+        }
+
+        $putError = $_.Exception.Message
+        try {
+            $confirmed = Get-AutomationRunbookJob -JobName $JobName
+        }
+        catch {
+            # The confirming GET is itself unreliable right now: the outcome of
+            # the PUT genuinely cannot be determined this attempt.
+            return [pscustomobject]@{
+                Outcome      = 'Unknown'
+                Job          = $null
+                ErrorMessage = "PUT failed ambiguously ($putError) and the confirming GET also failed: $($_.Exception.Message)"
+            }
+        }
+
+        if ($confirmed) {
+            return [pscustomobject]@{ Outcome = 'Started'; Job = $confirmed; ErrorMessage = '' }
+        }
+
+        # GET confirms the job does not exist: it is safe to PUT again next time.
+        return [pscustomobject]@{
+            Outcome      = 'ConfirmedAbsent'
+            Job          = $null
+            ErrorMessage = "PUT failed ambiguously (status $statusCode): $putError. A follow-up GET confirmed the job was not created; safe to retry."
+        }
+    }
+}
+
 function ConvertFrom-RunbookOutput {
     <#
     .SYNOPSIS
         Extracts the structured result a runbook emits as a '##RESULT## {json}'
-        line. Falls back to $null when the runbook has not been updated yet.
+        line. Falls back to $null when the runbook produced no marker line yet,
+        or when the marker line is not valid JSON.
     #>
     param([string] $Output)
 
@@ -1209,21 +1624,271 @@ function ConvertFrom-RunbookOutput {
     $json = $line.Substring($line.IndexOf('##RESULT##') + 10).Trim()
     try { return $json | ConvertFrom-Json } catch { return $null }
 }
+
+function Get-RunbookOutputEvidenceState {
+    <#
+    .SYNOPSIS
+        Classifies why a terminal, 'Completed' Automation job produced no
+        parsed result, so JobMonitor can distinguish a transient evidence gap
+        (worth a retry) from a runbook that will never emit one.
+    .DESCRIPTION
+        A completed job with no output at all is most often the Automation
+        output store lagging behind the job status: retry a bounded number of
+        times ('EvidencePending'). A completed job whose output *is* present
+        but has no '##RESULT##' line, or an invalid one, means the runbook
+        itself never produced the contract it promises: that is not something
+        a retry will fix ('EvidenceMissing'), but it is still recorded as
+        retryable-once in case the output store is only briefly behind the job
+        status transition.
+    .OUTPUTS
+        'HasResult' | 'EvidencePending' | 'EvidenceMissing'
+    #>
+    param(
+        [string] $Output,
+        $ParsedResult
+    )
+
+    if ($null -ne $ParsedResult) { return 'HasResult' }
+    if ([string]::IsNullOrWhiteSpace($Output)) { return 'EvidencePending' }
+    return 'EvidenceMissing'
+}
 # endregion Inlined functions from: AT.Automation.psm1
 # region Inlined functions from: AT.Dispatch.psm1
-# Translates one canonical intake payload into one Automation runbook job.
-# It deliberately does not wait for the runbook to finish; JobMonitor
-# reconciles the outcome over time in the same Function App.
+# Translates one canonical intake payload into one Automation runbook job, and
+# provides the durable claim/retry primitives JobMonitor uses to reconcile any
+# request that did not finish dispatching inline (crash recovery, ambiguous
+# ARM responses, throttling, ...).
+#
+# Design summary (see docs/flusso-alto-livello.md for the full narrative):
+#   - WipeIntake persists the full canonical payload with status=Accepted
+#     *before* attempting anything (durable handoff / write-before-action).
+#     The immediate dispatch attempt that follows is an optimisation, not a
+#     requirement for correctness: if it does not happen, or does not finish,
+#     JobMonitor will.
+#   - Every dispatch attempt - whether inline from WipeIntake or reconciled by
+#     JobMonitor - first claims the row with an ETag-conditional MERGE, so two
+#     workers can never both start the same runbook job.
+#   - A deterministic job name (the requestId) makes the ARM PUT itself
+#     idempotent; Invoke-IdempotentRunbookDispatch (AT.Automation) adds the
+#     GET-before/GET-after checks that keep a timeout/429/5xx from ever being
+#     misread as a clean failure or a clean success.
+#   - Attempts are bounded: after DISPATCH_MAX_ATTEMPTS the request is failed
+#     terminally (DispatchFailed) instead of retrying forever.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 
+function Get-DispatchMaxAttempts {
+    return Get-AppSettingInt -Name 'DISPATCH_MAX_ATTEMPTS' -Default 8
+}
+
+function Get-DispatchBackoffBaseSeconds {
+    return Get-AppSettingInt -Name 'DISPATCH_BACKOFF_BASE_SECONDS' -Default 20
+}
+
+function Get-DispatchBackoffMaxSeconds {
+    return Get-AppSettingInt -Name 'DISPATCH_BACKOFF_MAX_SECONDS' -Default 1800
+}
+
+function Get-DispatchMaxConcurrency {
+    return Get-AppSettingInt -Name 'DISPATCH_MAX_CONCURRENCY' -Default 10
+}
+
+function Get-EvidenceMaxAttempts {
+    return Get-AppSettingInt -Name 'EVIDENCE_MAX_ATTEMPTS' -Default 5
+}
+
+function Get-CallbackMaxAttempts {
+    return Get-AppSettingInt -Name 'CALLBACK_MAX_ATTEMPTS' -Default 6
+}
+
+function Get-CallbackBackoffBaseSeconds {
+    return Get-AppSettingInt -Name 'CALLBACK_BACKOFF_BASE_SECONDS' -Default 15
+}
+
+function Get-CallbackBackoffMaxSeconds {
+    return Get-AppSettingInt -Name 'CALLBACK_BACKOFF_MAX_SECONDS' -Default 900
+}
+
+function Get-CallbackMaxConcurrency {
+    return Get-AppSettingInt -Name 'CALLBACK_MAX_CONCURRENCY' -Default 20
+}
+
+function Set-CallbackPending {
+    <#
+    .SYNOPSIS
+        Arms the durable callback pipeline for a request that just reached a
+        terminal state (Completed, PartiallyCompleted, Failed or DispatchFailed
+        - dry runs included). Does nothing when the request has no callbackUrl.
+    .DESCRIPTION
+        Sets callbackStatus='Pending' and assigns a stable eventId the first
+        time a terminal state is reached, so every callback delivery attempt
+        for this outcome - however many retries it takes - carries the same
+        requestId/eventId pair for the receiver's own idempotency check.
+    .OUTPUTS
+        The eventId used, or $null when no callback is configured.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [string] $CallbackUrl,
+        [string] $ExistingEventId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CallbackUrl)) { return $null }
+
+    $eventId = if ([string]::IsNullOrWhiteSpace($ExistingEventId)) { [guid]::NewGuid().ToString() } else { $ExistingEventId }
+
+    Update-WipeRequestState -Platform $Platform -RequestId $RequestId -Properties @{
+        callbackStatus   = 'Pending'
+        callbackAttempts = 0
+        eventId          = $eventId
+    }
+
+    return $eventId
+}
+
+# ---------------------------------------------------------------------------
+# Reconciliation candidate discovery (JobMonitor's dispatch pass)
+# ---------------------------------------------------------------------------
+function Get-DispatchCandidateRequests {
+    <#
+    .SYNOPSIS
+        Requests still waiting for a durable dispatch outcome: freshly accepted
+        (never attempted) or mid-retry after a prior ambiguous/transient
+        failure. Ordering/limiting to a bounded concurrency happens in
+        Get-DueDispatchCandidates so one JobMonitor tick never tries to claim
+        an unbounded number of rows.
+    #>
+    param([int] $Top = 200)
+    return @(Find-WipeRequestState -Filter "status eq 'Accepted' or status eq 'Dispatching'" -Top $Top)
+}
+
+function Test-BackoffFieldDue {
+    <#
+    .SYNOPSIS
+        Generic backoff check shared by the dispatch and callback reconciliation
+        passes: true when the named datetime field is absent, unparsable, or in
+        the past.
+    #>
+    param($Request, [Parameter(Mandatory)] [string] $FieldName)
+
+    $hasField = $Request.PSObject.Properties.Name -contains $FieldName -and $Request.$FieldName
+    if (-not $hasField) { return $true }
+
+    $next = $null
+    if (-not [datetime]::TryParse([string]$Request.$FieldName, [ref] $next)) { return $true }
+    return (Get-Date).ToUniversalTime() -ge $next.ToUniversalTime()
+}
+
+function Test-DispatchAttemptDue {
+    <#
+    .SYNOPSIS
+        True when a candidate request has no scheduled backoff yet, or its
+        backoff window has elapsed.
+    #>
+    param($Request)
+    return Test-BackoffFieldDue -Request $Request -FieldName 'nextAttemptAt'
+}
+
+function Get-DueDispatchCandidates {
+    <#
+    .SYNOPSIS
+        Candidate requests whose backoff window has elapsed, capped at the
+        configured dispatch concurrency limit so a single JobMonitor tick
+        cannot overwhelm the Automation account with simultaneous ARM PUTs.
+    #>
+    param([int] $MaxConcurrency = -1)
+
+    if ($MaxConcurrency -lt 0) { $MaxConcurrency = Get-DispatchMaxConcurrency }
+    $candidates = @(Get-DispatchCandidateRequests | Where-Object { Test-DispatchAttemptDue -Request $_ })
+    return @($candidates | Select-Object -First $MaxConcurrency)
+}
+
+# ---------------------------------------------------------------------------
+# Atomic claim
+# ---------------------------------------------------------------------------
+function Invoke-DispatchClaim {
+    <#
+    .SYNOPSIS
+        Atomically claims one request row for a dispatch attempt using an
+        ETag-conditional MERGE. Two callers racing for the same row (a second
+        JobMonitor tick, or JobMonitor racing WipeIntake's own inline attempt)
+        can never both win: the loser's MERGE is rejected with HTTP 412 and it
+        simply moves on to the next candidate.
+    .OUTPUTS
+        PSCustomObject: Claimed (bool), Reason, Entity (the pre-claim entity).
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId
+    )
+
+    $current = Get-WipeRequestStateWithETag -Platform $Platform -RequestId $RequestId
+    if (-not $current) {
+        return [pscustomobject]@{ Claimed = $false; Reason = 'NotFound'; Entity = $null }
+    }
+    if ([string]$current.Entity.status -notin @('Accepted', 'Dispatching')) {
+        return [pscustomobject]@{ Claimed = $false; Reason = 'NotEligible'; Entity = $current.Entity }
+    }
+
+    $claimed = Set-WipeRequestStateClaim -Platform $Platform -RequestId $RequestId -ETag $current.ETag -Properties @{
+        status        = 'Dispatching'
+        claimedAt     = (Get-Date).ToUniversalTime()
+        lastAttemptAt = (Get-Date).ToUniversalTime()
+    }
+
+    if (-not $claimed) {
+        return [pscustomobject]@{ Claimed = $false; Reason = 'ClaimConflict'; Entity = $current.Entity }
+    }
+
+    return [pscustomobject]@{ Claimed = $true; Reason = ''; Entity = $current.Entity }
+}
+
+function ConvertTo-DispatchMessage {
+    <#
+    .SYNOPSIS
+        Rebuilds the canonical dispatch payload from a durably persisted state
+        row (the 'payloadJson' property written by WipeIntake at Accepted
+        time). This is what lets JobMonitor redispatch a request after a
+        Function App restart without ever holding the original HTTP payload
+        in memory.
+    #>
+    param($Entity)
+
+    $payloadJson = Get-JsonPropertyValue -InputObject $Entity -Name 'payloadJson'
+    if ([string]::IsNullOrWhiteSpace([string]$payloadJson)) {
+        throw "Request row for '$($Entity.RowKey)' has no persisted payloadJson; cannot reconstruct the dispatch message."
+    }
+    return ([string]$payloadJson | ConvertFrom-Json)
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch attempt (used both by WipeIntake's optional immediate attempt and
+# by JobMonitor's reconciliation pass, always AFTER Invoke-DispatchClaim)
+# ---------------------------------------------------------------------------
 function Invoke-DisposalDispatch {
+    <#
+    .SYNOPSIS
+        Performs one dispatch attempt for an already-claimed request: resolves
+        the runbook binding, calls ARM through the ambiguity-safe helper, and
+        persists the outcome. Never throws for a dispatch-side failure: every
+        outcome (Dispatched, retryable Dispatching-with-backoff, or terminal
+        DispatchFailed once attempts are exhausted) is returned and persisted.
+    .OUTPUTS
+        PSCustomObject: Status ('Completed'|'Dispatched'|'Dispatching'|'DispatchFailed'),
+        ErrorMessage, AutomationJobName, AutomationJobId, Attempt, Terminal (bool),
+        ReleaseLease (bool - true once the request reaches ANY terminal state).
+    #>
     param(
         [Parameter(Mandatory)] $Message,
-        [Parameter(Mandatory)] [string] $ExpectedPlatform
+        [Parameter(Mandatory)] [string] $ExpectedPlatform,
+        [int] $Attempt = 1,
+        [int] $MaxAttempts = -1
     )
+
+    if ($MaxAttempts -lt 0) { $MaxAttempts = Get-DispatchMaxAttempts }
 
     $payload = ConvertFrom-JsonBody -Body $Message
     if (-not $payload) { throw 'Dispatch payload body is not valid JSON.' }
@@ -1247,6 +1912,8 @@ function Invoke-DisposalDispatch {
         throw "Message options.dryRun must be a boolean, received '$dryRunValue'."
     }
 
+    $callbackUrl = [string](Get-JsonPropertyValue -InputObject $payload -Name 'callbackUrl')
+
     $logProps = @{
         requestId     = $requestId
         correlationId = [string]$payload.correlationId
@@ -1254,6 +1921,7 @@ function Invoke-DisposalDispatch {
         scenario      = [string]$payload.scenario
         serialNumber  = [string]$payload.device.serialNumber
         dryRun        = $isDryRun
+        attempt       = $Attempt
     }
 
     Write-AtLog -Level 'Information' -Message 'Dispatching disposal request.' -Properties $logProps
@@ -1261,23 +1929,41 @@ function Invoke-DisposalDispatch {
 
     # Retirement never removes the device from its enrollment platform. Until the
     # runbooks accept a -Scenario parameter, a retirement request must not be sent
-    # to a runbook whose first action is the unenrollment.
+    # to a runbook whose first action is the unenrollment. This is a static
+    # configuration problem: retrying will never fix it, so it fails terminally
+    # on the first attempt rather than consuming the retry budget.
     if (-not [bool]$payload.options.removeFromEnrollmentPlatform -and
         -not (Get-AppSettingBool -Name 'RUNBOOKS_SUPPORT_SCENARIO' -Default $false)) {
         $reason = 'Retirement scenario requires runbooks that support -Scenario; set RUNBOOKS_SUPPORT_SCENARIO=true once updated.'
         Write-AtLog -Level 'Warning' -Message $reason -Properties $logProps
+        Write-AtAudit -Action 'WipeDispatchFailed' -Level 'Error' -Properties ($logProps + @{ status = 'DispatchFailed'; error = $reason })
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
-            status = 'DispatchFailed'; errorMessage = $reason
+            status = 'DispatchFailed'; errorMessage = $reason; completedAt = (Get-Date).ToUniversalTime(); attempts = $Attempt
         }
+        Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl ($callbackUrl) | Out-Null
         return [pscustomobject]@{
-            Status = 'DispatchFailed'
-            ErrorMessage = $reason
-            AutomationJobName = $null
-            AutomationJobId = $null
+            Status = 'DispatchFailed'; ErrorMessage = $reason; AutomationJobName = $null; AutomationJobId = $null
+            Attempt = $Attempt; Terminal = $true; ReleaseLease = $true
         }
     }
 
-    $binding = Resolve-RunbookBinding -Platform $platform -Message $payload
+    try {
+        $binding = Resolve-RunbookBinding -Platform $platform -Message $payload
+    }
+    catch {
+        # A misconfigured RUNBOOK_MAP is also a static problem: fail terminally.
+        $reason = "Unable to resolve the runbook binding: $($_.Exception.Message)"
+        Write-AtLog -Level 'Error' -Message $reason -Properties $logProps
+        Write-AtAudit -Action 'WipeDispatchFailed' -Level 'Error' -Properties ($logProps + @{ status = 'DispatchFailed'; error = $reason })
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            status = 'DispatchFailed'; errorMessage = $reason; completedAt = (Get-Date).ToUniversalTime(); attempts = $Attempt
+        }
+        Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl ($callbackUrl) | Out-Null
+        return [pscustomobject]@{
+            Status = 'DispatchFailed'; ErrorMessage = $reason; AutomationJobName = $null; AutomationJobId = $null
+            Attempt = $Attempt; Terminal = $true; ReleaseLease = $true
+        }
+    }
 
     # Idempotent job name: replaying the message returns the existing job.
     $jobName = $requestId
@@ -1285,9 +1971,10 @@ function Invoke-DisposalDispatch {
     Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
         status            = 'Dispatching'
         runbook           = $binding.Runbook
-        timeoutMinutes = $binding.TimeoutMinutes
+        timeoutMinutes    = $binding.TimeoutMinutes
         automationJobName = $jobName
-        dispatchedAt      = (Get-Date).ToUniversalTime()
+        attempts          = $Attempt
+        lastAttemptAt     = (Get-Date).ToUniversalTime()
     }
 
     if ($isDryRun) {
@@ -1298,60 +1985,454 @@ function Invoke-DisposalDispatch {
             completedAt = (Get-Date).ToUniversalTime()
             resultJson = @{ dryRun = $true; runbook = $binding.Runbook; parameters = $binding.Parameters }
         }
+        Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl ($callbackUrl) | Out-Null
         return [pscustomobject]@{
-            Status = 'Completed'
-            ErrorMessage = ''
-            AutomationJobName = $null
-            AutomationJobId = $null
+            Status = 'Completed'; ErrorMessage = ''; AutomationJobName = $null; AutomationJobId = $null
+            Attempt = $Attempt; Terminal = $true; ReleaseLease = $true
         }
     }
 
-    try {
-        $job = Start-AutomationRunbookJob `
-            -JobName $jobName `
-            -Runbook $binding.Runbook `
-            -Parameters $binding.Parameters `
-            -RunOn $binding.RunOn
-    }
-    catch {
-        # Persist the failure before returning it to the HTTP caller.
-        Write-AtLog -Level 'Error' -Message "Runbook dispatch failed: $($_.Exception.Message)" -Properties $logProps
-        Write-AtAudit -Action 'WipeDispatchFailed' -Level 'Error' -Properties ($logProps + @{ status = 'DispatchFailed'; error = $_.Exception.Message })
-        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
-            status = 'DispatchFailed'; errorMessage = $_.Exception.Message
-        }
-        throw
-    }
+    $dispatch = Invoke-IdempotentRunbookDispatch -JobName $jobName -Runbook $binding.Runbook `
+        -Parameters $binding.Parameters -RunOn $binding.RunOn
 
-    try {
+    if ($dispatch.Outcome -eq 'Started') {
         Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
             status            = 'Dispatched'
-            automationJobName = [string]$job.JobName
-            automationJobId   = [string]$job.JobId
+            automationJobName = [string]$dispatch.Job.JobName
+            automationJobId   = [string]$dispatch.Job.JobId
             dispatchedAt      = (Get-Date).ToUniversalTime()
             errorMessage      = ''
+            dispatchOutcome   = 'Started'
         }
-    }
-    catch {
-        Write-AtLog -Level 'Error' -Message "Runbook started, but the Dispatched state could not be persisted: $($_.Exception.Message)" -Properties $logProps
-        Write-AtAudit -Action 'WipeDispatchStatePending' -Level 'Error' -Properties ($logProps + @{ status = 'Dispatching'; automationJobId = [string]$job.JobId })
+        $logProps.automationJobName = [string]$dispatch.Job.JobName
+        Write-AtLog -Level 'Information' -Message 'Runbook job started.' -Properties $logProps
+        Write-AtAudit -Action 'WipeJobStarted' -Properties ($logProps + @{ status = 'Dispatched'; runbook = $binding.Runbook; automationJobId = [string]$dispatch.Job.JobId })
+
         return [pscustomobject]@{
-            Status = 'Dispatching'
-            ErrorMessage = 'The runbook started; JobMonitor will reconcile the pending dispatch state.'
-            AutomationJobName = [string]$job.JobName
-            AutomationJobId = [string]$job.JobId
+            Status = 'Dispatched'; ErrorMessage = ''
+            AutomationJobName = [string]$dispatch.Job.JobName; AutomationJobId = [string]$dispatch.Job.JobId
+            Attempt = $Attempt; Terminal = $false; ReleaseLease = $false
         }
     }
 
-    $logProps.automationJobName = [string]$job.JobName
-    Write-AtLog -Level 'Information' -Message 'Runbook job started.' -Properties $logProps
-    Write-AtAudit -Action 'WipeJobStarted' -Properties ($logProps + @{ status = 'Dispatched'; runbook = $binding.Runbook; automationJobId = [string]$job.JobId })
+    # Outcome is PermanentFailure, ConfirmedAbsent or Unknown: never mark the
+    # request DispatchFailed - and never release the device lease - while
+    # attempts remain. 'Unknown' in particular must not be retried blindly
+    # (the previous PUT might still land); the next attempt starts, as always,
+    # with a fresh GET, so it self-corrects once ARM's state settles.
+    $exhausted = $Attempt -ge $MaxAttempts
+
+    if (-not $exhausted) {
+        $delay = Get-BackoffDelaySeconds -Attempt $Attempt -BaseSeconds (Get-DispatchBackoffBaseSeconds) -MaxSeconds (Get-DispatchBackoffMaxSeconds)
+        $nextAttemptAt = (Get-Date).ToUniversalTime().AddSeconds($delay)
+
+        Write-AtLog -Level 'Warning' -Message "Dispatch attempt $Attempt/$MaxAttempts inconclusive ($($dispatch.Outcome)): $($dispatch.ErrorMessage). Retrying at $($nextAttemptAt.ToString('o'))." -Properties $logProps
+        Write-AtAudit -Action 'WipeDispatchRetryScheduled' -Level 'Warning' -Properties ($logProps + @{ status = 'Dispatching'; dispatchOutcome = $dispatch.Outcome; nextAttemptAt = $nextAttemptAt.ToString('o') })
+
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            status          = 'Dispatching'
+            errorMessage    = $dispatch.ErrorMessage
+            dispatchOutcome = $dispatch.Outcome
+            nextAttemptAt   = $nextAttemptAt
+        }
+
+        return [pscustomobject]@{
+            Status = 'Dispatching'; ErrorMessage = $dispatch.ErrorMessage
+            AutomationJobName = $jobName; AutomationJobId = $null
+            Attempt = $Attempt; Terminal = $false; ReleaseLease = $false
+        }
+    }
+
+    $terminalReason = if ($dispatch.Outcome -eq 'Unknown') {
+        "Dispatch outcome could not be confirmed after $Attempt attempts (last: $($dispatch.ErrorMessage)). Manual verification of Automation job '$jobName' is required before assuming the device was not actioned."
+    }
+    else {
+        "Dispatch failed after $Attempt attempts ($($dispatch.Outcome)): $($dispatch.ErrorMessage)"
+    }
+
+    Write-AtLog -Level 'Error' -Message $terminalReason -Properties $logProps
+    Write-AtAudit -Action 'WipeDispatchFailed' -Level 'Error' -Properties ($logProps + @{ status = 'DispatchFailed'; dispatchOutcome = $dispatch.Outcome; error = $terminalReason })
+
+    Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+        status          = 'DispatchFailed'
+        errorMessage     = $terminalReason
+        dispatchOutcome  = $dispatch.Outcome
+        completedAt      = (Get-Date).ToUniversalTime()
+        attempts         = $Attempt
+    }
+    Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl ($callbackUrl) | Out-Null
 
     return [pscustomobject]@{
-        Status = 'Dispatched'
-        ErrorMessage = ''
-        AutomationJobName = [string]$job.JobName
-        AutomationJobId = [string]$job.JobId
+        Status = 'DispatchFailed'; ErrorMessage = $terminalReason
+        AutomationJobName = $jobName; AutomationJobId = $null
+        Attempt = $Attempt; Terminal = $true; ReleaseLease = $true
+    }
+}
+
+function Invoke-DispatchReconciliation {
+    <#
+    .SYNOPSIS
+        End-to-end reconciliation of one candidate request row for JobMonitor:
+        claim -> rebuild the canonical message from the durable payload ->
+        attempt dispatch. Skips the row cleanly (Claimed=$false) when another
+        worker already owns it.
+    #>
+    param([Parameter(Mandatory)] $Request)
+
+    $platform = [string]$Request.PartitionKey
+    $requestId = [string]$Request.RowKey
+
+    $claim = Invoke-DispatchClaim -Platform $platform -RequestId $requestId
+    if (-not $claim.Claimed) {
+        return [pscustomobject]@{ Claimed = $false; Reason = $claim.Reason; Result = $null }
+    }
+
+    $priorAttempts = 0
+    if ($claim.Entity.PSObject.Properties.Name -contains 'attempts' -and $claim.Entity.attempts) {
+        [int]::TryParse([string]$claim.Entity.attempts, [ref] $priorAttempts) | Out-Null
+    }
+    $attempt = $priorAttempts + 1
+
+    try {
+        $message = ConvertTo-DispatchMessage -Entity $claim.Entity
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "JobMonitor: cannot reconcile dispatch for '$requestId': $($_.Exception.Message)" -Properties @{ requestId = $requestId; platform = $platform }
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            status = 'DispatchFailed'; errorMessage = $_.Exception.Message; completedAt = (Get-Date).ToUniversalTime()
+        }
+        return [pscustomobject]@{
+            Claimed = $true; Reason = ''
+            Result  = [pscustomobject]@{ Status = 'DispatchFailed'; ErrorMessage = $_.Exception.Message; Terminal = $true; ReleaseLease = $true }
+        }
+    }
+
+    $result = Invoke-DisposalDispatch -Message $message -ExpectedPlatform $platform -Attempt $attempt
+    return [pscustomobject]@{ Claimed = $true; Reason = ''; Result = $result }
+}
+
+# ---------------------------------------------------------------------------
+# In-flight reconciliation: polls Automation for requests whose runbook job is
+# already known (Dispatched/Running), and for requests waiting on the job's
+# output to catch up with its already-terminal status (EvidencePending).
+# ---------------------------------------------------------------------------
+function Get-InFlightCandidateRequests {
+    param([int] $Top = 200)
+    return @(Find-WipeRequestState -Filter "status eq 'Dispatched' or status eq 'Running' or status eq 'EvidencePending'" -Top $Top)
+}
+
+function Resolve-RequestTerminalStatus {
+    <#
+    .SYNOPSIS
+        Maps a completed Automation job's parsed ##RESULT## onto the request
+        state machine. A runbook that completes with per-device errors is
+        PartiallyCompleted, not Completed: the process must be able to tell
+        "unenrolled but not wiped" from full success.
+    #>
+    param([string] $JobStatus, $Result)
+
+    if ($JobStatus -ne 'Completed') { return 'Failed' }
+    if ($null -eq $Result) { return 'Completed' }
+
+    $hasErrors = $false
+    if ($Result.PSObject.Properties.Name -contains 'errors' -and $Result.errors) {
+        $hasErrors = @($Result.errors).Count -gt 0
+    }
+
+    $wipeIssued = $true
+    if ($Result.PSObject.Properties.Name -contains 'wipeIssued') { $wipeIssued = [bool]$Result.wipeIssued }
+
+    if (-not $wipeIssued) { return 'Failed' }
+    if ($hasErrors) { return 'PartiallyCompleted' }
+    return 'Completed'
+}
+
+function Invoke-InFlightReconciliation {
+    <#
+    .SYNOPSIS
+        Reconciles one request whose Automation job is already known: polls
+        the job status, and once terminal, requires a valid '##RESULT##' line
+        before declaring success. A terminal job with no usable evidence yet
+        is retried a bounded number of times as 'EvidencePending'; running out
+        of those retries - or the overall per-platform timeout - fails the
+        request with evidenceState='EvidenceMissing'.
+    .OUTPUTS
+        PSCustomObject: Status, EvidenceState, ReleaseLease (bool),
+        CallbackEventId (string or $null), Handled (bool - $false when the
+        request is still legitimately in progress and nothing changed).
+    #>
+    param([Parameter(Mandatory)] $Request)
+
+    $platform = [string]$Request.PartitionKey
+    $requestId = [string]$Request.RowKey
+    $callbackUrl = [string](Get-JsonPropertyValue -InputObject $Request -Name 'callbackUrl')
+    $existingEventId = [string](Get-JsonPropertyValue -InputObject $Request -Name 'eventId')
+
+    $logProps = @{
+        requestId     = $requestId
+        platform      = $platform
+        correlationId = Get-JsonPropertyValue -InputObject $Request -Name 'correlationId'
+        serialNumber  = Get-JsonPropertyValue -InputObject $Request -Name 'serialNumber'
+    }
+
+    $jobName = [string](Get-JsonPropertyValue -InputObject $Request -Name 'automationJobName')
+    if ([string]::IsNullOrWhiteSpace($jobName)) {
+        Write-AtLog -Level 'Warning' -Message 'JobMonitor: no Automation job name recorded, skipping.' -Properties $logProps
+        return [pscustomobject]@{ Status = $Request.status; EvidenceState = $null; ReleaseLease = $false; CallbackEventId = $null; Handled = $false }
+    }
+
+    $timeoutMinutes = 60
+    $timeoutValue = Get-JsonPropertyValue -InputObject $Request -Name 'timeoutMinutes'
+    if ($timeoutValue) { $timeoutMinutes = [int]$timeoutValue }
+
+    $dispatchedAt = $null
+    $dispatchedAtValue = Get-JsonPropertyValue -InputObject $Request -Name 'dispatchedAt'
+    if ($dispatchedAtValue) { try { $dispatchedAt = [datetime]::Parse($dispatchedAtValue).ToUniversalTime() } catch { $dispatchedAt = $null } }
+    $expired = $dispatchedAt -and ((Get-Date).ToUniversalTime() -gt $dispatchedAt.AddMinutes($timeoutMinutes))
+
+    try {
+        $job = Get-AutomationRunbookJob -JobName $jobName
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "JobMonitor: job lookup failed: $($_.Exception.Message)" -Properties $logProps
+        return [pscustomobject]@{ Status = $Request.status; EvidenceState = $null; ReleaseLease = $false; CallbackEventId = $null; Handled = $false }
+    }
+
+    if (-not $job) {
+        if ($expired) {
+            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+                status = 'Failed'; errorMessage = 'Automation job not found and request timed out.'
+                evidenceState = 'EvidenceMissing'; completedAt = (Get-Date).ToUniversalTime()
+            }
+            $eventId = Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl $callbackUrl -ExistingEventId $existingEventId
+            return [pscustomobject]@{ Status = 'Failed'; EvidenceState = 'EvidenceMissing'; ReleaseLease = $true; CallbackEventId = $eventId; Handled = $true }
+        }
+        return [pscustomobject]@{ Status = $Request.status; EvidenceState = $null; ReleaseLease = $false; CallbackEventId = $null; Handled = $false }
+    }
+
+    if (-not (Test-AutomationJobTerminal -Status $job.Status)) {
+        if ($expired) {
+            Write-AtLog -Level 'Warning' -Message "JobMonitor: request timed out after $timeoutMinutes minutes." -Properties $logProps
+            Write-AtAudit -Action 'WipeTimeout' -Level 'Warning' -Properties ($logProps + @{ status = 'Failed'; timeoutMinutes = $timeoutMinutes; lastJobStatus = [string]$job.Status })
+            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+                status = 'Failed'; errorMessage = "Runbook job timeout after $timeoutMinutes minutes (last status: $($job.Status))."
+                evidenceState = 'EvidenceMissing'; completedAt = (Get-Date).ToUniversalTime()
+            }
+            $eventId = Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl $callbackUrl -ExistingEventId $existingEventId
+            return [pscustomobject]@{ Status = 'Failed'; EvidenceState = 'EvidenceMissing'; ReleaseLease = $true; CallbackEventId = $eventId; Handled = $true }
+        }
+
+        $progress = @{ automationJobId = [string]$job.JobId }
+        if ($job.Status -eq 'Running') { $progress.status = 'Running' }
+        elseif ($Request.status -eq 'Dispatching') { $progress.status = 'Dispatched' }
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties $progress
+        return [pscustomobject]@{ Status = $progress.status; EvidenceState = $null; ReleaseLease = $false; CallbackEventId = $null; Handled = $false }
+    }
+
+    # --- Terminal Automation job: require valid evidence before declaring success ---
+    $output = Get-AutomationRunbookJobOutput -JobName $jobName
+    $result = ConvertFrom-RunbookOutput -Output ([string]$output)
+    $evidenceState = Get-RunbookOutputEvidenceState -Output ([string]$output) -ParsedResult $result
+
+    if ($evidenceState -ne 'HasResult') {
+        $evidenceAttempts = 0
+        $evidenceAttemptsValue = Get-JsonPropertyValue -InputObject $Request -Name 'evidenceAttempts'
+        if ($evidenceAttemptsValue) { [int]::TryParse([string]$evidenceAttemptsValue, [ref] $evidenceAttempts) | Out-Null }
+        $evidenceAttempts++
+
+        if ($evidenceAttempts -ge (Get-EvidenceMaxAttempts) -or $expired) {
+            $errorMessage = "Runbook job '$jobName' completed (status $($job.Status)) but produced no usable evidence after $evidenceAttempts attempt(s) (evidenceState=$evidenceState)."
+            Write-AtLog -Level 'Error' -Message $errorMessage -Properties $logProps
+            Write-AtAudit -Action 'WipeTerminalState' -Level 'Error' -Properties ($logProps + @{ status = 'Failed'; evidenceState = $evidenceState; errorMessage = $errorMessage })
+            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+                status = 'Failed'; errorMessage = $errorMessage; evidenceState = 'EvidenceMissing'
+                jobStatus = [string]$job.Status; automationJobId = [string]$job.JobId; evidenceAttempts = $evidenceAttempts
+                completedAt = (Get-Date).ToUniversalTime()
+            }
+            $eventId = Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl $callbackUrl -ExistingEventId $existingEventId
+            return [pscustomobject]@{ Status = 'Failed'; EvidenceState = 'EvidenceMissing'; ReleaseLease = $true; CallbackEventId = $eventId; Handled = $true }
+        }
+
+        Write-AtLog -Level 'Warning' -Message "JobMonitor: job '$jobName' terminal but evidence not yet usable ($evidenceState), attempt $evidenceAttempts/$(Get-EvidenceMaxAttempts)." -Properties $logProps
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            status = 'EvidencePending'; jobStatus = [string]$job.Status; automationJobId = [string]$job.JobId
+            evidenceState = $evidenceState; evidenceAttempts = $evidenceAttempts
+        }
+        return [pscustomobject]@{ Status = 'EvidencePending'; EvidenceState = $evidenceState; ReleaseLease = $false; CallbackEventId = $null; Handled = $false }
+    }
+
+    $status = Resolve-RequestTerminalStatus -JobStatus $job.Status -Result $result
+    $errorMessage = ''
+    if ($status -ne 'Completed') {
+        $errorMessage = if ($job.Exception) { "$($job.Exception)" } elseif ($job.StatusDetails) { "$($job.StatusDetails)" } else { "Runbook job status: $($job.Status)" }
+    }
+
+    $updates = @{
+        status          = $status
+        completedAt     = (Get-Date).ToUniversalTime()
+        jobStatus       = [string]$job.Status
+        automationJobId = [string]$job.JobId
+        errorMessage    = $errorMessage
+        evidenceState   = 'HasResult'
+        resultJson      = $result
+    }
+    Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties $updates
+
+    $logProps.status = $status
+    Write-AtLog -Level 'Information' -Message 'JobMonitor: request reached a terminal state.' -Properties $logProps
+    $auditLevel = if ($status -eq 'Completed') { 'Information' } elseif ($status -eq 'PartiallyCompleted') { 'Warning' } else { 'Error' }
+    Write-AtAudit -Action 'WipeTerminalState' -Level $auditLevel -Properties ($logProps + @{ jobStatus = [string]$job.Status; errorMessage = $errorMessage })
+
+    $eventId = Set-CallbackPending -Platform $platform -RequestId $requestId -CallbackUrl $callbackUrl -ExistingEventId $existingEventId
+    return [pscustomobject]@{ Status = $status; EvidenceState = 'HasResult'; ReleaseLease = $true; CallbackEventId = $eventId; Handled = $true }
+}
+
+# ---------------------------------------------------------------------------
+# Durable callback reconciliation
+# ---------------------------------------------------------------------------
+function Get-CallbackCandidateRequests {
+    param([int] $Top = 200)
+    return @(Find-WipeRequestState -Filter "callbackStatus eq 'Pending' or callbackStatus eq 'FailedRetryable'" -Top $Top)
+}
+
+function Test-CallbackAttemptDue {
+    param($Request)
+    return Test-BackoffFieldDue -Request $Request -FieldName 'callbackNextAttemptAt'
+}
+
+function Get-DueCallbackCandidates {
+    param([int] $MaxConcurrency = -1)
+
+    if ($MaxConcurrency -lt 0) { $MaxConcurrency = Get-CallbackMaxConcurrency }
+    $candidates = @(Get-CallbackCandidateRequests | Where-Object { Test-CallbackAttemptDue -Request $_ })
+    return @($candidates | Select-Object -First $MaxConcurrency)
+}
+
+function ConvertTo-CallbackPayload {
+    <#
+    .SYNOPSIS
+        Builds the ServiceNow callback body from a durable state row. requestId
+        and eventId are included in the body (not just the headers) so the
+        receiver can de-duplicate even if it only inspects the payload.
+    #>
+    param($Request, [Parameter(Mandatory)] [string] $EventId)
+
+    $result = $null
+    $resultJson = Get-JsonPropertyValue -InputObject $Request -Name 'resultJson'
+    if ($resultJson) {
+        try { $result = [string]$resultJson | ConvertFrom-Json } catch { $result = [string]$resultJson }
+    }
+
+    return [ordered]@{
+        requestId         = $Request.RowKey
+        eventId           = $EventId
+        correlationId     = Get-JsonPropertyValue -InputObject $Request -Name 'correlationId'
+        platform          = $Request.PartitionKey
+        scenario          = Get-JsonPropertyValue -InputObject $Request -Name 'scenario'
+        status            = Get-JsonPropertyValue -InputObject $Request -Name 'status'
+        dryRun            = Get-JsonPropertyValue -InputObject $Request -Name 'dryRun'
+        device            = [ordered]@{
+            serialNumber    = Get-JsonPropertyValue -InputObject $Request -Name 'serialNumber'
+            imei            = Get-JsonPropertyValue -InputObject $Request -Name 'imei'
+            deviceName      = Get-JsonPropertyValue -InputObject $Request -Name 'deviceName'
+            managedDeviceId = Get-JsonPropertyValue -InputObject $Request -Name 'managedDeviceId'
+        }
+        automationJobName = Get-JsonPropertyValue -InputObject $Request -Name 'automationJobName'
+        automationJobId   = Get-JsonPropertyValue -InputObject $Request -Name 'automationJobId'
+        dispatchedAt      = Get-JsonPropertyValue -InputObject $Request -Name 'dispatchedAt'
+        completedAt       = Get-JsonPropertyValue -InputObject $Request -Name 'completedAt'
+        errorMessage      = Get-JsonPropertyValue -InputObject $Request -Name 'errorMessage'
+        evidenceState     = Get-JsonPropertyValue -InputObject $Request -Name 'evidenceState'
+        result            = $result
+    }
+}
+
+function Send-WipeRequestCallback {
+    param(
+        [Parameter(Mandatory)] [string] $Url,
+        [Parameter(Mandatory)] $Payload,
+        [Parameter(Mandatory)] [string] $EventId
+    )
+
+    $headers = @{
+        'X-Request-Id'   = [string]$Payload.requestId
+        'X-Event-Id'     = $EventId
+        'Idempotency-Key' = $EventId
+    }
+    Invoke-RestMethod -Uri $Url -Method POST -Headers $headers -ContentType 'application/json' `
+        -Body ($Payload | ConvertTo-Json -Depth 12) -TimeoutSec 30 | Out-Null
+}
+
+function Invoke-CallbackReconciliation {
+    <#
+    .SYNOPSIS
+        Delivers (or retries) one durable callback. Claims the row with an
+        ETag-conditional MERGE first so two JobMonitor passes can never send
+        the same callback twice; reaches a final Sent/Failed state once
+        delivered or once CALLBACK_MAX_ATTEMPTS is exhausted, otherwise
+        schedules the next attempt with backoff (FailedRetryable).
+    #>
+    param([Parameter(Mandatory)] $Request)
+
+    $platform = [string]$Request.PartitionKey
+    $requestId = [string]$Request.RowKey
+
+    $current = Get-WipeRequestStateWithETag -Platform $platform -RequestId $requestId
+    if (-not $current) { return [pscustomobject]@{ Claimed = $false; Reason = 'NotFound'; Outcome = $null } }
+    if ([string]$current.Entity.callbackStatus -notin @('Pending', 'FailedRetryable')) {
+        return [pscustomobject]@{ Claimed = $false; Reason = 'NotEligible'; Outcome = $null }
+    }
+
+    $priorAttempts = 0
+    $priorAttemptsValue = Get-JsonPropertyValue -InputObject $current.Entity -Name 'callbackAttempts'
+    if ($priorAttemptsValue) { [int]::TryParse([string]$priorAttemptsValue, [ref] $priorAttempts) | Out-Null }
+    $attempt = $priorAttempts + 1
+
+    $claimed = Set-WipeRequestStateClaim -Platform $platform -RequestId $requestId -ETag $current.ETag -Properties @{
+        callbackAttempts   = $attempt
+        callbackClaimedAt  = (Get-Date).ToUniversalTime()
+    }
+    if (-not $claimed) { return [pscustomobject]@{ Claimed = $false; Reason = 'ClaimConflict'; Outcome = $null } }
+
+    $callbackUrl = [string](Get-JsonPropertyValue -InputObject $current.Entity -Name 'callbackUrl')
+    if ([string]::IsNullOrWhiteSpace($callbackUrl)) {
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{ callbackStatus = 'Failed'; callbackError = 'callbackUrl missing' }
+        return [pscustomobject]@{ Claimed = $true; Reason = ''; Outcome = 'Failed' }
+    }
+
+    $eventId = [string](Get-JsonPropertyValue -InputObject $current.Entity -Name 'eventId')
+    if ([string]::IsNullOrWhiteSpace($eventId)) { $eventId = [guid]::NewGuid().ToString() }
+
+    $payload = ConvertTo-CallbackPayload -Request $current.Entity -EventId $eventId
+    $logProps = @{ requestId = $requestId; platform = $platform; attempt = $attempt; eventId = $eventId }
+
+    try {
+        Send-WipeRequestCallback -Url $callbackUrl -Payload $payload -EventId $eventId
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            callbackStatus = 'Sent'; callbackSentAt = (Get-Date).ToUniversalTime(); callbackError = ''; eventId = $eventId
+        }
+        Write-AtAudit -Action 'WipeCallbackSent' -Properties $logProps
+        return [pscustomobject]@{ Claimed = $true; Reason = ''; Outcome = 'Sent' }
+    }
+    catch {
+        $maxAttempts = Get-CallbackMaxAttempts
+        if ($attempt -ge $maxAttempts) {
+            Write-AtLog -Level 'Error' -Message "JobMonitor: callback delivery failed permanently after $attempt attempts: $($_.Exception.Message)" -Properties $logProps
+            Write-AtAudit -Action 'WipeCallbackFailed' -Level 'Error' -Properties ($logProps + @{ error = $_.Exception.Message })
+            Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+                callbackStatus = 'Failed'; callbackError = $_.Exception.Message; eventId = $eventId
+            }
+            return [pscustomobject]@{ Claimed = $true; Reason = ''; Outcome = 'Failed' }
+        }
+
+        $delay = Get-BackoffDelaySeconds -Attempt $attempt -BaseSeconds (Get-CallbackBackoffBaseSeconds) -MaxSeconds (Get-CallbackBackoffMaxSeconds)
+        $nextAttemptAt = (Get-Date).ToUniversalTime().AddSeconds($delay)
+        Write-AtLog -Level 'Warning' -Message "JobMonitor: callback delivery failed (attempt $attempt/$maxAttempts), retrying at $($nextAttemptAt.ToString('o')): $($_.Exception.Message)" -Properties $logProps
+        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
+            callbackStatus = 'FailedRetryable'; callbackError = $_.Exception.Message
+            callbackNextAttemptAt = $nextAttemptAt; eventId = $eventId
+        }
+        return [pscustomobject]@{ Claimed = $true; Reason = ''; Outcome = 'FailedRetryable' }
     }
 }
 # endregion Inlined functions from: AT.Dispatch.psm1
@@ -1381,6 +2462,30 @@ function Remove-CurrentDeviceLease {
     }
     catch {
         Write-AtLog -Level 'Error' -Message "Failed to release the device lease: $($_.Exception.Message)" -Properties $LogProperties
+    }
+}
+
+function Save-RejectedRequest {
+    <#
+    .SYNOPSIS
+        Persists every 'Rejected' outcome (reason/error/completedAt) so a
+        requestId that reached domain-level validation never 404s on GetStatus,
+        even though no dispatch was ever attempted for it.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Platform,
+        [Parameter(Mandatory)] [string] $RequestId,
+        [Parameter(Mandatory)] [hashtable] $Properties,
+        [hashtable] $LogProperties
+    )
+
+    try {
+        Save-WipeRequestState -Platform $Platform -RequestId $RequestId -Properties (
+            @{ status = 'Rejected'; completedAt = (Get-Date).ToUniversalTime() } + $Properties
+        ) | Out-Null
+    }
+    catch {
+        Write-AtLog -Level 'Error' -Message "Failed to persist rejected state: $($_.Exception.Message)" -Properties $LogProperties
     }
 }
 
@@ -1439,24 +2544,85 @@ $logProps = @{
 Write-AtLog -Level 'Information' -Message 'Disposal request received.' -Properties $logProps
 Write-AtAudit -Action 'WipeRequestReceived' -Properties $logProps
 
-# --- Idempotency ------------------------------------------------------------
-# Same requestId already in flight or done: return the current state instead of
-# creating a second job.
+# --- Atomic requestId idempotency gate ---------------------------------------
+# The hash covers only what the CALLER supplied (never server-generated fields
+# such as correlationId/acceptedAt): a legitimate retry of the exact same
+# request must always compute the same hash so it can be replayed safely.
+$hashInput = [ordered]@{
+    requestId       = $requestId
+    scenario        = $inputScenario
+    operatingSystem = $inputOperatingSystem
+    serialNumber    = $inputSerialNumber
+    imei            = $inputImei
+    managedDeviceId = $inputManagedDeviceId
+    deviceName      = $inputDeviceName
+    dryRun          = "$dryRun"
+    userConfirmed   = "$([bool]$inputUserConfirmed)"
+    mdmServerId     = $inputMdmServerId
+    callbackUrl     = $inputCallbackUrl
+}
+$payloadHash = Get-PayloadHash -InputObject $hashInput
+
 try {
-    $existing = @(Find-WipeRequestState -Filter "RowKey eq '$requestId'" -Top 1)
-    if ($existing.Count -gt 0) {
-        Write-AtLog -Level 'Warning' -Message 'Duplicate requestId, returning existing state.' -Properties $logProps
+    $registration = Register-RequestIdIndex -RequestId $requestId -Platform $platform -PayloadHash $payloadHash
+}
+catch {
+    Write-AtLog -Level 'Error' -Message "State store idempotency check failed: $($_.Exception.Message)" -Properties $logProps
+    Write-Json -StatusCode 502 -Object @{ error = 'Failed to check request idempotency.'; detail = $_.Exception.Message; correlationId = $correlationId }
+    return
+}
+
+if (-not $registration.Registered) {
+    if ($registration.Conflict) {
+        Write-AtLog -Level 'Warning' -Message 'requestId reused with different content: rejected without overwriting the original request.' -Properties $logProps
+        Write-AtAudit -Action 'WipeRequestIdConflict' -Level 'Warning' -Properties $logProps
+        Write-Json -StatusCode 409 -Object @{
+            error         = 'requestId was already used with different request content. Use a new requestId for a different request.'
+            requestId     = $requestId
+            correlationId = $correlationId
+        }
+        return
+    }
+
+    # Same requestId, same content: safe replay. Return the current durable
+    # state instead of creating a second job.
+    Write-AtLog -Level 'Warning' -Message 'Duplicate requestId with identical content, returning existing state.' -Properties $logProps
+    $existing = $null
+    try {
+        # The index remembers the platform as first declared, which for a
+        # "Mobile" request is resolved (Windows/Apple/Android excluded) only
+        # AFTER the index write: the state row can therefore live in a
+        # different partition than $registration.Platform. Try the fast path
+        # first, then fall back to a partition-agnostic lookup by RowKey.
+        $existing = Get-WipeRequestState -Platform $registration.Platform -RequestId $requestId
+        if (-not $existing) {
+            $candidates = @(Find-WipeRequestState -Filter "PartitionKey ne '__RequestId' and RowKey eq '$($requestId.Replace("'", "''"))'" -Top 1)
+            if ($candidates.Count -gt 0) { $existing = $candidates[0] }
+        }
+    }
+    catch {
+        Write-AtLog -Level 'Warning' -Message "State store lookup for the existing request failed: $($_.Exception.Message)" -Properties $logProps
+    }
+
+    if ($existing) {
         Write-Json -StatusCode 200 -Object @{
             requestId     = $requestId
-            correlationId = $existing[0].correlationId
-            status        = $existing[0].status
+            correlationId = (Get-JsonPropertyValue -InputObject $existing -Name 'correlationId')
+            status        = (Get-JsonPropertyValue -InputObject $existing -Name 'status')
             duplicate     = $true
         }
         return
     }
-}
-catch {
-    Write-AtLog -Level 'Warning' -Message "State store lookup failed, continuing: $($_.Exception.Message)" -Properties $logProps
+
+    # Registered a moment ago by a concurrent request that has not finished
+    # persisting the state row yet: it is in flight, not lost.
+    Write-Json -StatusCode 202 -Object @{
+        requestId     = $requestId
+        correlationId = $correlationId
+        status        = 'Accepted'
+        duplicate      = $true
+    }
+    return
 }
 
 # --- Device resolution + guardrails -----------------------------------------
@@ -1466,9 +2632,12 @@ try {
         -ManagedDeviceId $inputManagedDeviceId `
         -DeviceName $inputDeviceName `
         -SerialNumber $inputSerialNumber `
+        -Imei $inputImei `
         -LogProperties $logProps
 }
 catch {
+    # A genuine Graph failure (auth, RBAC, throttling, 5xx, ...) is NEVER
+    # reinterpreted as "device not managed": only an empty/404 result is.
     Write-AtLog -Level 'Error' -Message "Device lookup failed: $($_.Exception.Message)" -Properties $logProps
     Write-Json -StatusCode 502 -Object @{ error = 'Failed to query Microsoft Graph for the device.'; detail = $_.Exception.Message; correlationId = $correlationId }
     return
@@ -1478,6 +2647,11 @@ catch {
 if (-not $device) {
     Write-AtLog -Level 'Warning' -Message 'Managed device not found in Intune: routed to manual handling.' -Properties $logProps
     Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'DeviceNotManagedByIntune' })
+    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
+        correlationId = $correlationId; scenario = $scenario; serialNumber = $inputSerialNumber; imei = $inputImei
+        reason = 'DeviceNotManagedByIntune'
+        errorMessage = 'Managed device not found in Intune. ServiceNow must open a manual task.'
+    }
     Write-Json -StatusCode 422 -Object @{
         requestId     = $requestId
         correlationId = $correlationId
@@ -1492,6 +2666,12 @@ if (-not $device) {
 if ($platform -eq 'Mobile') {
     $platform = ConvertTo-EnrollmentPlatform -OperatingSystem ([string]$device.operatingSystem)
     if (-not $platform -or $platform -eq 'Mobile') {
+        Save-RejectedRequest -Platform 'Mobile' -RequestId $requestId -LogProperties $logProps -Properties @{
+            correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
+            managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
+            reason = 'AmbiguousPlatform'
+            errorMessage = "Unable to resolve the enrollment platform from Intune operatingSystem '$($device.operatingSystem)'."
+        }
         Write-Json -StatusCode 422 -Object @{
             requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
             reason = 'AmbiguousPlatform'
@@ -1501,10 +2681,58 @@ if ($platform -eq 'Mobile') {
     }
     $logProps.platform = $platform
 }
+else {
+    # The caller declared a concrete platform: Intune's own record is still
+    # authoritative and a mismatch must be rejected rather than silently
+    # dispatched to the wrong runbook.
+    $intunePlatform = ConvertTo-EnrollmentPlatform -OperatingSystem ([string]$device.operatingSystem)
+    if ($intunePlatform -and $intunePlatform -ne 'Mobile' -and $intunePlatform -ne $platform) {
+        Write-AtLog -Level 'Warning' -Message "Payload platform '$platform' does not match Intune's operatingSystem '$($device.operatingSystem)' (resolved '$intunePlatform')." -Properties $logProps
+        Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'PlatformMismatch' })
+        Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
+            correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
+            managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
+            reason = 'PlatformMismatch'
+            errorMessage = "Requested platform '$platform' does not match the device's Intune platform '$intunePlatform'."
+        }
+        Write-Json -StatusCode 422 -Object @{
+            requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
+            reason = 'PlatformMismatch'
+            error  = "Requested platform '$platform' does not match the device's Intune platform '$intunePlatform' (operatingSystem='$($device.operatingSystem)')."
+        }
+        return
+    }
+}
+
+# When the caller supplied an IMEI, it must belong to the resolved device:
+# otherwise the wrong physical asset could be wiped under the right serial.
+if (-not [string]::IsNullOrWhiteSpace($inputImei) -and
+    -not [string]::IsNullOrWhiteSpace([string]$device.imei) -and
+    $inputImei -ne [string]$device.imei) {
+    Write-AtLog -Level 'Warning' -Message 'Supplied imei does not match the resolved device record.' -Properties $logProps
+    Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'DeviceIdentityMismatch' })
+    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
+        correlationId = $correlationId; scenario = $scenario; serialNumber = [string]$device.serialNumber
+        managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName; imei = $inputImei
+        reason = 'DeviceIdentityMismatch'
+        errorMessage = "Supplied imei '$inputImei' does not match the resolved device's imei."
+    }
+    Write-Json -StatusCode 422 -Object @{
+        requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
+        reason = 'DeviceIdentityMismatch'
+        error  = "Supplied imei does not match the resolved device's imei."
+    }
+    return
+}
 
 $resolvedSerialNumber = [string]$device.serialNumber
 if ([string]::IsNullOrWhiteSpace($resolvedSerialNumber)) {
     Write-AtLog -Level 'Warning' -Message 'The managed device has no serial number and cannot be dispatched.' -Properties $logProps
+    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
+        correlationId = $correlationId; scenario = $scenario; managedDeviceId = [string]$device.id; deviceName = [string]$device.deviceName
+        reason = 'MissingSerialNumber'
+        errorMessage = 'The managed device does not expose the serial number required by the platform runbook.'
+    }
     Write-Json -StatusCode 422 -Object @{
         requestId = $requestId
         correlationId = $correlationId
@@ -1533,16 +2761,13 @@ if ($failed.Count -gt 0 -and -not $dryRun) {
     Write-AtLog -Level 'Warning' -Message 'Guardrails failed: routed to manual handling.' -Properties $logProps
     Write-AtAudit -Action 'WipeRequestRejected' -Level 'Warning' -Properties ($logProps + @{ status = 'Rejected'; reason = 'GuardrailFailed'; guardrails = (($failed.name) -join ',') })
 
-    try {
-        Save-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
-            correlationId = $correlationId; status = 'Rejected'; scenario = $scenario
-            serialNumber  = [string]$device.serialNumber; deviceName = [string]$device.deviceName
-            managedDeviceId = [string]$device.id
-            errorMessage  = "Guardrails failed: $(($failed.name) -join ', ')"
-            acceptedAt    = (Get-Date).ToUniversalTime()
-        } | Out-Null
+    Save-RejectedRequest -Platform $platform -RequestId $requestId -LogProperties $logProps -Properties @{
+        correlationId = $correlationId; scenario = $scenario
+        serialNumber  = [string]$device.serialNumber; deviceName = [string]$device.deviceName
+        managedDeviceId = [string]$device.id
+        reason        = 'GuardrailFailed'
+        errorMessage  = "Guardrails failed: $(($failed.name) -join ', ')"
     }
-    catch { Write-AtLog -Level 'Error' -Message "Failed to persist rejected state: $($_.Exception.Message)" -Properties $logProps }
 
     Write-Json -StatusCode 422 -Object @{
         requestId = $requestId; correlationId = $correlationId; status = 'Rejected'
@@ -1551,7 +2776,7 @@ if ($failed.Count -gt 0 -and -not $dryRun) {
     return
 }
 
-# --- Canonical message ------------------------------------------------------
+# --- Canonical message -------------------------------------------------------
 $removeFromPlatform = Test-RemoveFromEnrollmentPlatform -Scenario $scenario
 
 $message = [ordered]@{
@@ -1609,7 +2834,11 @@ if (-not $deviceLease.Acquired) {
     return
 }
 
-# --- Write-before-action ----------------------------------------------------
+# --- Write-before-action: durable handoff ------------------------------------
+# The full canonical payload is persisted BEFORE any dispatch attempt. If the
+# process is recycled right here, JobMonitor's reconciliation pass finds this
+# same row (status=Accepted, payloadJson set) and dispatches it - no HTTP
+# request needs to be replayed for the disposal to still happen.
 try {
     Save-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
         correlationId   = $correlationId
@@ -1623,6 +2852,8 @@ try {
         callbackUrl     = $inputCallbackUrl
         dryRun          = $dryRun
         attempts        = 0
+        payloadHash     = $payloadHash
+        payloadJson     = $message
         acceptedAt      = (Get-Date).ToUniversalTime()
     } | Out-Null
 }
@@ -1633,35 +2864,55 @@ catch {
     return
 }
 
-# --- Direct runbook dispatch -------------------------------------------------
+# --- Optional immediate dispatch attempt -------------------------------------
+# Best-effort only: claim the row we just created (an ETag-conditional MERGE,
+# exactly like JobMonitor's reconciliation pass uses) so this attempt and a
+# concurrent JobMonitor tick can never both start the runbook job. If the
+# claim is lost, JobMonitor already owns the request and will finish it; the
+# caller simply gets 202 Accepted back.
+$dispatch = $null
 try {
-    $dispatch = Invoke-DisposalDispatch -Message $message -ExpectedPlatform $platform
+    $claim = Invoke-DispatchClaim -Platform $platform -RequestId $requestId
+    if ($claim.Claimed) {
+        $dispatch = Invoke-DisposalDispatch -Message $message -ExpectedPlatform $platform -Attempt 1
+    }
+    else {
+        Write-AtLog -Level 'Information' -Message "Immediate dispatch skipped ($($claim.Reason)); JobMonitor will reconcile." -Properties $logProps
+    }
 }
 catch {
-    $dispatchError = $_.Exception.Message
-    try {
-        Update-WipeRequestState -Platform $platform -RequestId $requestId -Properties @{
-            status = 'DispatchFailed'
-            errorMessage = $dispatchError
-        }
-    }
-    catch {
-        Write-AtLog -Level 'Error' -Message "Failed to persist DispatchFailed state: $($_.Exception.Message)" -Properties $logProps
-    }
-    Remove-CurrentDeviceLease -SerialNumber $resolvedSerialNumber -RequestId $requestId -LogProperties $logProps
-    Write-AtLog -Level 'Error' -Message "Failed to dispatch the runbook: $dispatchError" -Properties $logProps
-    Write-Json -StatusCode 502 -Object @{
-        error = 'Failed to start the platform runbook.'
-        detail = $dispatchError
-        requestId = $requestId
+    # The immediate attempt is an optimisation: any unexpected failure here
+    # (including a claim/dispatch bug) must not surface as an HTTP failure,
+    # because the durable Accepted row already guarantees JobMonitor will try.
+    Write-AtLog -Level 'Error' -Message "Immediate dispatch attempt failed unexpectedly, deferring to JobMonitor: $($_.Exception.Message)" -Properties $logProps
+}
+
+if (-not $dispatch) {
+    Write-AtAudit -Action 'WipeRequestAccepted' -Properties ($logProps + @{ status = 'Accepted' })
+    Write-Json -StatusCode 202 -Object @{
+        requestId     = $requestId
         correlationId = $correlationId
-        status = 'DispatchFailed'
-    }
+        status        = 'Accepted'
+        platform      = $platform
+        scenario      = $scenario
+        dryRun        = $dryRun
+        device        = @{
+            managedDeviceId = [string]$device.id
+            deviceName      = [string]$device.deviceName
+            serialNumber    = [string]$device.serialNumber
+            operatingSystem = [string]$device.operatingSystem
+        }
+        guardrails    = $guardrails
+        statusUrl     = "/api/v1/wipe/status?requestId=$requestId"
+    } -ExtraHeaders @{ 'Location' = "/api/v1/wipe/status?requestId=$requestId" }
     return
 }
 
-if ($dispatch.Status -eq 'DispatchFailed') {
+if ($dispatch.ReleaseLease) {
     Remove-CurrentDeviceLease -SerialNumber $resolvedSerialNumber -RequestId $requestId -LogProperties $logProps
+}
+
+if ($dispatch.Status -eq 'DispatchFailed') {
     Write-Json -StatusCode 500 -Object @{
         error = $dispatch.ErrorMessage
         requestId = $requestId
@@ -1669,10 +2920,6 @@ if ($dispatch.Status -eq 'DispatchFailed') {
         status = $dispatch.Status
     }
     return
-}
-
-if ($dispatch.Status -eq 'Completed') {
-    Remove-CurrentDeviceLease -SerialNumber $resolvedSerialNumber -RequestId $requestId -LogProperties $logProps
 }
 
 Write-AtLog -Level 'Information' -Message 'Disposal request dispatched directly.' -Properties $logProps
@@ -1691,8 +2938,8 @@ Write-Json -StatusCode 202 -Object @{
         serialNumber    = [string]$device.serialNumber
         operatingSystem = [string]$device.operatingSystem
     }
-    guardrails    = $guardrails
+    guardrails        = $guardrails
     automationJobName = $dispatch.AutomationJobName
     automationJobId   = $dispatch.AutomationJobId
-    statusUrl     = "/api/v1/wipe/status?requestId=$requestId"
+    statusUrl         = "/api/v1/wipe/status?requestId=$requestId"
 } -ExtraHeaders @{ 'Location' = "/api/v1/wipe/status?requestId=$requestId" }

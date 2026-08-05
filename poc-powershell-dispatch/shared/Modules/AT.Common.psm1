@@ -301,6 +301,110 @@ function Resolve-JsonPath {
     return $current
 }
 
+function ConvertTo-CanonicalJson {
+    <#
+    .SYNOPSIS
+        Serialises an object to JSON with object keys sorted, so two logically
+        equal payloads always produce the same text regardless of property order.
+    #>
+    param([Parameter(Mandatory)] $InputObject)
+
+    if ($null -eq $InputObject) { return 'null' }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $names = @($InputObject.Keys) | Sort-Object
+        $parts = foreach ($name in $names) {
+            '"{0}":{1}' -f $name, (ConvertTo-CanonicalJson -InputObject $InputObject[$name])
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    if ($InputObject -is [string]) {
+        return ($InputObject | ConvertTo-Json -Compress)
+    }
+
+    if ($InputObject -is [bool]) {
+        return $InputObject.ToString().ToLowerInvariant()
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) {
+        $parts = foreach ($item in $InputObject) { ConvertTo-CanonicalJson -InputObject $item }
+        return '[' + ($parts -join ',') + ']'
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $names = @($InputObject.PSObject.Properties.Name) | Sort-Object
+        $parts = foreach ($name in $names) {
+            '"{0}":{1}' -f $name, (ConvertTo-CanonicalJson -InputObject $InputObject.PSObject.Properties[$name].Value)
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+
+    # Numbers and other primitives.
+    return ($InputObject | ConvertTo-Json -Compress)
+}
+
+function Get-PayloadHash {
+    <#
+    .SYNOPSIS
+        Deterministic SHA-256 hex digest of the parts of a request that define
+        "the same request": used to tell a safe replay (same requestId, same
+        content) from a requestId collision with different content.
+    #>
+    param([Parameter(Mandatory)] $InputObject)
+
+    $canonical = ConvertTo-CanonicalJson -InputObject $InputObject
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonical))
+        return [System.Convert]::ToHexString($hash).ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Retry backoff
+# ---------------------------------------------------------------------------
+function Get-BackoffDelaySeconds {
+    <#
+    .SYNOPSIS
+        Exponential backoff with a cap, used for both dispatch retries and
+        callback retries: BaseSeconds * 2^(Attempt-1), capped at MaxSeconds.
+    #>
+    param(
+        [Parameter(Mandatory)] [int] $Attempt,
+        [int] $BaseSeconds = 15,
+        [int] $MaxSeconds = 1800
+    )
+
+    if ($Attempt -lt 1) { $Attempt = 1 }
+    $delay = $BaseSeconds * [Math]::Pow(2, ($Attempt - 1))
+    if ($delay -gt $MaxSeconds -or [double]::IsInfinity($delay)) { $delay = $MaxSeconds }
+    return [int]$delay
+}
+
+function Get-HttpErrorStatusCode {
+    <#
+    .SYNOPSIS
+        Best-effort extraction of the HTTP status code from a terminating error
+        raised by Invoke-RestMethod/Invoke-WebRequest. Returns $null when the
+        error has no HTTP response at all (e.g. a network timeout or DNS
+        failure), which callers must treat as "unknown", not as any specific
+        status.
+    #>
+    param($ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch { }
+    return $null
+}
+
 function ConvertFrom-JsonBody {
     param($Body)
 
@@ -344,4 +448,5 @@ function Get-JsonPropertyValue {
 Export-ModuleMember -Function Get-AppSetting, Get-AppSettingBool, Get-AppSettingInt, Write-AtLog, `
     Get-AppInsightsConfig, Send-AppInsightsTelemetry, Write-AtAudit, `
     Get-ManagedIdentityToken, ConvertTo-EnrollmentPlatform, ConvertTo-ValidScenario, `
-    Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody, Get-JsonPropertyValue
+    Test-RemoveFromEnrollmentPlatform, Resolve-JsonPath, ConvertFrom-JsonBody, Get-JsonPropertyValue, `
+    ConvertTo-CanonicalJson, Get-PayloadHash, Get-BackoffDelaySeconds, Get-HttpErrorStatusCode

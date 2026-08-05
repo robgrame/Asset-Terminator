@@ -160,9 +160,17 @@ function Invoke-GraphRequest {
 function Get-IntuneManagedDevice {
     <#
         .SYNOPSIS
-            Resolves an Intune managed device by managedDeviceId, or by deviceName
-            and/or serialNumber. When several stale objects match, the freshest one
-            (by enrolledDateTime, then lastSyncDateTime) is returned.
+            Resolves an Intune managed device by managedDeviceId, or by deviceName,
+            serialNumber and/or imei. When several stale objects match, the freshest
+            one (by enrolledDateTime, then lastSyncDateTime) is returned.
+        .DESCRIPTION
+            A device is reported "not managed" ($null return) ONLY when Graph
+            genuinely has no matching object (an empty result set, or a 404 on a
+            direct id lookup). Any other Graph failure - authentication, RBAC,
+            throttling, a 5xx - is rethrown so the caller can tell "this device is
+            not enrolled" apart from "we could not ask Intune right now"; conflating
+            the two would route real outages to the manual-task guardrail instead
+            of surfacing them as the transient error they are.
         .OUTPUTS
             The managedDevice Graph object, or $null when not found.
     #>
@@ -171,25 +179,31 @@ function Get-IntuneManagedDevice {
         [string] $ManagedDeviceId,
         [string] $DeviceName,
         [string] $SerialNumber,
+        [string] $Imei,
         [hashtable] $LogProperties = @{}
     )
 
-    $select = 'id,deviceName,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,manufacturer'
+    $select = 'id,deviceName,operatingSystem,osVersion,isEncrypted,complianceState,enrolledDateTime,lastSyncDateTime,userPrincipalName,serialNumber,manufacturer,imei'
 
     if ($ManagedDeviceId) {
         try {
             return Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices/$ManagedDeviceId`?`$select=$select"
         }
-        catch { return $null }
+        catch {
+            $status = Get-HttpErrorStatusCode -ErrorRecord $_
+            if ($status -eq 404) { return $null }
+            throw
+        }
     }
 
-    if (-not $DeviceName -and -not $SerialNumber) {
-        throw 'Get-IntuneManagedDevice requires -ManagedDeviceId, -DeviceName or -SerialNumber.'
+    if (-not $DeviceName -and -not $SerialNumber -and -not $Imei) {
+        throw 'Get-IntuneManagedDevice requires -ManagedDeviceId, -DeviceName, -SerialNumber or -Imei.'
     }
 
     $clauses = @()
     if ($DeviceName)   { $clauses += "deviceName eq '$($DeviceName.Replace("'", "''"))'" }
     if ($SerialNumber) { $clauses += "serialNumber eq '$($SerialNumber.Replace("'", "''"))'" }
+    if ($Imei)         { $clauses += "imei eq '$($Imei.Replace("'", "''"))'" }
     $filter = [Uri]::EscapeDataString($clauses -join ' and ')
 
     $candidates = @()
@@ -198,10 +212,21 @@ function Get-IntuneManagedDevice {
         $candidates = @($result.value)
     }
     catch {
-        Write-MockLog -Level 'Warning' -Message "Server-side filter failed ($($_.Exception.Message)); falling back to client-side matching." -Properties $LogProperties
+        # Some combined $filter clauses (e.g. imei together with deviceName) are
+        # rejected by Graph as an unsupported query (400): fall back to a single
+        # supported clause and match the remaining criteria client-side. Any
+        # other status (401/403/429/5xx) is a real failure and must propagate.
+        $status = Get-HttpErrorStatusCode -ErrorRecord $_
+        if ($status -ne 400) { throw }
+
+        Write-MockLog -Level 'Warning' -Message "Server-side filter failed (status $status); falling back to client-side matching." -Properties $LogProperties
         if ($DeviceName) {
             $nameFilter = [Uri]::EscapeDataString("deviceName eq '$($DeviceName.Replace("'", "''"))'")
             $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$nameFilter&`$select=$select"
+        }
+        elseif ($SerialNumber) {
+            $serialFilter = [Uri]::EscapeDataString("serialNumber eq '$($SerialNumber.Replace("'", "''"))'")
+            $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$filter=$serialFilter&`$select=$select"
         }
         else {
             $result = Invoke-GraphRequest -Method GET -Path "deviceManagement/managedDevices?`$select=$select"
@@ -211,6 +236,7 @@ function Get-IntuneManagedDevice {
 
     if ($DeviceName)   { $candidates = @($candidates | Where-Object { $_.deviceName   -eq $DeviceName }) }
     if ($SerialNumber) { $candidates = @($candidates | Where-Object { $_.serialNumber -eq $SerialNumber }) }
+    if ($Imei)         { $candidates = @($candidates | Where-Object { $_.imei -eq $Imei }) }
 
     if ($candidates.Count -eq 0) { return $null }
 

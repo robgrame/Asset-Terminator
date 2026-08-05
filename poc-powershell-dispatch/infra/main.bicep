@@ -66,6 +66,34 @@ param runbooksSupportScenario bool = true
 @description('CRON expression for the JobMonitor timer.')
 param jobMonitorSchedule string = '0 */2 * * * *'
 
+// --- Durable dispatch/callback reconciliation (JobMonitor) ------------------
+@description('Maximum dispatch attempts (ARM PUT via Automation) before a request is failed terminally as DispatchFailed.')
+param dispatchMaxAttempts int = 8
+
+@description('Base delay in seconds for the dispatch retry exponential backoff.')
+param dispatchBackoffBaseSeconds int = 20
+
+@description('Cap in seconds for the dispatch retry exponential backoff.')
+param dispatchBackoffMaxSeconds int = 1800
+
+@description('Maximum number of requests JobMonitor claims and attempts to dispatch in a single tick.')
+param dispatchMaxConcurrency int = 10
+
+@description('Maximum polls for a valid ##RESULT## line after the Automation job itself reports a terminal status, before failing the request with evidenceState=EvidenceMissing.')
+param evidenceMaxAttempts int = 5
+
+@description('Maximum ServiceNow callback delivery attempts before the callback is marked Failed terminally.')
+param callbackMaxAttempts int = 6
+
+@description('Base delay in seconds for the callback retry exponential backoff.')
+param callbackBackoffBaseSeconds int = 15
+
+@description('Cap in seconds for the callback retry exponential backoff.')
+param callbackBackoffMaxSeconds int = 900
+
+@description('Maximum number of callbacks JobMonitor attempts to deliver in a single tick.')
+param callbackMaxConcurrency int = 20
+
 @description('Platform -> runbook routing table (see docs/evoluzione-dispatch-runbook.md).')
 param runbookMap object = {
   Windows: {
@@ -508,6 +536,15 @@ resource apiApp 'Microsoft.Web/sites@2023-12-01' = {
         { name: 'RUNBOOK_MAP', value: string(runbookMap) }
         { name: 'RUNBOOKS_SUPPORT_SCENARIO', value: toLower(string(runbooksSupportScenario)) }
         { name: 'JOBMONITOR_SCHEDULE', value: jobMonitorSchedule }
+        { name: 'DISPATCH_MAX_ATTEMPTS', value: string(dispatchMaxAttempts) }
+        { name: 'DISPATCH_BACKOFF_BASE_SECONDS', value: string(dispatchBackoffBaseSeconds) }
+        { name: 'DISPATCH_BACKOFF_MAX_SECONDS', value: string(dispatchBackoffMaxSeconds) }
+        { name: 'DISPATCH_MAX_CONCURRENCY', value: string(dispatchMaxConcurrency) }
+        { name: 'EVIDENCE_MAX_ATTEMPTS', value: string(evidenceMaxAttempts) }
+        { name: 'CALLBACK_MAX_ATTEMPTS', value: string(callbackMaxAttempts) }
+        { name: 'CALLBACK_BACKOFF_BASE_SECONDS', value: string(callbackBackoffBaseSeconds) }
+        { name: 'CALLBACK_BACKOFF_MAX_SECONDS', value: string(callbackBackoffMaxSeconds) }
+        { name: 'CALLBACK_MAX_CONCURRENCY', value: string(callbackMaxConcurrency) }
       ])
     }
   }

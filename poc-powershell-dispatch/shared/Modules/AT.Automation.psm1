@@ -163,11 +163,121 @@ function Test-AutomationJobTerminal {
     return $Status -in @('Completed', 'Failed', 'Stopped', 'Suspended')
 }
 
+function Test-TransientArmStatusCode {
+    <#
+    .SYNOPSIS
+        True for the status codes where ARM's outcome is genuinely ambiguous:
+        a timeout or 5xx can mean "the request never reached the service" or
+        "it succeeded but the response was lost"; 429 means the request may or
+        may not have been throttled before or after taking effect.
+    #>
+    param([Nullable[int]] $StatusCode)
+
+    if ($null -eq $StatusCode) { return $true } # no response at all: network/timeout
+    return $StatusCode -eq 429 -or $StatusCode -ge 500
+}
+
+function Get-ArmErrorStatusCode {
+    param($ErrorRecord)
+    return Get-HttpErrorStatusCode -ErrorRecord $ErrorRecord
+}
+
+function Invoke-IdempotentRunbookDispatch {
+    <#
+    .SYNOPSIS
+        Starts a runbook job through ARM with a deterministic job name, without
+        ever risking a duplicate job when the PUT's outcome is ambiguous.
+    .DESCRIPTION
+        ARM PUT .../jobs/{jobName} is idempotent *if it reaches the service*,
+        but a client-side timeout, a 429 or a 5xx leaves the true outcome
+        unknown: the job may have started anyway. The dispatcher must never
+        guess in that situation, because guessing wrong either starts a
+        duplicate wipe or reports failure for a job that is actually running.
+
+        Sequence:
+          1. GET the job first. If it already exists, the PUT is unnecessary
+             (a previous attempt succeeded, or is genuinely known now).
+          2. Otherwise PUT. A clean success or a clean permanent failure (4xx
+             other than 429) is unambiguous.
+          3. On a transient failure (timeout / 429 / 5xx) GET the job again:
+             - found  -> the PUT actually took effect: Confirmed/Started.
+             - 404    -> confirmed absent: safe for the *next* attempt to PUT
+               again; this attempt reports Outcome='ConfirmedAbsent' (not a
+               permanent failure) so the caller can retry with backoff.
+             - the confirming GET itself fails -> Outcome='Unknown': the
+               caller must not retry the PUT this attempt (that could create a
+               duplicate job) and must not treat this as a terminal failure or
+               release any lease; it simply tries again later.
+    .OUTPUTS
+        PSCustomObject: Outcome ('Started'|'ConfirmedAbsent'|'Unknown'|'PermanentFailure'),
+        Job (the job object when known), ErrorMessage.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $JobName,
+        [Parameter(Mandatory)] [string] $Runbook,
+        [hashtable] $Parameters,
+        [string] $RunOn = ''
+    )
+
+    # Step 1: a job with this deterministic name may already exist from a prior
+    # attempt whose PUT response never reached us.
+    try {
+        $existing = Get-AutomationRunbookJob -JobName $JobName
+        if ($existing) {
+            return [pscustomobject]@{ Outcome = 'Started'; Job = $existing; ErrorMessage = '' }
+        }
+    }
+    catch {
+        # The pre-check itself is best-effort: fall through to the PUT. If the
+        # PUT also fails ambiguously, the post-check below still applies.
+        Write-Warning "Pre-dispatch job lookup failed for '$JobName': $($_.Exception.Message)"
+    }
+
+    try {
+        $job = Start-AutomationRunbookJob -JobName $JobName -Runbook $Runbook -Parameters $Parameters -RunOn $RunOn
+        return [pscustomobject]@{ Outcome = 'Started'; Job = $job; ErrorMessage = '' }
+    }
+    catch {
+        $statusCode = Get-ArmErrorStatusCode -ErrorRecord $_
+        if (-not (Test-TransientArmStatusCode -StatusCode $statusCode)) {
+            # A clean permanent failure (bad runbook name, RBAC denied, malformed
+            # parameters, ...): retrying the same PUT would only fail again.
+            return [pscustomobject]@{ Outcome = 'PermanentFailure'; Job = $null; ErrorMessage = $_.Exception.Message }
+        }
+
+        $putError = $_.Exception.Message
+        try {
+            $confirmed = Get-AutomationRunbookJob -JobName $JobName
+        }
+        catch {
+            # The confirming GET is itself unreliable right now: the outcome of
+            # the PUT genuinely cannot be determined this attempt.
+            return [pscustomobject]@{
+                Outcome      = 'Unknown'
+                Job          = $null
+                ErrorMessage = "PUT failed ambiguously ($putError) and the confirming GET also failed: $($_.Exception.Message)"
+            }
+        }
+
+        if ($confirmed) {
+            return [pscustomobject]@{ Outcome = 'Started'; Job = $confirmed; ErrorMessage = '' }
+        }
+
+        # GET confirms the job does not exist: it is safe to PUT again next time.
+        return [pscustomobject]@{
+            Outcome      = 'ConfirmedAbsent'
+            Job          = $null
+            ErrorMessage = "PUT failed ambiguously (status $statusCode): $putError. A follow-up GET confirmed the job was not created; safe to retry."
+        }
+    }
+}
+
 function ConvertFrom-RunbookOutput {
     <#
     .SYNOPSIS
         Extracts the structured result a runbook emits as a '##RESULT## {json}'
-        line. Falls back to $null when the runbook has not been updated yet.
+        line. Falls back to $null when the runbook produced no marker line yet,
+        or when the marker line is not valid JSON.
     #>
     param([string] $Output)
 
@@ -183,6 +293,35 @@ function ConvertFrom-RunbookOutput {
     try { return $json | ConvertFrom-Json } catch { return $null }
 }
 
+function Get-RunbookOutputEvidenceState {
+    <#
+    .SYNOPSIS
+        Classifies why a terminal, 'Completed' Automation job produced no
+        parsed result, so JobMonitor can distinguish a transient evidence gap
+        (worth a retry) from a runbook that will never emit one.
+    .DESCRIPTION
+        A completed job with no output at all is most often the Automation
+        output store lagging behind the job status: retry a bounded number of
+        times ('EvidencePending'). A completed job whose output *is* present
+        but has no '##RESULT##' line, or an invalid one, means the runbook
+        itself never produced the contract it promises: that is not something
+        a retry will fix ('EvidenceMissing'), but it is still recorded as
+        retryable-once in case the output store is only briefly behind the job
+        status transition.
+    .OUTPUTS
+        'HasResult' | 'EvidencePending' | 'EvidenceMissing'
+    #>
+    param(
+        [string] $Output,
+        $ParsedResult
+    )
+
+    if ($null -ne $ParsedResult) { return 'HasResult' }
+    if ([string]::IsNullOrWhiteSpace($Output)) { return 'EvidencePending' }
+    return 'EvidenceMissing'
+}
+
 Export-ModuleMember -Function Resolve-RunbookBinding, Start-AutomationRunbookJob, Get-AutomationRunbookJob, `
-    Get-AutomationRunbookJobOutput, Test-AutomationJobTerminal, `
-    ConvertFrom-RunbookOutput, Get-AutomationAccountResourceId
+    Get-AutomationRunbookJobOutput, Test-AutomationJobTerminal, Test-TransientArmStatusCode, `
+    Get-ArmErrorStatusCode, Invoke-IdempotentRunbookDispatch, `
+    ConvertFrom-RunbookOutput, Get-RunbookOutputEvidenceState, Get-AutomationAccountResourceId
